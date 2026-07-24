@@ -9,8 +9,8 @@ snapshot path when requested.
 
 The view is for workspace recall. It presents captured sessions, windows,
 panes, working directories, programs, commands, and capture limitations in
-user-facing language. It does not expose recovery-planner terminology such as
-`Automatic` or `Manual`.
+user-facing language. The renderer does not generate recovery-planner
+terminology such as `Automatic` or `Manual`.
 
 ## Command Surface
 
@@ -82,8 +82,10 @@ tokens defined below.
 ### Header
 
 `Snapshot` is `latest` when selection used the global pointer and `explicit`
-when the user supplied a path. `File` always shows the full selected immutable
-path returned by `LoadedSnapshot`.
+when the user supplied a path. `File` shows the complete selected path returned
+by `LoadedSnapshot`, without `~` abbreviation or ellipsis. The global-latest
+path is absolute because it comes from the absolute state root; an explicit
+relative path remains relative and is not silently canonicalized for display.
 
 `Captured` preserves the snapshot's exact validated RFC 3339 representation,
 including fractional precision and offset. `Source` displays the recorded tmux
@@ -141,10 +143,11 @@ exactly equal to the containing session's path bytes, the renderer writes
 `cwd = session`; this is display compression, not cwd inheritance. A differing
 pane path is always shown in full.
 
-The display never prints or color-codes `Automatic`, `Manual`, or equivalent
-recovery-planner classifications. Codex, Claude Code, recognized serve
-commands, and other captured commands are all presented as facts stored for
-the pane.
+The renderer never generates or color-codes `Automatic`, `Manual`, or
+equivalent recovery-planner classifications. Codex, Claude Code, recognized
+serve commands, and other captured commands are all presented as facts stored
+for the pane. User-controlled names and command arguments remain complete even
+when their literal content includes words such as `automatic` or `manual`.
 
 ## Palette
 
@@ -308,7 +311,8 @@ Plain exact-output tests cover:
 - program aggregation and first-seen order;
 - command quoting, empty arguments, controls, literal escapes, Unicode, and
   non-UTF-8 bytes; and
-- names and values that resemble ANSI sequences.
+- names and values that resemble ANSI sequences or internal classification
+  words.
 
 Styled exact-output tests verify that only approved tokens are colored and that
 every style is reset immediately. Stripping ANSI from forced-color output must
@@ -316,7 +320,8 @@ produce byte-for-byte identical output to `--color never`.
 
 Integration tests cover latest and explicit loading, invalid snapshots, empty
 stdout on failure, exit statuses, and absence of tmux/process/preflight access.
-Tests assert that successful output never contains `automatic` or `manual`.
+Mapping tests assert that the renderer adds no internal classification labels;
+they do not reject matching words that came from snapshot data.
 
 Repository verification runs formatting, Clippy with warnings denied, the full
 locked test suite, documentation generation, and Cargo packaging.
