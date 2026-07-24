@@ -1,0 +1,32 @@
+[package]
+name = "tmux-rescue"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Snapshot and restore tmux session topology and recoverable foreground commands"
+license = "CC0-1.0"
+repository = "https://github.com/huweiATgithub/tmux-rescue"
+readme = "README.md"
+keywords = ["tmux", "terminal", "recovery", "session", "backup"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "README.md",
+    "src/**",
+    "tests/**",
+]
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

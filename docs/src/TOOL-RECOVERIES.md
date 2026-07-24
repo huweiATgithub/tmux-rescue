@@ -26,8 +26,8 @@ listed here must not be classified as an automatic recovery.
 | --- | --- | --- | --- |
 | Codex | Foreground Codex TUI tied to the pane | Exact Codex session ID | `codex resume <session-id>` |
 | Claude Code | Foreground Claude Code TUI tied to the pane | Exact Claude session ID | `claude --resume <session-id>` |
-| mdBook | Foreground `mdbook serve` | Captured executable and full argv | Replay captured argv |
-| Bookshelf | Foreground `book serve` | Captured executable and full argv | Replay captured argv |
+| mdBook | Foreground `mdbook serve` | Captured executable and full argv | Launch proven target executable with captured trailing argv |
+| Bookshelf | Foreground `book serve` | Captured executable and full argv | Launch proven target executable with captured trailing argv |
 
 No other program is in the v1 automatic-recovery whitelist.
 
@@ -70,6 +70,9 @@ conflicting evidence does not authorize automatic execution.
   candidates.
 - Files and process metadata used as evidence are untrusted input and must be
   parsed before use.
+- Opened tool-session record sets and contents are observed on both sides of
+  the final foreground-process fence. A failed record collection cannot supply
+  evidence, and a changed observation invalidates the pane observation.
 
 ### Tail Corroboration
 
@@ -87,9 +90,10 @@ creates or selects a session ID.
 
 Automatic recovery either derives canonical structured argv from a refined
 session ID or carries a recognized structured serve command. Restore renders
-that structure for the target shell and submits it with Enter. After startup,
-the executor applies the shared bounded-settle and guarded-input rules from
-[ARCHITECTURE.md](ARCHITECTURE.md), using the variant's exact success predicate.
+that structure for the target shell, bracketed-pastes it literally, and submits
+one separate Enter. After startup, the executor applies the shared bounded-settle
+and guarded-input rules from [ARCHITECTURE.md](ARCHITECTURE.md), using the
+variant's exact success predicate.
 
 ## Codex
 
@@ -128,7 +132,8 @@ derived argv = ["codex", "resume", <session-id>]
 ```
 
 The executable name shown here is the v1 recovery command contract. Normal
-restore preflight still verifies that it is available in the target shell.
+restore preflight still resolves it from the invocation environment to one
+absolute executable.
 After launch, `RecoveredAutomatically` requires a pane-tied Codex session file
 whose parsed `payload.id` equals the requested `CodexSessionId`. A foreground
 Codex process without exact identity confirmation becomes `NeedsAttention`.
@@ -139,7 +144,11 @@ Codex process without exact identity confirmation becomes `NeedsAttention`.
 
 The foreground process must be a Claude Code interactive TUI tied to the pane.
 Background agents and generic Claude Code service processes are not themselves
-recoverable foreground sessions.
+recoverable foreground sessions. v1 accepts only its understood interactive
+global-option forms. Positional launches, unknown options, help/version,
+print/background/worktree modes, subcommands, and `--fork-session` downgrade to
+manual recovery. In particular, the UUID supplied with `--resume` identifies
+the parent rather than the new fork and cannot authorize automatic recovery.
 
 ### Identity Evidence
 
@@ -156,17 +165,18 @@ ClaudeWorkerEvidence {
   working_directory: RecordedAbsolutePath,
   pid: ProcessId,
   process_start_time: ProcessStartTime,
-  transport: PtyIdentity | SocketIdentity
+  transport: PtyIdentity
 }
 ```
 
 When using a worker record, every field above is mandatory. The working
 directory must equal the pane evidence; PID and process start time must identify
-the same live foreground worker; and the PTY or socket identity must bind that
-worker to the pane. A missing or mismatched field is insufficient or conflicting
-evidence. A daemon roster or status record may corroborate these facts but
-cannot supply a missing field, and daemon health alone does not identify the
-pane's session.
+the same live foreground worker; and the PTY identity must equal the pane's
+terminal identity. A missing or mismatched field is insufficient or conflicting
+evidence. Socket-bound worker records are not automatically recoverable in v1
+because the snapshot boundary has no independent pane-to-socket proof. A daemon
+roster or status record may corroborate these facts but cannot supply a missing
+field, and daemon health alone does not identify the pane's session.
 
 Record shapes may vary between supported Claude Code versions; a display name
 is not required. The parser must reject a shape it does not understand rather
@@ -185,7 +195,8 @@ derived argv = ["claude", "--resume", <session-id>]
 ```
 
 The executable name shown here is the v1 recovery command contract. Normal
-restore preflight still verifies that it is available in the target shell.
+restore preflight still resolves it from the invocation environment to one
+absolute executable.
 After launch, `RecoveredAutomatically` requires pane-tied argv or a complete
 worker record carrying the requested `ClaudeSessionId`. A foreground Claude
 Code process without exact identity confirmation becomes `NeedsAttention`.
@@ -215,9 +226,11 @@ AutomaticRecovery::MdBookServe {
 }
 ```
 
-Restore renders its captured argv without inventing, dropping, or prepending
-arguments. Post-launch success requires pane-tied foreground evidence that
-satisfies the same recognition rules and captured serve argv.
+Restore replaces captured `argv[0]` with the absolute target `mdbook` executable
+proved by preflight and preserves every remaining argument exactly. Post-launch
+success requires pane-tied foreground evidence that satisfies the same
+recognition rules, the same `argv[0]` basename, and the exact captured arguments
+after `argv[0]`.
 
 ## Bookshelf Serve
 
@@ -244,6 +257,8 @@ AutomaticRecovery::BookshelfServe {
 }
 ```
 
-Restore renders its captured argv without inventing, dropping, or prepending
-arguments. Post-launch success requires pane-tied foreground evidence that
-satisfies the same recognition rules and captured serve argv.
+Restore replaces captured `argv[0]` with the absolute target `book` executable
+proved by preflight and preserves every remaining argument exactly. Post-launch
+success requires pane-tied foreground evidence that satisfies the same
+recognition rules, the same `argv[0]` basename, and the exact captured arguments
+after `argv[0]`.

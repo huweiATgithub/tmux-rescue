@@ -24,7 +24,9 @@ The source and target are separate concepts:
   captured.
 - `RestoreTarget(TmuxServerIdentity)` identifies the socket selected for
   reconstruction.
-- `AbsentAtPlanning<RestoreTarget>` carries the result of the target-existence
+- `TargetVacancy = MissingPath | RefusedSocket` distinguishes a missing socket
+  path from the refused socket left by a crashed tmux server.
+- `AvailableAtPlanning<RestoreTarget>` carries that refined target-vacancy
   preflight used to produce a plan.
 - `ExecutionCheckedTarget<RestoreTarget>` is produced by the execution-time
   recheck and may be consumed only by target creation.
@@ -39,14 +41,26 @@ restored.
 Raw CLI and snapshot server selectors are parsed into a
 `TmuxServerIdentity`, which denotes one concrete tmux socket endpoint. Target
 existence checks and all later tmux operations consume that resolved identity,
-not the original string. The plan-time absence result is not reused as proof at
+not the original string. The plan-time vacancy result is not reused as proof at
 execution time.
 
-Target creation is a create-if-absent boundary. Existing, inaccessible, or
-indeterminate endpoints fail closed. An absence observation alone cannot
-produce `OwnedRestoreTarget`, and cleanup cannot accept an absence proof. If an
-adapter cannot establish ownership without first mutating an existing server,
-`--run` is unsupported for that target rather than weakening this invariant.
+Target creation is a create-if-no-live-server boundary. A missing path and a
+Unix socket that rejects connection are the only accepted vacancy observations;
+the latter is necessary because a crashed tmux server leaves its socket path
+behind. Existing live servers, non-socket paths, inaccessible endpoints, and
+other indeterminate states fail closed. A vacancy observation alone cannot
+produce `OwnedRestoreTarget`, and cleanup cannot accept vacancy as ownership.
+Execution rechecks vacancy, then creation must prove that this invocation
+created the exact server before topology mutation. If another server wins the
+race, claim fails without topology mutation. If an adapter cannot establish
+ownership without first mutating an existing server, `--run` is unsupported for
+that target rather than weakening this invariant. Once creation has started,
+failed ownership readback triggers a token-conditional cleanup attempt; a
+server with any other token is left untouched, and the observed cleanup
+disposition is part of the fatal result. A missing or refused socket is not by
+itself proof that an observed owned server process has exited. When process
+identity was established, cleanup also compares the Linux PID and process
+start time; failed cleanup without such proof reports an unknown disposition.
 
 ## Rust Boundary
 
@@ -58,9 +72,10 @@ The Cargo package exposes:
   and exit-status mapping.
 
 External interactions are replaceable capabilities. The library needs
-interfaces for tmux, process inspection, snapshot storage, time, target-shell
-rendering, and progress events. Real adapters and test adapters use the same
-contracts.
+interfaces for tmux, process inspection, snapshot storage, capture time, and
+target-shell rendering. Typed capture events and restore outcomes carry
+diagnostics across the library boundary. Real adapters and test adapters use
+the same contracts.
 
 The library never parses CLI arguments, prints output, or terminates the
 process. A future scheduler will call the library and real adapters directly
@@ -142,9 +157,12 @@ represent non-UTF-8 values losslessly rather than discarding or replacing
 bytes.
 
 The executable records the inspected process image and is classification
-evidence. Shell replay renders `argv[0]` as the command word followed by the
-remaining argv elements; it does not prepend the executable to argv. These
-values may legitimately differ for an interpreter or a custom `argv[0]`.
+evidence. Manual and fallback hints render captured `argv[0]` followed by the
+remaining argv elements; they do not prepend the captured executable.
+Automatic launch instead replaces `argv[0]` with the absolute target executable
+proved by preflight and preserves every remaining argument. This binds the
+executed command to `PlanningExecutable` even when the target shell's `PATH`
+differs from the invoking environment.
 
 `RecordedAbsolutePath` proves only that the captured value is syntactically
 absolute. Whether that directory still exists is intentionally resolved later
@@ -280,6 +298,11 @@ Classification maps that result as follows:
 v1 records only that foreground command. It does not capture or reconstruct a
 process tree.
 
+Opened tool-session record sets and contents are collected before and after the
+final foreground-process re-observation. A collection failure makes that
+record source unavailable, and any change across the closing fence invalidates
+the observation; stale record metadata cannot authorize automatic recovery.
+
 Automatic resolution uses the complete evidence contract in
 [TOOL-RECOVERIES.md](TOOL-RECOVERIES.md).
 
@@ -300,17 +323,20 @@ tmux-rescue/
 \-- latest -> snapshots/<capture-timestamp>-<unique-suffix>.json
 ```
 
-Each final key combines the capture timestamp with a collision-safe unique
-suffix. Filename creation is no-replace, so concurrent invocations cannot
-overwrite one another. Timestamp is the primary recency key; the unique suffix
-provides a deterministic tie-breaker for equal timestamps. A detected clock
-regression saves the snapshot but does not move `latest` backward and is
-logged. Valid historical snapshots are never modified or automatically deleted
-in v1.
+Each final filename parses into a canonical `SnapshotKey` containing the
+capture timestamp and an RFC 4122 version 4 UUID suffix. Filename creation is
+no-replace, so concurrent invocations cannot overwrite one another. Timestamp
+is the primary recency key; the unique suffix provides a deterministic
+tie-breaker for equal timestamps. A detected clock regression saves the
+snapshot but does not move `latest` backward and is logged. Valid historical
+snapshots are never modified or automatically deleted in v1.
 
 State directories and snapshot files are owner-only by default. Temporary
 publication files are not historical snapshots and may be removed after failed
-or interrupted publication.
+or interrupted publication. Preparation secures and syncs every required state
+directory, then syncs every ancestor directory entry through the filesystem
+root before snapshot publication begins. This also covers a multi-level path
+that a concurrent publisher may have created first.
 
 ### Publication
 
@@ -365,9 +391,12 @@ snapshot path. A later successful capture may atomically replace an invalid
 pointer and reports `ReplacedInvalid`.
 
 The `latest` symlink is valid only when it is a relative link naming a snapshot
-inside this state root's `snapshots/` directory. Restore rejects an absolute,
-escaping, or otherwise unexpected link target before reading it as the default
-snapshot.
+inside this state root's `snapshots/` directory. Its basename must parse as a
+canonical `SnapshotKey`, and that key's timestamp must equal the opened
+snapshot's validated `captured_at`. Restore rejects an absolute, escaping,
+noncanonical, incoherent, or otherwise unexpected link target before using it
+as the default snapshot. This key constraint does not apply to an explicitly
+selected snapshot path.
 
 Default selection resolves `latest` once, opens the selected target as a
 regular file beneath `snapshots/`, and validates and deserializes that same
@@ -402,7 +431,7 @@ snapshot selection
 -> deserialize RawSnapshot
 -> refine ValidatedSnapshot
 -> resolve target
--> prove AbsentAtPlanning
+-> prove AvailableAtPlanning
 -> resolve TargetShell and current resources
 -> construct RestorePlan
 ```
@@ -417,7 +446,7 @@ Planning produces only refined actions:
 ```text
 RestorePlan {
   target: RestoreTarget,
-  absent_at_planning: AbsentAtPlanning<RestoreTarget>,
+  available_at_planning: AvailableAtPlanning<RestoreTarget>,
   target_shell: TargetShell,
   topology: PlannedTopology,
   panes: NonEmptyUniqueOrdered<SourcePaneCoordinate, PlannedPaneAction>,
@@ -448,7 +477,10 @@ PlannedPaneAction =
 
 `ResolvedDirectory` retains whether it is the recorded directory or a named
 fallback. `RenderedShellInput` is derived from validated structured argv,
-contains no submitted Enter, and is bound to the selected `TargetShell`.
+contains no submitted Enter, is bound to the selected `TargetShell`, and is no
+larger than `MAX_RENDERED_SHELL_INPUT_BYTES`. The bound keeps the rendered
+input and its nested tmux command representation below the operating system's
+single-argument limit.
 `LaunchableShellInput` additionally proves that the command word resolves to an
 available executable in an existing recorded directory. `RestorePlan` and its
 actions are opaque products of planning; execution cannot reconstruct an action
@@ -471,18 +503,34 @@ The default plan-only command still succeeds after printing those degradations.
 
 Every restored pane uses one `TargetShell`. Because the target server is absent
 during planning, v1 follows tmux's new-server default order and selects the
-first suitable full executable path from:
+first suitable native Linux executable at a full path from:
 
 1. the invocation's `SHELL` environment variable;
 2. the effective user's `getpwuid(3)` shell; or
 3. `/bin/sh`.
 
+Script wrappers are not accepted as `TargetShell` in v1 because their runtime
+process identity would be the script interpreter rather than the selected
+path. Both the selected path's basename and the canonical runtime path's
+basename must identify a supported shell dialect; an unrelated native program
+behind a shell-named symbolic link is rejected. The canonical runtime must be a
+structurally complete architecture-compatible Linux ELF with file-bounded load
+segments and an executable entry point, and must match a supported conventional
+system-shell path or a supported entry in `/etc/shells`. Planning parses the
+runtime and captures its file identity from the same opened file. Construction
+does not execute a candidate shell, so plan-only restore has no shell-startup
+side effects.
+
 Topology creation passes this shell explicitly for every pane and sets it as
 the owned server's `default-shell`; a tmux configuration override cannot make
 the printed plan and executed shell diverge. The same typed value governs
-executable lookup, rendering, pane creation, and the input guard. Source shell
-identity is not captured. If the shell cannot be resolved or a command cannot
-be rendered safely for it, planning fails.
+rendering, pane creation, and the input guard. Automatic executable lookup uses
+the invocation environment's `PATH`, resolves one absolute executable, and
+stores that executable's file identity in the plan; launch does not depend on a
+later shell lookup. Source shell identity is not captured. The plan also records
+the shell executable's file identity and topology creation rechecks it before
+starting panes. If the shell cannot be resolved or a command cannot be rendered
+safely for it, planning fails.
 
 ### Execution Phases
 
@@ -490,8 +538,9 @@ Execution has a strict rollback boundary.
 
 #### Phase 1: Topology
 
-The executor first consumes `ExecutionCheckedTarget` with the create-if-absent
-capability. Successful creation returns `OwnedRestoreTarget`. The executor then:
+The executor first consumes `ExecutionCheckedTarget` with the
+create-if-no-live-server capability. Successful creation returns
+`OwnedRestoreTarget`. The executor then:
 
 - creates sessions with their resolved working directories;
 - creates windows at their recorded indexes and restores their names;
@@ -499,6 +548,12 @@ capability. Successful creation returns `OwnedRestoreTarget`. The executor then:
 - starts every pane with the planned `TargetShell` as the target server's
   default interactive shell; and
 - starts each pane in its resolved working directory.
+
+To establish a session's working directory when its first pane has a different
+working directory, topology creation starts a non-interactive blocking
+placeholder through `TargetShell`, then replaces it with that pane's
+interactive shell. The first interactive shell therefore starts exactly once,
+in the pane's resolved working directory.
 
 Exact split positions, sizes, and pane indexes are not restored.
 
@@ -517,7 +572,10 @@ RestoreTargetState =
 Normal topology rollback returns `Removed`. Cleanup failure or an indeterminate
 endpoint is fatal, prominently logged, and reported with `Retained` or
 `Unknown`; it is never summarized as successful removal. The executor cannot
-remove a target for which it lacks `OwnedRestoreTarget`.
+remove a target for which it lacks `OwnedRestoreTarget`. For an owned server,
+an absent endpoint yields `Removed` only after its recorded Linux process is
+also proved gone or replaced; the same live PID/start identity yields
+`Retained`.
 
 #### Phase 2: Program Recovery
 
@@ -526,10 +584,16 @@ Independent panes continue after local failures.
 
 Execution switches on `PlannedPaneAction`, not the snapshot's `PaneRecovery`.
 Before any action sends input, it invokes one guarded pane operation that binds
-the owned target, pane identity, planned shell identity, conditional foreground
-check, rendered input, and optional Enter. The adapter re-observes the pane as
-part of that operation and refuses input if the pane is missing, the shell is
-not foreground, or an observed identity changed. It does not return a reusable
+the owned target, recorded pane PID, planned shell identity, rendered input, and
+whether the typed operation is paste-only or an automatic launch. Automatic
+launch also carries and rechecks the planning-time executable file identity.
+The adapter performs a full Linux foreground-process re-observation immediately
+before a tmux-side conditional check of server ownership, pane liveness, pane
+PID, and current-command basename. The Linux observation also requires the
+planned pane working directory. Here `Idle` means that the expected interactive
+shell is the pane foreground process; it does not claim that a visible prompt
+has been recognized. The adapter refuses input when either check detects a
+missing pane or a non-shell foreground process. It does not return a reusable
 shell-verification token.
 
 An unexpected foreground process becomes `NeedsAttention` and receives no
@@ -538,8 +602,8 @@ commands, planned manual hints, preflight fallback hints, and
 failed-automatic hints.
 
 - `LeaveIdle`: verify and leave the interactive shell untouched.
-- `LaunchAutomatic`: submit the rendered recovery input and one separate
-  Enter.
+- `LaunchAutomatic`: bracketed-paste the rendered recovery input literally,
+  then submit one separate Enter.
 - `PasteManualHint`: paste the rendered foreground command without Enter.
 - `PasteAutomaticFallback`: paste the rendered recovery command without Enter.
 - `NoInput`: send no input and report the capture failure.
@@ -555,9 +619,15 @@ executor observes the pane using the whitelist variant's recovery expectation:
   and
 - a missing pane or observation failure is a local failure.
 
-No prior process observation authorizes later input. The conditional operation
-is the safety boundary against typing a hint into an already-running
-interactive program.
+This is a best-effort v1 input boundary, not an atomic Linux process lock: tmux
+cannot include foreground PID and process-start identity in the same predicate
+that sends pane input. A foreground transition that occurs in the scheduling
+gap and is indistinguishable by pane PID and command basename can evade the
+second check. The planned shell or automatic executable can likewise be
+replaced after its last file-identity check and before tmux receives the input.
+v1 keeps these gaps small, never reuses an earlier capture-time observation,
+and logs any detectable refusal; eliminating the residual races requires a
+stronger future tmux or process-control capability.
 
 ### Restore Outcomes
 
@@ -602,13 +672,16 @@ Restore CLI outcomes are:
 2  program recovery began but completed partially
 ```
 
-For exit 1 or 2, the final summary reports `RestoreTargetState`. Validation,
-preflight, and target-claim failures before ownership use `NotEstablished`;
-normal topology rollback uses `Observed(Removed)`; and cleanup failure may use
-`Observed(Retained)` or `Observed(Unknown)`. The restore plan and final summary
-go to standard output. Progress, warnings, fatal diagnostics, and per-pane
-failures go to standard error. v1 has no JSON-output contract; future automation
-calls the typed library API.
+Command-line syntax errors occur before a restore request exists; they exit 1
+with Clap usage diagnostics and no `RestoreTargetState`. For a parsed restore
+request exiting 1 or 2, the final summary reports `RestoreTargetState`.
+Validation, preflight, and target-claim failures that never begin target
+creation use `NotEstablished`; claim failures after creation begins report an
+observed disposition. Normal topology rollback uses `Observed(Removed)`, and
+cleanup failure may use `Observed(Retained)` or `Observed(Unknown)`. The restore
+plan and final summary go to standard output. Progress, warnings, fatal
+diagnostics, and per-pane failures go to standard error. v1 has no JSON-output
+contract; future automation calls the typed library API.
 
 ## Trust And Safety
 
@@ -639,8 +712,9 @@ working directory, and never removes a server it cannot prove it created.
 No error is silently converted into success.
 
 Capture, planning, storage, topology execution, and pane recovery return typed
-outcomes. Events identify the source coordinates, target coordinates when
-available, operation, failure, and fallback taken. The CLI renders them and
+outcomes. Capture events identify the attempt and source pane when applicable;
+planning, storage, and execution results retain their failure or fallback, and
+each pane result identifies its source coordinate. The CLI renders them and
 prints a final per-pane restore inventory.
 
 Expected plan-only completion and planned manual recovery are successful.
@@ -674,8 +748,9 @@ Core tests use fake external capabilities to verify:
 
 Storage tests inject failure before and after each publication commit boundary
 and cover no-replace immutable creation, equal-timestamp collisions, detected
-clock regression, global symlink replacement, concurrent `latest` ordering,
-and replacement of `latest` between selection and file opening.
+clock regression, multi-level concurrent directory durability, canonical key
+and snapshot-time coherence, global symlink replacement, concurrent `latest`
+ordering, and replacement of `latest` between selection and file opening.
 
 Whitelist resolver tests use tool metadata fixtures and cover every documented
 downgrade condition, canonical command derivation, and exact post-launch
