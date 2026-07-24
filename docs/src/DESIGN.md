@@ -126,21 +126,18 @@ Consequently a plan may print successfully even when `--run` will later fail to
 establish the destination.
 
 Execution passes the printed selector unchanged to its one start-capable
-command, which attempts to claim a fresh tmux server. Before topology creation,
-tmux-rescue requires the attempt's ownership token, server PID, tmux server
-start time, operating-system process start time, and zero sessions. Every
-confirmation, topology, recovery, verification, cleanup, and rollback client
-uses no-start mode and the same selector. If the selector reaches an existing
-server, the new token is not established and that server is not mutated or
-removed.
+command, which attempts to claim a fresh tmux server before any topology
+operation. Every later destination client uses no-start mode and the same
+selector. If the selector reaches an existing server, the claim produces no
+owned capability and that server is not mutated or removed.
 
 After a successful claim, execution creates sessions, windows, panes, and
 interactive shells, then restores programs inside those shells. On topology
-failure it rolls back only the server covered by the full ownership proof and
-reports any cleanup failure. If claim confirmation fails after the start
-attempt, cleanup is allowed only through narrower evidence proving that the
-same attempt token, PID, tmux start time, and operating-system process start
-time still identify the server. Once program recovery begins, the server is
+failure it rolls back only a proven-owned server and reports any cleanup
+failure. If claim confirmation fails after the start attempt, cleanup is
+allowed only with complete revalidated evidence. The exact ownership and
+cleanup evidence contracts are defined in
+[ARCHITECTURE.md](ARCHITECTURE.md). Once program recovery begins, the server is
 retained and independent panes are recovered on a best-effort basis.
 
 ## Recovery Policy

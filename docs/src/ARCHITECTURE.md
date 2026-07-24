@@ -671,9 +671,18 @@ session count; captures the operating-system process start time for that PID;
 repeats the tmux observation to reject an identity change; and proves the same
 process is still live. Only a matching token, stable PID and both start-time
 facts, and zero sessions produce `OwnedRestoreTarget`. The capability retains
-the destination and ownership facts required by every later mutation. An
-existing server does not acquire the new token from the claim configuration, so
-a selector that reaches one produces no owned capability and leaves its
+the destination and ownership facts required by every later mutation.
+
+Possessing the capability is not a one-time authorization. Before each owned
+mutation, the adapter proves that the retained PID still names the same live
+operating-system process with the retained process start time. It then executes
+the mutation only inside one tmux `if-shell` predicate that jointly rechecks the
+retained ownership token, server PID, and tmux server start time through the
+same selector. A failed process or tmux recheck sends no mutation. Cleanup uses
+the same guard with the additional zero-session predicate.
+
+An existing server does not acquire the new token from the claim configuration,
+so a selector that reaches one produces no owned capability and leaves its
 process, sessions, topology, and options untouched.
 
 After successful ownership proof, the executor:
@@ -693,9 +702,9 @@ in the pane's resolved working directory.
 
 Exact split positions, sizes, and pane indexes are not restored.
 
-Every mutation is scoped by `OwnedRestoreTarget`. If topology creation fails,
-rollback consumes that ownership value and returns a verified target
-disposition:
+Every mutation is scoped by `OwnedRestoreTarget` and passes the per-operation
+process-and-tmux ownership recheck above. If topology creation fails, rollback
+consumes that ownership value and returns a verified target disposition:
 
 ```text
 TargetDisposition = Removed | Retained | Missing | Unknown
