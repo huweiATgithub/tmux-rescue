@@ -9,8 +9,9 @@ as a topology-first terminal tree. It is read-only and does not contact tmux or
 inspect current processes.
 
 Restore is plan-first: by default it validates the snapshot and prints the
-planned topology and pane actions. `--run` performs that printed plan only when
-the target tmux server is absent.
+planned topology and pane actions without contacting the destination or writing
+application state. `--run` prints the same plan, then attempts to claim a fresh
+destination without mutating an existing tmux server.
 
 ## Requirements
 
@@ -25,11 +26,22 @@ cargo install tmux-rescue
 
 ## Use
 
-Capture the tmux server selected by the invoking tmux context:
+Capture the tmux server selected by the invoking tmux context, a named tmux
+server, or an exact socket path:
 
 ```bash
 tmux-rescue snapshot
+tmux-rescue -L work snapshot
+tmux-rescue -S ./work.sock snapshot
 ```
+
+`-L` and `-S` are root options and must appear before `snapshot` or `restore`.
+tmux-rescue passes the selected flag and value through to tmux without
+resolving or normalizing them.
+
+All captures share one archive: one `snapshots/` directory and one global
+`latest` pointer. A capture from any selected server may advance that pointer;
+there is no per-server snapshot stream.
 
 Inspect the global latest snapshot:
 
@@ -70,17 +82,41 @@ can be forced or disabled with `--color always` or `--color never`. A window
 with one pane is compacted to one line; windows with multiple panes retain their
 full branch structure.
 
-Inspect a restore plan for an absent target socket:
+Print restore plans for the global latest snapshot, using a named destination,
+an exact destination socket path, or the selected snapshot's recorded source
+path when no selector is given:
 
 ```bash
-tmux-rescue restore --target /tmp/tmux-rescue.sock
+tmux-rescue -L rescue restore
+tmux-rescue -S ./rescue.sock restore
+tmux-rescue restore
 ```
 
-Execute the same plan only after reviewing it:
+Snapshot selection and destination selection are independent. To restore a
+particular immutable capture to a selected destination, provide both:
 
 ```bash
-tmux-rescue restore --target /tmp/tmux-rescue.sock --run
+tmux-rescue -L rescue restore /path/to/immutable-snapshot.json
 ```
+
+Every plan begins by printing the exact selector it will use, for example
+`target: -L rescue` or `target: -S ./rescue.sock`. With no explicit selector,
+it prints the generated `-S` selector for the snapshot's recorded source path.
+Display escaping is diagnostic; execution retains the original operating-
+system string.
+
+Plan-only restore does not contact the destination and performs no application
+filesystem writes. After review, add `--run` to the same root-level form:
+
+```bash
+tmux-rescue -S ./rescue.sock restore /path/to/immutable-snapshot.json --run
+```
+
+Execution passes that exact selector to the one start-capable ownership claim.
+Topology mutation begins only after the claim proves the attempt's token,
+server PID, tmux server start time, operating-system process start time, and
+zero sessions. A selector that reaches an existing server cannot establish the
+new token, so tmux-rescue does not mutate or remove that server.
 
 The default snapshot is `latest` for both `inspect` and `restore`; an explicit
 immutable snapshot path may be supplied as the first argument.

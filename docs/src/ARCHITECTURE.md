@@ -16,51 +16,50 @@ The automatic-recovery variants and their tool-specific evidence are owned by
 ## System Boundary
 
 tmux-rescue observes one live source tmux server, stores immutable snapshots,
-and may reconstruct a snapshot on one absent target tmux server.
+and may reconstruct a selected snapshot on one selected destination tmux
+server. Live-server selection and stored-snapshot selection are separate
+boundaries.
 
-The source and target are separate concepts:
+The selector and destination types are:
 
-- `SnapshotSource(TmuxServerIdentity)` identifies the tmux server that was
-  captured.
-- `RestoreTarget(TmuxServerIdentity)` identifies the socket selected for
-  reconstruction.
-- `TargetVacancy = MissingPath | RefusedSocket` distinguishes a missing socket
-  path from the refused socket left by a crashed tmux server.
-- `AvailableAtPlanning<RestoreTarget>` carries that refined target-vacancy
-  preflight used to produce a plan.
-- `ExecutionCheckedTarget<RestoreTarget>` is produced by the execution-time
-  recheck and may be consumed only by target creation.
-- `OwnedRestoreTarget<RestoreTarget>` is returned only when creation establishes
-  that the current restore created that exact server. It is required by every
-  topology mutation and by rollback.
+```text
+TmuxSelector =
+    SocketName(OsString)  // emit as -L <raw-value>
+  | SocketPath(OsString)  // emit as -S <raw-value>
 
-The target defaults to the source socket but may differ. Source identity is
-recorded context, not a restriction on where an explicit snapshot may be
-restored.
+RestoreDestination {
+  selector: TmuxSelector
+}
+```
 
-Raw CLI and snapshot server selectors are parsed into a
-`TmuxServerIdentity`, which denotes one concrete tmux socket endpoint. Target
-existence checks and all later tmux operations consume that resolved identity,
-not the original string. The plan-time vacancy result is not reused as proof at
-execution time.
+`TmuxSelector` encodes the parser's proof that the two spellings are exclusive.
+Its value is a lossless operating-system string. tmux-rescue does not make a
+path absolute, canonicalize a value, derive a path from `-L`, inspect tmux's
+selector environment rules, prepare a selector-derived directory, or reject a
+value based on reimplemented tmux semantics. `RestoreDestination` owns exactly
+one selector; `RestorePlan` owns exactly one destination.
 
-Target creation is a create-if-no-live-server boundary. A missing path and a
-Unix socket that rejects connection are the only accepted vacancy observations;
-the latter is necessary because a crashed tmux server leaves its socket path
-behind. Existing live servers, non-socket paths, inaccessible endpoints, and
-other indeterminate states fail closed. A vacancy observation alone cannot
-produce `OwnedRestoreTarget`, and cleanup cannot accept vacancy as ownership.
-Execution rechecks vacancy, then creation must prove that this invocation
-created the exact server before topology mutation. If another server wins the
-race, claim fails without topology mutation. If an adapter cannot establish
-ownership without first mutating an existing server, `--run` is unsupported for
-that target rather than weakening this invariant. Once creation has started,
-failed ownership readback triggers a token-conditional cleanup attempt; a
-server with any other token is left untouched, and the observed cleanup
-disposition is part of the fatal result. A missing or refused socket is not by
-itself proof that an observed owned server process has exited. When process
-identity was established, cleanup also compares the Linux PID and process
-start time; failed cleanup without such proof reports an unknown disposition.
+One command-construction boundary appends the selector's exact flag and raw
+value as two `std::process::Command` arguments. It never reconstructs an
+argument from display text. An explicit selector remains unchanged for the
+lifetime of its source adapter or restore destination, including relative and
+non-UTF-8 values. tmux-reported source paths are provenance; they do not replace
+or reinterpret an explicit selector.
+
+Snapshot source and restore destination are separate concepts. The snapshot's
+validated `SnapshotSource` records the tmux-reported absolute source path.
+Restore uses an explicit selector when supplied; otherwise it deliberately
+wraps that recorded path as `TmuxSelector::SocketPath`. This generated fallback
+is restore policy, not resolution of a user selector. Neither choice restricts
+which immutable snapshot may be restored.
+
+`OwnedRestoreTarget` is returned only after an execution-time claim proves the
+attempt token, server PID, tmux server start time, operating-system process
+start time, and zero sessions. It is required for topology mutation and normal
+rollback. A failed claim returns no owned capability. Cleanup after a possible
+start uses a narrower cleanup-only proof of the same token, PID, and start-time
+facts; incomplete or changed evidence authorizes no mutation and produces a
+conservative observed disposition.
 
 ## Rust Boundary
 
@@ -80,6 +79,12 @@ the same contracts.
 The library never parses CLI arguments, prints output, or terminates the
 process. A future scheduler will call the library and real adapters directly
 rather than invoke or parse the CLI.
+
+The binary has one raw-argument boundary. It parses root-level `-L` or `-S`
+directly into an optional `TmuxSelector`, then passes that refined value to the
+capture adapter or restore planner. Downstream code does not carry parallel
+optional selector values or recheck their exclusivity. `inspect` accepts no
+selector.
 
 Human snapshot inspection is owned by a private binary module. It accepts only
 a storage-produced `LoadedSnapshot`, constructs private display facts, and
@@ -219,13 +224,22 @@ not a success requirement.
 v1 capture is manual. The core exposes one capture operation used by:
 
 ```text
-tmux-rescue snapshot
+tmux-rescue [-L SOCKET_NAME | -S SOCKET_PATH] snapshot
 ```
 
-The CLI uses the tmux server selected by the invoking tmux context, or tmux's
-default server when there is no current context. A missing or indeterminate
-source is an error. The reusable core receives an already parsed
-`SnapshotSource`; v1 adds no separate CLI source-selector flag.
+Without an explicit selector, the first no-start tmux query uses the invoking
+tmux context or tmux's default selection. It observes `#{socket_path}`, validates
+that value as `SnapshotSource`, and pins all later commands in that capture to a
+generated `SocketPath` selector. With an explicit selector, the initial query
+and every later source command use the original `-L` or `-S` value unchanged;
+the query's reported path is recorded only as source provenance. A missing,
+rejected, or malformed selection is an error and publishes nothing.
+
+The source adapter retains both the validated provenance and the selector used
+for subsequent commands. Source commands use tmux's no-start mode. Capture does
+not intentionally create a selected server, assign local meaning to the
+selector, or change selector-relevant working directory or inherited
+environment between calls.
 
 Every successful invocation creates a new snapshot. Capture performs no
 comparison or deduplication against earlier snapshots.
@@ -334,6 +348,11 @@ tmux-rescue/
 |   \-- <capture-timestamp>-<unique-suffix>.json
 \-- latest -> snapshots/<capture-timestamp>-<unique-suffix>.json
 ```
+
+This is one global stream. The layout has no selector, socket-name, or
+socket-path partition. Every successful capture publishes into the same
+`snapshots/` directory and participates in ordering the same `latest` pointer,
+even when successive captures selected different tmux servers.
 
 Each final filename parses into a canonical `SnapshotKey` containing the
 capture timestamp and an RFC 4122 version 4 UUID suffix. Filename creation is
@@ -479,20 +498,31 @@ no progress messages and has no partial-success status.
 Restore is plan-first:
 
 ```text
-tmux-rescue restore          # validate, preflight, print plan, stop
-tmux-rescue restore --run    # validate, preflight, print plan, execute
+tmux-rescue [-L SOCKET_NAME | -S SOCKET_PATH] restore [SNAPSHOT]
+    # validate, preflight resources, print plan, stop
+tmux-rescue [-L SOCKET_NAME | -S SOCKET_PATH] restore [SNAPSHOT] --run
+    # print the same plan, then execute
 ```
 
-The full command shape is
-`tmux-rescue restore [SNAPSHOT] [--target <server>] [--run]`.
+The selector is optional, mutually exclusive, non-repeatable, and root-level.
+`SNAPSHOT` selects an explicit immutable file; omitting it selects the one
+global `latest`. These choices are independent: `-L abc restore` means restore
+the global latest snapshot to tmux's `-L abc` destination, not restore the
+latest snapshot captured from that server.
 
-Without an explicit snapshot path, restore selects the global `latest`
-symlink. Both modes reject a target tmux server that already exists. This
-rejection applies even when only printing a plan.
+An explicit destination selector is retained byte-for-byte. When it is omitted,
+planning constructs `TmuxSelector::SocketPath(snapshot.source().path())` from
+the selected snapshot's validated source provenance. Rendering and execution
+both borrow that single selector from the plan's `RestoreDestination`; neither
+can silently fall back to the snapshot source after an explicit selector was
+supplied.
 
-`--run` repeats the target-existence check immediately before topology
-creation. If the target appeared after planning, execution aborts without
-touching it.
+Plan-only restore makes no tmux call against the destination and performs no
+filesystem writes. It neither derives a destination path nor claims that the
+destination is vacant, absent, available, resolved, or claimable. `--run` may
+therefore print a valid plan and then fail at the execution-time ownership
+claim. A destination that reaches an existing server fails that claim without
+topology mutation.
 
 ### Validation And Preflight
 
@@ -502,8 +532,8 @@ Planning performs:
 snapshot selection
 -> deserialize RawSnapshot
 -> refine ValidatedSnapshot
--> resolve target
--> prove AvailableAtPlanning
+-> choose explicit TmuxSelector or generate SocketPath(snapshot.source.path)
+-> construct RestoreDestination
 -> resolve TargetShell and current resources
 -> construct RestorePlan
 ```
@@ -517,10 +547,9 @@ Planning produces only refined actions:
 
 ```text
 RestorePlan {
-  target: RestoreTarget,
-  available_at_planning: AvailableAtPlanning<RestoreTarget>,
+  destination: RestoreDestination,
   target_shell: TargetShell,
-  topology: PlannedTopology,
+  sessions: NonEmptyUniqueOrdered<SessionName, PlannedSession>,
   panes: NonEmptyUniqueOrdered<SourcePaneCoordinate, PlannedPaneAction>,
   degradations: Ordered<PlanDegradation>
 }
@@ -556,7 +585,20 @@ single-argument limit.
 `LaunchableShellInput` additionally proves that the command word resolves to an
 available executable in an existing recorded directory. `RestorePlan` and its
 actions are opaque products of planning; execution cannot reconstruct an action
-from raw snapshot fields.
+from raw snapshot fields. The plan contains no parallel absolute destination
+identity and no destination-availability capability.
+
+The first plan line renders the exact stored selector:
+
+```text
+target: -L abc
+target: -S ./rescue.sock
+target: -S /recorded/source.sock  # generated fallback when no selector was given
+```
+
+Only one of those lines appears. Arbitrary operating-system strings use the
+CLI's safe diagnostic escaping. Display text does not feed execution; the
+original `OsString` remains in `TmuxSelector`.
 
 Preflight resolves current working directories and executables where possible:
 
@@ -573,9 +615,9 @@ Every directory fallback is a plan degradation and makes `--run` partial. An
 executable fallback for an intended automatic recovery is also a degradation.
 The default plan-only command still succeeds after printing those degradations.
 
-Every restored pane uses one `TargetShell`. Because the target server is absent
-during planning, v1 follows tmux's new-server default order and selects the
-first suitable native Linux executable at a full path from:
+Every restored pane uses one `TargetShell`. For the server that execution may
+claim, v1 follows tmux's new-server default order and selects the first suitable
+native Linux executable at a full path from:
 
 1. the invocation's `SHELL` environment variable;
 2. the effective user's `getpwuid(3)` shell; or
@@ -610,9 +652,31 @@ Execution has a strict rollback boundary.
 
 #### Phase 1: Topology
 
-The executor first consumes `ExecutionCheckedTarget` with the
-create-if-no-live-server capability. Successful creation returns
-`OwnedRestoreTarget`. The executor then:
+The executor first passes the plan's `RestoreDestination` to the target adapter.
+The adapter creates an unpredictable token in a private claim configuration and
+runs its sole start-capable destination command:
+
+```text
+tmux <exact-selector> -f <claim-config> start-server
+```
+
+Every other destination client—claim confirmation and recheck, topology,
+recovery, verification, failed-claim cleanup, and rollback—uses tmux no-start
+mode (`-N`) with the same selector. If the endpoint disappears, these clients
+fail closed instead of starting a replacement server.
+
+The start command alone is not ownership. Through the same selector, claim
+confirmation reads the attempt token, server PID, tmux server start time, and
+session count; captures the operating-system process start time for that PID;
+repeats the tmux observation to reject an identity change; and proves the same
+process is still live. Only a matching token, stable PID and both start-time
+facts, and zero sessions produce `OwnedRestoreTarget`. The capability retains
+the destination and ownership facts required by every later mutation. An
+existing server does not acquire the new token from the claim configuration, so
+a selector that reaches one produces no owned capability and leaves its
+process, sessions, topology, and options untouched.
+
+After successful ownership proof, the executor:
 
 - creates sessions with their resolved working directories;
 - creates windows at their recorded indexes and restores their names;
@@ -648,6 +712,18 @@ remove a target for which it lacks `OwnedRestoreTarget`. For an owned server,
 an absent endpoint yields `Removed` only after its recorded Linux process is
 also proved gone or replaced; the same live PID/start identity yields
 `Retained`.
+
+A claim failure before `start-server` may have begun reports
+`RestoreTargetState::NotEstablished`. Once the command may have run, failure
+returns no `OwnedRestoreTarget` and reports an evidence-based
+`RestoreTargetState::Observed(Removed | Retained | Missing | Unknown)`.
+Failed-claim cleanup is authorized by a separate cleanup-only capability, not
+by an inference from command success or endpoint absence. That capability is
+created only when the same selector still observes this attempt's matching
+token, PID, tmux server start time, operating-system process start time, and
+zero sessions; it rechecks those facts before a guarded `kill-server`. Missing,
+mismatched, or changed evidence leaves the server untouched and the disposition
+conservative.
 
 #### Phase 2: Program Recovery
 
@@ -816,41 +892,56 @@ Core tests use fake external capabilities to verify:
 
 - raw-to-validated snapshot refinement;
 - invalid-state and malicious-input rejection;
+- exclusive `TmuxSelector` variants and exact two-argument `-L`/`-S` emission,
+  including empty, relative, and non-UTF-8 values;
 - lossless argv round-tripping, including empty arguments and non-UTF-8 values,
   and target-shell rendering;
 - stable capture, topology retries, and unstable publication at
   `MAX_TOPOLOGY_VALIDATION_ATTEMPTS`;
 - before-read, after-read, and incomplete-candidate attempt outcomes;
+- ambient source pinning to the reported path and explicit-selector retention on
+  every source command;
 - idle, automatic, manual, and unavailable pane classification;
 - rejection of incoherent or cross-variant automatic payloads;
 - missing-directory and missing-executable planned actions and degradation
   provenance;
 - deterministic `TargetShell` selection across planning and execution;
-- target-existence rejection in both plan and run modes;
-- target creation races, ownership-scoped topology, and rollback cleanup
-  failure;
+- explicit destination independence, snapshot-source fallback, and exact
+  selector rendering from `RestorePlan`;
+- no destination call or filesystem write during plan-only restore;
+- exactly one start-capable claim command and no-start mode for confirmation,
+  topology, recovery, verification, failed-claim cleanup, and rollback;
+- existing-server protection, full token/PID/tmux-start/process-start/session
+  ownership proof, cleanup-only proof, ownership-scoped topology, and rollback
+  cleanup failure;
 - best-effort pane continuation after recovery begins;
 - a foreground-process change during guarded input, with no input sent;
 - exact automatic identity or serve-command confirmation after launch;
 - hint pasting without Enter only through the guarded input operation; and
 - typed outcome and exit-status mapping.
 
-Binary renderer and CLI tests verify exact plain and styled inspection output,
+Binary renderer and CLI tests verify root-level selector grammar and conflicts,
+exact selector plan output, the generated source-path fallback, and plan-before-
+execution ordering. They also verify exact plain and styled inspection output,
 lossless command/path display encoding, ordered program aggregation, latest and
-explicit selection, unstable and unavailable continuation, per-stream color
-policy, empty stdout on fatal loading failures, and the absence of live tmux,
-process, restore-planning, or preflight access.
+explicit snapshot selection, unstable and unavailable continuation, per-stream
+color policy, empty stdout on fatal loading failures, and the absence of live
+tmux, process, restore-planning, or preflight access during inspection.
 
 Storage tests inject failure before and after each publication commit boundary
 and cover no-replace immutable creation, equal-timestamp collisions, detected
 clock regression, multi-level concurrent directory durability, canonical key
 and snapshot-time coherence, global symlink replacement, concurrent `latest`
-ordering, and replacement of `latest` between selection and file opening.
+ordering, replacement of `latest` between selection and file opening, and
+captures from different selected servers sharing the same archive and pointer.
 
 Whitelist resolver tests use tool metadata fixtures and cover every documented
 downgrade condition, canonical command derivation, and exact post-launch
 success predicate.
 
-End-to-end tests may create a uniquely addressed temporary tmux server and
-temporary state directory. They must never inspect, mutate, or target the
-user's default tmux server.
+Real-tmux integration tests create uniquely addressed temporary `-L` and `-S`
+servers and temporary state directories. They exercise exact selector
+pass-through for snapshot and restore, global-latest selection, source-path
+fallback, and protection of an existing server's process, sessions, topology,
+and options after claim-token mismatch. They run serially and never inspect,
+mutate, or target the user's default tmux server.

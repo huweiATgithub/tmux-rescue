@@ -26,19 +26,40 @@ state.
 
 ## v1 User Experience
 
+Snapshot and restore accept tmux's two server selectors at the root command:
+
+```text
+tmux-rescue [-L SOCKET_NAME | -S SOCKET_PATH] snapshot
+tmux-rescue [-L SOCKET_NAME | -S SOCKET_PATH] restore [SNAPSHOT] [--run]
+```
+
+`-L` and `-S` are mutually exclusive, non-repeatable, and must appear before
+the subcommand. tmux-rescue preserves the chosen flag and its lossless
+operating-system string as an opaque instruction. It does not resolve a socket
+name, normalize a socket path, or reproduce tmux's environment and directory
+rules; tmux remains responsible for interpreting the selector.
+
 ### Snapshot
 
-`tmux-rescue snapshot` captures one selected tmux server and, when capture and
-publication succeed, writes a new independent snapshot. v1 does not compare it
-with earlier captures. A failed invocation that cannot produce a complete
-candidate writes no historical snapshot. A publication interruption may leave
-a temporary file or an unreferenced immutable snapshot as defined by the
-storage contract.
+Without a selector, `tmux-rescue snapshot` initially uses tmux's ambient server
+selection. It observes that server's reported socket path and pins the remaining
+capture commands to the generated `-S` selector so one capture cannot drift
+between sources. With `-L` or `-S`, every source command retains the exact
+explicit selector instead; a reported source path is recorded as provenance but
+does not replace or reinterpret it. Source commands use tmux's no-start mode.
+
+When capture and publication succeed, snapshot writes a new independent
+snapshot. v1 does not compare it with earlier captures. A failed selection,
+source query, or capture that cannot produce a complete candidate writes no
+historical snapshot. A publication interruption may leave a temporary file or
+an unreferenced immutable snapshot as defined by the storage contract.
 
 The snapshot contains the source server identity, capture metadata, and the
 ordered session, window, and pane tree. It also contains the typed recovery
-state for each pane. The newly published snapshot may update the global
-`latest` symlink.
+state for each pane. Every selected server publishes into the same
+`snapshots/` directory and competes to update the same global `latest` symlink.
+Selector values do not partition storage; restoring a non-latest capture uses
+its explicit immutable snapshot path.
 
 Snapshot capture is manual in v1. Scheduling, tmux hooks, and an internal daemon
 are deferred until the core capture API has proved useful.
@@ -84,22 +105,43 @@ explicit immutable snapshot path may be supplied instead.
 Restore is plan-first:
 
 ```text
-tmux-rescue restore [SNAPSHOT] [--target <server>]
-    # validate, preflight, and print the plan
+tmux-rescue [-L SOCKET_NAME | -S SOCKET_PATH] restore [SNAPSHOT]
+    # validate, plan, and print without contacting the destination
 
-tmux-rescue restore [SNAPSHOT] [--target <server>] --run
+tmux-rescue [-L SOCKET_NAME | -S SOCKET_PATH] restore [SNAPSHOT] --run
     # print the same plan, then execute it
 ```
 
-Both forms reject a target tmux server that already exists. The target defaults
-to the source socket recorded by the snapshot, but the user may select a
-different, absent target server.
+Snapshot selection and destination selection are independent. `SNAPSHOT`
+selects an immutable capture, or its omission selects the global `latest`;
+`-L` or `-S` independently selects the destination. With no explicit selector,
+restore generates `-S <recorded-source-path>` from the selected snapshot's
+validated source provenance.
 
-Execution first creates sessions, windows, panes, and interactive shells. It
-then restores programs inside those shells. On topology failure it rolls back
-only a server proven to have been created by the current restore and reports
-any cleanup failure. Once program recovery begins, the server is retained and
-independent panes are recovered on a best-effort basis.
+The printed plan begins with the selector exactly as retained for execution,
+using safe diagnostic escaping for arbitrary operating-system strings. It does
+not call tmux against the destination, perform application filesystem writes,
+or claim that the destination is absent, available, resolved, or claimable.
+Consequently a plan may print successfully even when `--run` will later fail to
+establish the destination.
+
+Execution passes the printed selector unchanged to its one start-capable
+command, which attempts to claim a fresh tmux server. Before topology creation,
+tmux-rescue requires the attempt's ownership token, server PID, tmux server
+start time, operating-system process start time, and zero sessions. Every
+confirmation, topology, recovery, verification, cleanup, and rollback client
+uses no-start mode and the same selector. If the selector reaches an existing
+server, the new token is not established and that server is not mutated or
+removed.
+
+After a successful claim, execution creates sessions, windows, panes, and
+interactive shells, then restores programs inside those shells. On topology
+failure it rolls back only the server covered by the full ownership proof and
+reports any cleanup failure. If claim confirmation fails after the start
+attempt, cleanup is allowed only through narrower evidence proving that the
+same attempt token, PID, tmux start time, and operating-system process start
+time still identify the server. Once program recovery begins, the server is
+retained and independent panes are recovered on a best-effort basis.
 
 ## Recovery Policy
 
@@ -141,7 +183,9 @@ operating-system values before adding terminal styles. It performs no live
 system access or mutation.
 
 Restore never mutates an existing tmux server, never creates missing working
-directories, and never automatically executes a manual recovery command.
+directories, and never automatically executes a manual recovery command. Only
+a fully proven owned destination can reach topology mutation or rollback;
+cleanup after an unconfirmed claim has its own narrower, cleanup-only proof.
 Commands are stored as structured argv and rendered for the target interactive
 shell only after validation.
 
