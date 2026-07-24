@@ -108,7 +108,7 @@ impl TerminalColorSupport {
 
 #[derive(Debug, Subcommand)]
 enum RawCommand {
-    /// Capture the tmux server selected by the invoking tmux context.
+    /// Capture the ambient tmux server; root -L/-S before snapshot select one explicitly.
     Snapshot,
     /// Validate and display a captured tmux workspace.
     Inspect {
@@ -1005,6 +1005,16 @@ mod tests {
                 run: false
             }
         );
+    }
+
+    #[test]
+    fn snapshot_help_describes_ambient_and_explicit_selection() {
+        let mut command = RawCli::command();
+        let help = command.render_help().to_string();
+
+        assert!(help.contains(
+            "Capture the ambient tmux server; root -L/-S before snapshot select one explicitly"
+        ));
     }
 
     #[test]

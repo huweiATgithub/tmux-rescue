@@ -518,7 +518,7 @@ can silently fall back to the snapshot source after an explicit selector was
 supplied.
 
 Plan-only restore makes no tmux call against the destination and performs no
-filesystem writes. It neither derives a destination path nor claims that the
+application filesystem writes. It neither derives a destination path nor claims that the
 destination is vacant, absent, available, resolved, or claimable. `--run` may
 therefore print a valid plan and then fail at the execution-time ownership
 claim. A destination that reaches an existing server fails that claim without
@@ -917,7 +917,9 @@ Core tests use fake external capabilities to verify:
 - deterministic `TargetShell` selection across planning and execution;
 - explicit destination independence, snapshot-source fallback, and exact
   selector rendering from `RestorePlan`;
-- no destination call or filesystem write during plan-only restore;
+- plan-only target-factory nonconstruction, no destination call, and unchanged
+  entries and content in controlled cwd, `TMPDIR`, `XDG_STATE_HOME`, `HOME`, and
+  `TMUX_TMPDIR` trees;
 - exactly one start-capable claim command and no-start mode for confirmation,
   topology, recovery, verification, failed-claim cleanup, and rollback;
 - existing-server protection, full token/PID/tmux-start/process-start/session
