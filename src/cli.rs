@@ -50,6 +50,13 @@ impl ColorMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum IconMode {
+    #[default]
+    Unicode,
+    Nerd,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalColorSupport {
     stdout_auto: bool,
@@ -92,6 +99,9 @@ pub enum Command {
         /// When to use terminal color.
         #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
         color: ColorMode,
+        /// Which icon set to use.
+        #[arg(long, value_enum, default_value_t = IconMode::Unicode)]
+        icons: IconMode,
     },
     /// Validate and print a restore plan, then optionally execute it.
     Restore {
@@ -165,6 +175,7 @@ impl From<Option<PathBuf>> for SnapshotSelection {
 pub struct InspectRequest {
     pub selection: SnapshotSelection,
     pub color: ColorMode,
+    pub icons: IconMode,
 }
 
 pub trait CliRunner {
@@ -176,9 +187,14 @@ pub trait CliRunner {
 pub fn dispatch(cli: Cli, runner: &mut impl CliRunner) -> u8 {
     match cli.command {
         Command::Snapshot => runner.snapshot(),
-        Command::Inspect { snapshot, color } => runner.inspect(InspectRequest {
+        Command::Inspect {
+            snapshot,
+            color,
+            icons,
+        } => runner.inspect(InspectRequest {
             selection: snapshot.into(),
             color,
+            icons,
         }),
         Command::Restore {
             snapshot,
@@ -741,9 +757,13 @@ mod tests {
         }
     }
 
-    fn inspect_command(cli: Cli) -> (Option<PathBuf>, ColorMode) {
+    fn inspect_command(cli: Cli) -> (Option<PathBuf>, ColorMode, IconMode) {
         match cli.command {
-            Command::Inspect { snapshot, color } => (snapshot, color),
+            Command::Inspect {
+                snapshot,
+                color,
+                icons,
+            } => (snapshot, color, icons),
             Command::Snapshot | Command::Restore { .. } => panic!("expected inspect command"),
         }
     }
@@ -768,7 +788,21 @@ mod tests {
 
         assert_eq!(
             inspect_command(parse(&["tmux-rescue", "inspect"])),
-            (None, ColorMode::Auto)
+            (None, ColorMode::Auto, IconMode::Unicode),
+        );
+        assert_eq!(
+            inspect_command(parse(&[
+                "tmux-rescue",
+                "inspect",
+                "snapshot.json",
+                "--icons",
+                "nerd",
+            ])),
+            (
+                Some(PathBuf::from("snapshot.json")),
+                ColorMode::Auto,
+                IconMode::Nerd,
+            ),
         );
         assert_eq!(
             inspect_command(parse(&[
@@ -781,6 +815,7 @@ mod tests {
             (
                 Some(PathBuf::from("relative/snapshot.json")),
                 ColorMode::Always,
+                IconMode::Unicode,
             )
         );
         assert_eq!(
@@ -794,9 +829,11 @@ mod tests {
             (
                 Some(PathBuf::from("relative/snapshot.json")),
                 ColorMode::Never,
+                IconMode::Unicode,
             )
         );
         assert!(Cli::try_parse_from(["tmux-rescue", "inspect", "--color", "sometimes"]).is_err());
+        assert!(Cli::try_parse_from(["tmux-rescue", "inspect", "--icons", "automatic"]).is_err());
         assert!(Cli::try_parse_from(["tmux-rescue", "inspect", "one.json", "two.json"]).is_err());
 
         let (snapshot, target, run) = restore_command(parse(&[
@@ -840,6 +877,8 @@ mod tests {
                     "relative/snapshot.json",
                     "--color",
                     "never",
+                    "--icons",
+                    "nerd",
                 ]),
                 &mut runner,
             ),
@@ -850,6 +889,7 @@ mod tests {
             [InspectRequest {
                 selection: SnapshotSelection::Explicit(PathBuf::from("relative/snapshot.json")),
                 color: ColorMode::Never,
+                icons: IconMode::Nerd,
             }]
         );
 
@@ -964,6 +1004,7 @@ mod tests {
         let request = InspectRequest {
             selection: SnapshotSelection::Explicit(snapshot),
             color: ColorMode::Always,
+            icons: IconMode::Unicode,
         };
         let mut stdout = FailingWriter;
         let mut stderr = Vec::new();
