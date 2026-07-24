@@ -47,7 +47,7 @@
 - Create: `src/selector.rs`
 - Modify: `src/lib.rs`
 
-- [ ] **Step 1: Write failing unit tests for exact argument emission**
+- [x] **Step 1: Write failing unit tests for exact argument emission**
 
   Add `src/selector.rs` with tests that construct a `std::process::Command`, append a selector, and inspect `Command::get_args()` as `OsStr` values. Register `mod selector;` in `src/lib.rs` in this RED step so Cargo discovers and compiles the new tests. Cover:
 
@@ -60,7 +60,7 @@
 
   Each test must assert exactly two appended arguments and byte-for-byte preservation. Add a mutation-sensitive assertion that `SocketName` emits `-L` and `SocketPath` emits `-S`.
 
-- [ ] **Step 2: Run the selector tests and confirm RED**
+- [x] **Step 2: Run the selector tests and confirm RED**
 
   Run:
 
@@ -70,7 +70,7 @@
 
   Expected failure: unresolved `TmuxSelector` and selector-emission API.
 
-- [ ] **Step 3: Implement one deep selector type**
+- [x] **Step 3: Implement one deep selector type**
 
   Implement this public representation and its single command boundary:
 
@@ -90,7 +90,7 @@
 
   `append_to` must call `command.arg(self.flag()).arg(self.value())`. It must not convert through `String`, `Path`, display text, or a shell. Export the module from `src/lib.rs` using the repository's existing module/re-export style.
 
-- [ ] **Step 4: Run focused and library tests**
+- [x] **Step 4: Run focused and library tests**
 
   Run:
 
@@ -99,7 +99,7 @@
   cargo test --locked --lib
   ```
 
-- [ ] **Step 5: Commit the selector primitive**
+- [x] **Step 5: Commit the selector primitive**
 
   ```bash
   git add src/selector.rs src/lib.rs
