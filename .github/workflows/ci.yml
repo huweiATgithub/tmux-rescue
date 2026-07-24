@@ -15,6 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  MDBOOK_VERSION: "0.5.3"
 
 jobs:
   rust:
@@ -31,6 +32,9 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Install mdBook required by integration tests
+        run: cargo install mdbook --version "$MDBOOK_VERSION" --locked
 
       - name: Install tmux 3.4
         run: |
@@ -54,4 +58,3 @@ jobs:
 
       - name: Package crate
         run: cargo package --locked
-
