@@ -405,13 +405,13 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 - Modify: `tests/tmux_source.rs`
 - Modify: `tests/tmux_target.rs`
 
-- [ ] **Step 1: Make the existing idle-pane fixture state-ready**
+- [x] **Step 1: Make the existing idle-pane fixture state-ready**
 
   Capture the initial pane ID from `new-session -P -F '#{pane_id}'`. Before snapshotting, poll a semantic condition until that pane's foreground process is the intended idle shell; require two consecutive matching observations so the login profile's transient `update-motd` cannot satisfy readiness.
 
   Reuse the production process observation seam where practical. Do not add an arbitrary sleep and do not weaken the expected idle-pane assertion.
 
-- [ ] **Step 2: Add a two-source global-stream test**
+- [x] **Step 2: Add a two-source global-stream test**
 
   Start one isolated source with `-L` and another with `-S`, capture both through the binary with one `XDG_STATE_HOME`, and assert:
 
@@ -422,7 +422,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   For test isolation only, give named-socket commands one temporary `TMUX_TMPDIR`. The production code and assertions must not derive or claim the resulting path.
 
-- [ ] **Step 3: Add plan-only non-contact/non-write coverage**
+- [x] **Step 3: Add plan-only non-contact/non-write coverage**
 
   Retain Task 2's orchestration proof that plan-only preparation has no write-capable input and does not invoke the injected target factory.
 
@@ -430,13 +430,13 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   The test scope is tmux-rescue-managed state and destination effects; caller-owned stdout capture is not an application filesystem write.
 
-- [ ] **Step 4: Update the comprehensive restore flow**
+- [x] **Step 4: Update the comprehensive restore flow**
 
   Replace positive `--target` invocations with root-level `-S`. Assert the exact target line rather than a substring, keep plan-only/run plan parity, and preserve all existing topology and pane-recovery assertions.
 
   Add or retain real existing-server protection for both selector variants, including PID, full session/topology inventory, and sentinel global options before and after the failed claim.
 
-- [ ] **Step 5: Run the real-tmux tests and confirm GREEN**
+- [x] **Step 5: Run the real-tmux tests and confirm GREEN**
 
   Run serially:
 
@@ -449,7 +449,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Repeat the e2e test once to verify the state-based readiness fix is stable.
 
-- [ ] **Step 6: Commit integration evidence**
+- [x] **Step 6: Commit integration evidence**
 
   ```bash
   git add tests/e2e.rs tests/storage.rs tests/tmux_source.rs tests/tmux_target.rs
