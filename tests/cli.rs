@@ -84,7 +84,7 @@ fn explicit_inspect_bypasses_state_root_and_live_systems() {
     assert!(stdout.contains("Consistency  ● stable topology\n"));
     assert!(stdout.contains(&format!("File         {}\n", snapshot.display())));
     assert!(stdout.contains("◆ work · 1 window · 1 pane\n"));
-    assert!(stdout.ends_with("└─ [0] editor\n   └─ [0] shell\n          cwd = session\n"));
+    assert!(stdout.ends_with("└─ [0] editor\n   └─ [0] shell\n           cwd = session\n"));
 }
 
 #[test]
@@ -126,7 +126,7 @@ fn unstable_latest_inspect_warns_and_keeps_rendering_after_unavailable_programs(
     let unavailable = stdout.find("[0] ! program not captured").unwrap();
     let later_pane = stdout.find("[1] shell").unwrap();
     assert!(unavailable < later_pane);
-    assert!(stdout.ends_with("   └─ [1] shell\n          cwd = session\n"));
+    assert!(stdout.ends_with("   └─ [1] shell\n           cwd = session\n"));
 }
 
 #[test]

@@ -186,9 +186,11 @@ sequences.
 
 ## Value Rendering
 
-Snapshot names are already validated as control-free UTF-8. Lossless operating
-system values may contain non-UTF-8 bytes and require a separate display
-encoding.
+Snapshot names and failure reasons are validated as control-free UTF-8, but all
+untrusted text still passes through the display encoding. Unicode bidirectional
+controls and line or paragraph separators are rendered visibly as `\u{NN}` so
+they cannot reorder or split the tree. Lossless operating system values may
+also contain non-UTF-8 bytes.
 
 Paths, executable values, and arguments preserve printable Unicode. Literal
 backslashes and quotation marks are escaped, control characters are rendered

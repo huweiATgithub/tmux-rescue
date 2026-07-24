@@ -19,7 +19,7 @@
 - Do not generate the recovery-planner labels `Automatic`, `Manual`, or synonyms. Matching words originating in user-controlled snapshot content remain visible and complete.
 - Color is redundant and token-local: cyan `◆`, green `●`, yellow `▲` and `!`, red `error:`, and bold only for the selected snapshot, session names, window names, pane facts, and the unstable warning phrase. Use no other effects or colors and never style connectors.
 - Every enabled style ends immediately with an ANSI reset. Stripping ANSI from forced-color output must be byte-identical to plain output.
-- Escape snapshot bytes before adding renderer-owned ANSI. Preserve printable Unicode; double literal backslashes, escape quotation marks and controls, and render invalid UTF-8 bytes as lowercase `\xNN`.
+- Escape snapshot bytes before adding renderer-owned ANSI. Preserve printable Unicode; double literal backslashes, escape quotation marks, terminal controls, bidirectional controls, and line or paragraph separators, and render invalid UTF-8 bytes as lowercase `\xNN`.
 - Preserve argv boundaries. Quote empty arguments and arguments containing whitespace, quotes, backslashes, controls, or invalid UTF-8; this is a diagnostic representation, not a shell command.
 - Show full timestamps, paths, IDs, commands, names, and reasons. Do not canonicalize explicit display paths, abbreviate home directories, truncate, wrap deliberately, page, inspect terminal width, or add ASCII/JSON modes.
 - Use singular count nouns only when the count is exactly one; otherwise use the approved plural forms. Program entries remain in first-seen tree order and coalesce by identical visible identity.
@@ -233,7 +233,7 @@ impl DisplayValue {
 }
 ```
 
-Walk maximal valid UTF-8 prefixes with `std::str::from_utf8`. For valid characters, preserve printable Unicode, emit `\\`, `\"`, `\n`, `\r`, and `\t`, and render every other control as `\xNN` when it is one byte or `\u{hex}` otherwise. For each invalid byte in `Utf8Error::error_len()` (or the remaining suffix when it is `None`), emit lowercase `\xNN`. Determine argument quoting from the original bytes so invalid UTF-8 and Unicode whitespace cannot be mistaken for safe bare arguments.
+Walk maximal valid UTF-8 prefixes with `std::str::from_utf8`. For valid characters, preserve printable Unicode, emit `\\`, `\"`, `\n`, `\r`, and `\t`, and render every other terminal control, Unicode bidirectional control, and line or paragraph separator as `\xNN` when it is one byte or `\u{hex}` otherwise. For each invalid byte in `Utf8Error::error_len()` (or the remaining suffix when it is `None`), emit lowercase `\xNN`. Determine argument quoting from the original bytes so invalid UTF-8, Unicode whitespace, and Unicode display controls cannot be mistaken for safe bare arguments. Apply the same refined display type to validated timestamps, snapshot names, and failure reasons before they reach styling or tree construction.
 
 Run: `cargo test --bin tmux-rescue inspect::tests::encodes_lossless_values_without_terminal_controls --locked`  
 Expected: pass.
@@ -268,7 +268,7 @@ match pane.recovery() {
 }
 ```
 
-Use a `Vec<ProgramEntry>` and update the first entry whose encoded visible identity matches; do not sort. Command identities come from `Path::file_name()` on the captured executable, falling back to the complete encoded executable. Coalesce identical rendered identities, including an idle `shell` and a command executable whose basename is literally `shell`. Inflect only the visible `shell` identity when its total is not one.
+Keep first-seen order in a `Vec<ProgramEntry>` and use a `HashMap<&str, usize>` from encoded visible identity to its vector index; do not sort or linearly rescan prior identities. Command identities come from `Path::file_name()` on the captured executable, falling back to the complete encoded executable. Coalesce identical rendered identities, including an idle `shell` and a command executable whose basename is literally `shell`. Inflect only the visible `shell` identity when its total is not one.
 
 Run: `cargo test --bin tmux-rescue inspect::tests::maps_recovery_variants_to_user_facts --locked`  
 Expected: pass.
@@ -344,7 +344,7 @@ const TREE_GLYPHS: termtree::GlyphPalette = termtree::GlyphPalette {
 };
 ```
 
-Build each window as a child, each pane as its child, and set multiline mode on pane nodes so `termtree` supplies every continuation connector. Keep the extra four-space detail indentation inside each pane’s display string. Render session cwd as the second line of the root string. Use a single helper for `session(s)`, `window(s)`, and `pane(s)` so count grammar cannot diverge.
+Build each window as a child, each pane as its child, and set multiline mode on pane nodes so `termtree` supplies every continuation connector. Keep the extra five-space detail indentation inside each pane’s display string so continuation text aligns with the approved exact sample. Render session cwd as the second line of the root string. Use a single helper for `session(s)`, `window(s)`, and `pane(s)` so count grammar cannot diverge.
 
 Run: `cargo test --bin tmux-rescue inspect::tests::renders_complete_plain_snapshot_tree --locked`  
 Expected: pass with the exact approved connectors and whitespace.

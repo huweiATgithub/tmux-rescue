@@ -60,13 +60,13 @@ Programs     1 Codex · 1 shell · 1 not captured
   cwd /home/user/work
 └─ [0] editor
    ├─ [0] Codex
-   │      session 019f7ac5-a55c-7e70-8b31-872ae70c9a94
-   │      cwd = session
+   │       session 019f7ac5-a55c-7e70-8b31-872ae70c9a94
+   │       cwd = session
    ├─ [1] shell
-   │      cwd = session
+   │       cwd = session
    └─ [2] ! program not captured
-          reason foreground process disappeared
-          cwd /home/user/work
+           reason foreground process disappeared
+           cwd = session
 ```
 
 An unstable topology warning is part of the same document; the complete
