@@ -15,6 +15,8 @@ use tmux_rescue::{
     TmuxRestoreAdapter, TmuxServerIdentity, TopologyReadPhase, capture_snapshot, plan_restore,
 };
 
+use crate::inspect::Palette;
+
 pub const EXIT_SUCCESS: u8 = 0;
 pub const EXIT_FAILURE: u8 = 1;
 pub const EXIT_PARTIAL: u8 = 2;
@@ -36,6 +38,47 @@ pub enum ColorMode {
     Auto,
     Always,
     Never,
+}
+
+impl ColorMode {
+    fn enabled(self, automatic_support: bool) -> bool {
+        match self {
+            Self::Auto => automatic_support,
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalColorSupport {
+    stdout_auto: bool,
+    stderr_auto: bool,
+}
+
+impl TerminalColorSupport {
+    pub const fn new(stdout_auto: bool, stderr_auto: bool) -> Self {
+        Self {
+            stdout_auto,
+            stderr_auto,
+        }
+    }
+
+    fn stdout_palette(self, mode: ColorMode) -> Palette {
+        Self::palette(mode.enabled(self.stdout_auto))
+    }
+
+    fn stderr_palette(self, mode: ColorMode) -> Palette {
+        Self::palette(mode.enabled(self.stderr_auto))
+    }
+
+    fn palette(enabled: bool) -> Palette {
+        if enabled {
+            Palette::colored()
+        } else {
+            Palette::plain()
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -152,11 +195,20 @@ pub fn dispatch(cli: Cli, runner: &mut impl CliRunner) -> u8 {
 pub struct SystemCliRunner<'a, W: Write, E: Write> {
     stdout: &'a mut W,
     stderr: &'a mut E,
+    color_support: TerminalColorSupport,
 }
 
 impl<'a, W: Write, E: Write> SystemCliRunner<'a, W, E> {
-    pub fn new(stdout: &'a mut W, stderr: &'a mut E) -> Self {
-        Self { stdout, stderr }
+    pub fn with_color_support(
+        stdout: &'a mut W,
+        stderr: &'a mut E,
+        color_support: TerminalColorSupport,
+    ) -> Self {
+        Self {
+            stdout,
+            stderr,
+            color_support,
+        }
     }
 
     fn report_failure(&mut self, error: CliError) -> u8 {
@@ -173,7 +225,8 @@ impl<W: Write, E: Write> CliRunner for SystemCliRunner<'_, W, E> {
         }
     }
 
-    fn inspect(&mut self, _request: InspectRequest) -> u8 {
+    fn inspect(&mut self, request: InspectRequest) -> u8 {
+        let _palette = self.color_support.stdout_palette(request.color);
         EXIT_FAILURE
     }
 
@@ -803,6 +856,34 @@ mod tests {
         assert_eq!(restore_exit_code(RestoreRunStatus::Complete), EXIT_SUCCESS);
         assert_eq!(restore_exit_code(RestoreRunStatus::Fatal), EXIT_FAILURE);
         assert_eq!(restore_exit_code(RestoreRunStatus::Partial), EXIT_PARTIAL);
+    }
+
+    #[test]
+    fn inspect_color_policy_resolves_per_stream() {
+        assert!(!ColorMode::Auto.enabled(false));
+        assert!(ColorMode::Auto.enabled(true));
+        assert!(ColorMode::Always.enabled(false));
+        assert!(ColorMode::Always.enabled(true));
+        assert!(!ColorMode::Never.enabled(false));
+        assert!(!ColorMode::Never.enabled(true));
+
+        let support = TerminalColorSupport::new(true, false);
+        assert_eq!(
+            support.stdout_palette(ColorMode::Auto),
+            crate::inspect::Palette::colored()
+        );
+        assert_eq!(
+            support.stderr_palette(ColorMode::Auto),
+            crate::inspect::Palette::plain()
+        );
+        assert_eq!(
+            support.stderr_palette(ColorMode::Always).fatal_prefix(),
+            "\x1b[31merror:\x1b[0m"
+        );
+        assert_eq!(
+            support.stdout_palette(ColorMode::Never),
+            crate::inspect::Palette::plain()
+        );
     }
 
     #[test]

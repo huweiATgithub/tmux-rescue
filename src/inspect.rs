@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 
+use anstyle::{AnsiColor, Style};
 use termtree::{GlyphPalette, Tree};
 use tmux_rescue::{
     AutomaticRecovery, CaptureConsistency, CapturedCommand, LoadedSnapshot, PaneRecovery,
@@ -18,13 +19,52 @@ const TREE_GLYPHS: GlyphPalette = GlyphPalette {
     last_skip: " ",
     skip_indent: "  ",
 };
+const BOLD: Style = Style::new().bold();
+const CYAN: Style = AnsiColor::Cyan.on_default();
+const GREEN: Style = AnsiColor::Green.on_default();
+const YELLOW: Style = AnsiColor::Yellow.on_default();
+const RED: Style = AnsiColor::Red.on_default();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Palette;
+pub(crate) struct Palette {
+    colored: bool,
+}
 
 impl Palette {
     pub(crate) const fn plain() -> Self {
-        Self
+        Self { colored: false }
+    }
+
+    pub(crate) const fn colored() -> Self {
+        Self { colored: true }
+    }
+
+    pub(crate) fn fatal_prefix(self) -> String {
+        self.paint(RED, "error:")
+    }
+
+    fn bold(self, text: &str) -> String {
+        self.paint(BOLD, text)
+    }
+
+    fn cyan(self, text: &str) -> String {
+        self.paint(CYAN, text)
+    }
+
+    fn green(self, text: &str) -> String {
+        self.paint(GREEN, text)
+    }
+
+    fn yellow(self, text: &str) -> String {
+        self.paint(YELLOW, text)
+    }
+
+    fn paint(self, style: Style, text: &str) -> String {
+        if self.colored {
+            format!("{}{text}{}", style.render(), style.render_reset())
+        } else {
+            text.to_owned()
+        }
     }
 }
 
@@ -99,19 +139,27 @@ impl InspectView {
         }
     }
 
-    fn render(&self, _palette: Palette) -> String {
+    fn render(&self, palette: Palette) -> String {
         let mut output = String::new();
-        writeln!(output, "Snapshot     {}", self.selection).unwrap();
+        writeln!(output, "Snapshot     {}", palette.bold(self.selection)).unwrap();
         writeln!(output, "Captured     {}", self.captured_at).unwrap();
         writeln!(output, "Source       {}", self.source.as_str()).unwrap();
         match self.consistency {
             ConsistencyView::Stable => {
-                writeln!(output, "Consistency  ● stable topology").unwrap();
-            }
-            ConsistencyView::Unstable { attempts } => {
                 writeln!(
                     output,
-                    "Consistency  ▲ unstable topology after {attempts} attempts"
+                    "Consistency  {} stable topology",
+                    palette.green("●")
+                )
+                .unwrap();
+            }
+            ConsistencyView::Unstable { attempts } => {
+                let warning = format!("unstable topology after {attempts} attempts");
+                writeln!(
+                    output,
+                    "Consistency  {} {}",
+                    palette.yellow("▲"),
+                    palette.bold(&warning),
                 )
                 .unwrap();
             }
@@ -142,7 +190,7 @@ impl InspectView {
             if position > 0 {
                 output.push('\n');
             }
-            write!(output, "{}", session.tree()).unwrap();
+            write!(output, "{}", session.tree(palette)).unwrap();
         }
         output
     }
@@ -234,15 +282,16 @@ impl SessionView {
         }
     }
 
-    fn tree(&self) -> Tree<String> {
+    fn tree(&self, palette: Palette) -> Tree<String> {
         let pane_count = self
             .windows
             .iter()
             .map(|window| window.panes.len())
             .sum::<usize>();
         let root = format!(
-            "◆ {} · {} {} · {} {}\n  cwd {}",
-            self.name,
+            "{} {} · {} {} · {} {}\n  cwd {}",
+            palette.cyan("◆"),
+            palette.bold(&self.name),
             self.windows.len(),
             count_noun(self.windows.len(), "window", "windows"),
             pane_count,
@@ -251,7 +300,7 @@ impl SessionView {
         );
         let mut tree = Tree::new(root).with_glyphs(TREE_GLYPHS);
         for window in &self.windows {
-            tree.push(window.tree());
+            tree.push(window.tree(palette));
         }
         tree
     }
@@ -277,10 +326,14 @@ impl WindowView {
         }
     }
 
-    fn tree(&self) -> Tree<String> {
-        let mut tree = Tree::new(format!("[{}] {}", self.source_index, self.name));
+    fn tree(&self, palette: Palette) -> Tree<String> {
+        let mut tree = Tree::new(format!(
+            "[{}] {}",
+            self.source_index,
+            palette.bold(&self.name)
+        ));
         for pane in &self.panes {
-            tree.push(pane.tree());
+            tree.push(pane.tree(palette));
         }
         tree
     }
@@ -334,8 +387,12 @@ impl PaneView {
         }
     }
 
-    fn tree(&self) -> Tree<String> {
-        let mut root = format!("[{}] {}", self.source_index, self.fact.title());
+    fn tree(&self, palette: Palette) -> Tree<String> {
+        let mut root = format!(
+            "[{}] {}",
+            self.source_index,
+            self.fact.render_title(palette)
+        );
         for detail in self.fact.details() {
             write!(root, "\n    {detail}").unwrap();
         }
@@ -369,12 +426,16 @@ enum PaneFact {
 }
 
 impl PaneFact {
-    fn title(&self) -> &str {
+    fn render_title(&self, palette: Palette) -> String {
         match self {
-            Self::Shell => "shell",
-            Self::ToolSession { name, .. } => name,
-            Self::Command(command) => &command.command,
-            Self::Unavailable { .. } => "! program not captured",
+            Self::Shell => palette.bold("shell"),
+            Self::ToolSession { name, .. } => palette.bold(name),
+            Self::Command(command) => palette.bold(&command.command),
+            Self::Unavailable { .. } => format!(
+                "{} {}",
+                palette.yellow("!"),
+                palette.bold("program not captured")
+            ),
         }
     }
 
@@ -503,6 +564,8 @@ fn argument_needs_quotes(argument: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use serde_json::{Value, json};
     use tmux_rescue::{LoadedSnapshot, StateStore};
 
@@ -803,5 +866,50 @@ mod tests {
         assert!(output.contains("Consistency  ▲ unstable topology after 3 attempts\n"));
         assert!(output.contains("◆ notes · 1 window · 1 pane"));
         assert!(output.ends_with("   └─ [2] shell\n          cwd = session\n"));
+    }
+
+    #[test]
+    fn forced_color_styles_only_approved_tokens() {
+        let (_directory, loaded) = load_fixture(topology_fixture());
+        let selection = crate::cli::SnapshotSelection::Explicit(loaded.path().to_owned());
+        let plain = render(&loaded, &selection, Palette::plain());
+        let colored = render(&loaded, &selection, Palette::colored());
+
+        for expected in [
+            "Snapshot     \x1b[1mexplicit\x1b[0m\n",
+            "Consistency  \x1b[32m●\x1b[0m stable topology\n",
+            "\x1b[36m◆\x1b[0m \x1b[1mMetaNC\x1b[0m · 2 windows · 3 panes\n",
+            "├─ [0] \x1b[1mnode\x1b[0m\n",
+            "│  ├─ [0] \x1b[1mCodex\x1b[0m\n",
+            "│  └─ [1] \x1b[1mshell\x1b[0m\n",
+            "\x1b[33m!\x1b[0m \x1b[1mprogram not captured\x1b[0m\n",
+        ] {
+            assert!(
+                colored.contains(expected),
+                "missing styled token {expected:?} in:\n{colored}"
+            );
+        }
+        assert!(colored.contains("Programs     1 Codex · 2 shells · 1 not captured\n\n\x1b[36m◆"));
+        assert!(colored.contains("reason foreground process disappeared\n"));
+        assert!(!colored.contains("\x1b[31m"));
+        assert!(!colored.contains("\x1b[36m├"));
+        assert!(!colored.contains("\x1b[33mreason"));
+
+        let mut stripped = anstream::StripStream::new(Vec::new());
+        stripped.write_all(colored.as_bytes()).unwrap();
+        assert_eq!(String::from_utf8(stripped.into_inner()).unwrap(), plain);
+
+        let mut unstable = topology_fixture();
+        unstable["consistency"] = json!({"kind": "unstable", "attempts": 3});
+        let (_directory, loaded) = load_fixture(unstable);
+        let unstable = render(
+            &loaded,
+            &crate::cli::SnapshotSelection::Latest,
+            Palette::colored(),
+        );
+        assert!(unstable.contains(concat!(
+            "Consistency  \x1b[33m▲\x1b[0m ",
+            "\x1b[1munstable topology after 3 attempts\x1b[0m\n",
+        )));
     }
 }
