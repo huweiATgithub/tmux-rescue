@@ -40,11 +40,13 @@ tmux-rescue inspect
 Or inspect an explicit immutable snapshot without using the global state root:
 
 ```bash
-tmux-rescue inspect /path/to/immutable-snapshot.json --color never
+tmux-rescue inspect /path/to/immutable-snapshot.json --color never --icons nerd
 ```
 
-The view keeps captured values complete and calls out limitations inline while
-still showing the rest of the workspace:
+The primary tree uses Nerd icons and requires a [Nerd Font Mono](https://www.nerdfonts.com/)
+terminal font. The portable default is `--icons unicode`. The view keeps captured
+values complete and calls out limitations inline while still showing the rest of
+the workspace:
 
 ```text
 Snapshot     latest
@@ -53,25 +55,20 @@ Source       /tmp/tmux-1000/default
 Consistency  ● stable topology
 File         /home/user/.local/state/tmux-rescue/snapshots/80000000000000000000000000000000-550e8400-e29b-41d4-a716-446655440000.json
 
-Contents     1 session · 1 window · 3 panes
-Programs     1 Codex · 1 shell · 1 not captured
+Contents     1 session · 1 window · 1 pane
+Programs     1 shell
 
-◆ work · 1 window · 3 panes
-  cwd /home/user/work
-└─ [0] editor
-   ├─ [0] Codex
-   │       session 019f7ac5-a55c-7e70-8b31-872ae70c9a94
-   │       cwd = session
-   ├─ [1] shell
-   │       cwd = session
-   └─ [2] ! program not captured
-           reason foreground process disappeared
-           cwd = session
+◆ work · 1 window · 1 pane
+   /home/user/work
+└─  0 editor ›  0 shell
+       = ◆
 ```
 
 An unstable topology warning is part of the same document; the complete
 snapshot tree is still displayed successfully. Color defaults to automatic and
-can be forced or disabled with `--color always` or `--color never`.
+can be forced or disabled with `--color always` or `--color never`. A window
+with one pane is compacted to one line; windows with multiple panes retain their
+full branch structure.
 
 Inspect a restore plan for an absent target socket:
 

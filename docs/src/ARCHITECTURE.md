@@ -86,6 +86,13 @@ a storage-produced `LoadedSnapshot`, constructs private display facts, and
 renders terminal text. Snapshot domain types therefore do not acquire terminal
 geometry, styling, or printing responsibilities.
 
+The CLI parses `IconMode = Unicode | Nerd` as a typed value, defaulting to the
+portable Unicode mode. It passes that value to the private inspection renderer.
+The renderer's private symbol palette owns the window, pane, and working-
+directory glyphs, including the session-working-directory reference marker;
+neither glyph choices nor terminal tree layout belong to serialized snapshot
+types or the reusable library.
+
 The exact module layout and interface decomposition are implementation
 decisions.
 
@@ -412,7 +419,7 @@ opened file. It does not validate one path and then follow `latest` again.
 The command shape is:
 
 ```text
-tmux-rescue inspect [SNAPSHOT] [--color <auto|always|never>]
+tmux-rescue inspect [SNAPSHOT] [--color <auto|always|never>] [--icons <unicode|nerd>]
 ```
 
 Without `SNAPSHOT`, inspection uses the same one-time global `latest` selection
@@ -438,7 +445,8 @@ session/window/pane tree in stored order. Pane presentation reports the facts
 stored in the snapshot: a tool session and ID, a shell, a captured command and
 executable, or unavailable program information and its reason. Working
 directories are always present; exact byte equality with the containing
-session path may be displayed as `cwd = session`.
+session path is rendered as the session-working-directory reference marker
+(`cwd = ◆`).
 
 `termtree` owns recursive connector geometry only. Private display types own
 node content, ordered aggregation, command boundaries, and cwd compression.

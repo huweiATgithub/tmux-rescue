@@ -84,7 +84,32 @@ fn explicit_inspect_bypasses_state_root_and_live_systems() {
     assert!(stdout.contains("Consistency  ● stable topology\n"));
     assert!(stdout.contains(&format!("File         {}\n", snapshot.display())));
     assert!(stdout.contains("◆ work · 1 window · 1 pane\n"));
-    assert!(stdout.ends_with("└─ [0] editor\n   └─ [0] shell\n           cwd = session\n"));
+    assert!(stdout.ends_with("└─ [0] editor › (0) shell\n      cwd = ◆\n"));
+}
+
+#[test]
+fn explicit_inspect_renders_nerd_icons_for_a_compact_single_pane_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let snapshot = temp.path().join("snapshot.json");
+    write_inspect_fixture(&snapshot);
+
+    let output = binary()
+        .arg("inspect")
+        .arg(&snapshot)
+        .args(["--color", "never", "--icons", "nerd"])
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("HOME")
+        .env("TMUX", "/definitely/not/a/tmux/socket")
+        .env("PATH", "/definitely/no/programs")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.ends_with(
+        "◆ work · 1 window · 1 pane\n   /workspace\n└─  0 editor ›  0 shell\n       = ◆\n"
+    ));
 }
 
 #[test]
@@ -123,10 +148,10 @@ fn unstable_latest_inspect_warns_and_keeps_rendering_after_unavailable_programs(
     assert!(stdout.starts_with("Snapshot     latest\n"));
     assert!(stdout.contains(&format!("File         {}\n", selected_path.display())));
     assert!(stdout.contains("Consistency  ▲ unstable topology after 3 attempts\n"));
-    let unavailable = stdout.find("[0] ! program not captured").unwrap();
-    let later_pane = stdout.find("[1] shell").unwrap();
+    let unavailable = stdout.find("(0) ! program not captured").unwrap();
+    let later_pane = stdout.find("(1) shell").unwrap();
     assert!(unavailable < later_pane);
-    assert!(stdout.ends_with("   └─ [1] shell\n           cwd = session\n"));
+    assert!(stdout.ends_with("   └─ (1) shell\n         cwd = ◆\n"));
 }
 
 #[test]

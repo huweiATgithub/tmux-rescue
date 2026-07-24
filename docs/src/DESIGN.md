@@ -49,7 +49,7 @@ are deferred until the core capture API has proved useful.
 default. An explicit immutable snapshot path may be supplied instead:
 
 ```text
-tmux-rescue inspect [SNAPSHOT] [--color <auto|always|never>]
+tmux-rescue inspect [SNAPSHOT] [--color <auto|always|never>] [--icons <unicode|nerd>]
 ```
 
 Inspection is a topology-first view of what the snapshot contains. It shows
@@ -67,6 +67,14 @@ Inspection is read-only. It does not contact tmux, inspect current processes,
 construct a restore plan, or preflight the current machine. Values remain
 complete and color is a redundant semantic aid rather than the only carrier of
 meaning.
+
+The portable default icon mode uses Unicode index markers; the optional Nerd
+mode uses Nerd Font Mono glyphs. A window containing exactly one pane is
+compacted to a single `window › pane` line. When a pane's captured working
+directory equals its session's captured working directory, the pane shows a
+reference to the session heading (`cwd = ◆`) instead of repeating the path; a
+different pane directory remains explicit. Windows with multiple panes retain
+their full branch structure.
 
 ### Restore
 
