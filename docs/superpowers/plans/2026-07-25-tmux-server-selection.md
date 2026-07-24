@@ -324,7 +324,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 - Modify: `src/tmux.rs`
 - Modify: `tests/tmux_target.rs`
 
-- [ ] **Step 1: Add failing ownership-boundary tests**
+- [x] **Step 1: Add failing ownership-boundary tests**
 
   Add test coverage for each safety transition:
 
@@ -337,7 +337,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Make the existing-server tests table-driven over `SocketName` and `SocketPath` only where shared assertions remain readable.
 
-- [ ] **Step 2: Run the complete target suite and confirm RED**
+- [x] **Step 2: Run the complete target suite and confirm RED**
 
   Run the full file so every new safety family, including pre-start state and rollback-selector retention, participates in the RED gate:
 
@@ -347,7 +347,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Expected failures: current failed-claim cleanup is token-only, ownership still relies on path identity, or a target command does not retain the exact selector/no-start behavior.
 
-- [ ] **Step 3: Encode cleanup authorization as a narrower proof type**
+- [x] **Step 3: Encode cleanup authorization as a narrower proof type**
 
   Keep `OwnedRestoreTarget` exclusive to a successful zero-session claim. Introduce a private cleanup-only capability, named for the proof it carries, that can be constructed only after reading and matching:
 
@@ -365,7 +365,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Split process creation from waiting: failure to spawn the claim command reports `NotEstablished`; once `Command::spawn()` succeeds, any wait, exit-status, confirmation, or cleanup failure reports an evidence-based `Observed(...)` state because `start-server` may have run.
 
-- [ ] **Step 4: Guard every post-claim mutation with the full identity**
+- [x] **Step 4: Guard every post-claim mutation with the full identity**
 
   Retain the selector, token, PID, tmux start time, and OS process start time in the owned target. Before a mutating client command, verify the OS PID/start pair and use the existing atomic tmux guard for token/PID/tmux start time. If either proof fails, stop without issuing the mutation.
 
@@ -377,7 +377,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Do not inspect a selector-derived filesystem path to decide disposition.
 
-- [ ] **Step 5: Run all target and execution tests**
+- [x] **Step 5: Run all target and execution tests**
 
   Run:
 
@@ -387,7 +387,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
   cargo test --locked --lib tmux
   ```
 
-- [ ] **Step 6: Commit the ownership hardening**
+- [x] **Step 6: Commit the ownership hardening**
 
   ```bash
   git add src/tmux.rs tests/tmux_target.rs
