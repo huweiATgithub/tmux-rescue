@@ -81,6 +81,18 @@ The library never parses CLI arguments, prints output, or terminates the
 process. A future scheduler will call the library and real adapters directly
 rather than invoke or parse the CLI.
 
+Human snapshot inspection is owned by a private binary module. It accepts only
+a storage-produced `LoadedSnapshot`, constructs private display facts, and
+renders terminal text. Snapshot domain types therefore do not acquire terminal
+geometry, styling, or printing responsibilities.
+
+The CLI parses `IconMode = Unicode | Nerd` as a typed value, defaulting to the
+portable Unicode mode. It passes that value to the private inspection renderer.
+The renderer's private symbol palette owns the window, pane, and working-
+directory glyphs, including the session-working-directory reference marker;
+neither glyph choices nor terminal tree layout belong to serialized snapshot
+types or the reusable library.
+
 The exact module layout and interface decomposition are implementation
 decisions.
 
@@ -385,22 +397,82 @@ after immutable publication but before pointer replacement may leave a valid
 snapshot not referenced by `latest`. In either case, the previous symlink
 remains intact.
 
-A missing, dangling, or invalid `latest` is a restore error. Restore does not
-silently guess another file. The user may always provide an explicit immutable
-snapshot path. A later successful capture may atomically replace an invalid
-pointer and reports `ReplacedInvalid`.
+A missing, dangling, or invalid `latest` is an inspection or restore selection
+error. Neither command silently guesses another file. The user may always
+provide an explicit immutable snapshot path. A later successful capture may
+atomically replace an invalid pointer and reports `ReplacedInvalid`.
 
 The `latest` symlink is valid only when it is a relative link naming a snapshot
 inside this state root's `snapshots/` directory. Its basename must parse as a
 canonical `SnapshotKey`, and that key's timestamp must equal the opened
-snapshot's validated `captured_at`. Restore rejects an absolute, escaping,
-noncanonical, incoherent, or otherwise unexpected link target before using it
-as the default snapshot. This key constraint does not apply to an explicitly
-selected snapshot path.
+snapshot's validated `captured_at`. Default loading rejects an absolute,
+escaping, noncanonical, incoherent, or otherwise unexpected link target before
+using it. This key constraint does not apply to an explicitly selected snapshot
+path.
 
 Default selection resolves `latest` once, opens the selected target as a
 regular file beneath `snapshots/`, and validates and deserializes that same
 opened file. It does not validate one path and then follow `latest` again.
+
+## Inspection Contract
+
+The command shape is:
+
+```text
+tmux-rescue inspect [SNAPSHOT] [--color <auto|always|never>] [--icons <unicode|nerd>]
+```
+
+Without `SNAPSHOT`, inspection uses the same one-time global `latest` selection
+and validation contract described above. An explicit path uses the explicit
+loader and does not require a state-root environment. The complete data flow is:
+
+```text
+latest or explicit path
+    -> StateStore validated load
+    -> LoadedSnapshot
+    -> binary-private InspectView
+    -> termtree geometry plus anstyle palette
+    -> one stdout document
+```
+
+Only `LoadedSnapshot` may enter view construction. Inspection never reads raw
+JSON directly, contacts tmux, inspects processes, constructs a `RestorePlan`,
+or performs target/resource preflight.
+
+The document contains snapshot identity and capture metadata, aggregate
+contents and visible-program counts, and the complete validated
+session/window/pane tree in stored order. Pane presentation reports the facts
+stored in the snapshot: a tool session and ID, a shell, a captured command and
+executable, or unavailable program information and its reason. Working
+directories are always present; exact byte equality with the containing
+session path is rendered as the session-working-directory reference marker
+(`cwd = ◆`).
+
+`termtree` owns recursive connector geometry only. Private display types own
+node content, ordered aggregation, command boundaries, and cwd compression.
+Lossless operating-system values preserve printable Unicode, visibly escape
+controls and literal escapes, and encode invalid UTF-8 bytes as `\xNN` before
+any style is added. Commands remain a diagnostic argv representation rather
+than a promise of shell-copy execution. No value is truncated or silently
+canonicalized for display.
+
+The fixed palette uses standard ANSI colors and the terminal default
+foreground. Cyan marks only the session `◆`, green the stable `●`, yellow the
+unstable `▲` and unavailable-program `!`, and red the fatal `error:` prefix.
+Selected snapshot identity, names, pane facts, and the unstable warning phrase
+may be bold. Connectors, paths, IDs, indexes, counts, reasons, and summary
+entries remain uncolored. Removing ANSI leaves byte-identical plain text.
+
+`--color auto` uses `anstream` to resolve stdout and stderr support separately,
+including its terminal and environment conventions. `always` and `never`
+override that automatic result.
+
+A valid stable or unstable snapshot produces one complete stdout document,
+writes nothing to stderr, and exits 0. `PaneRecovery::Unavailable` is a valid
+fact with the same successful stream contract. Selection, loading, validation,
+rendering, or output failure exits 1 and reports a terminal-safe error on
+stderr; failures before a document write leave stdout empty. Inspection emits
+no progress messages and has no partial-success status.
 
 ## Restore Contract
 
@@ -664,6 +736,19 @@ a warning. A published result prints its immutable path, consistency, and
 candidate path with an explicit warning. Capture progress and failures go to
 standard error.
 
+Inspection CLI outcomes are:
+
+```text
+0  validated snapshot document printed, including unstable or unavailable facts
+1  selection, loading, validation, rendering, or output failed
+```
+
+Stable and unstable inspection share the same success status and stream
+contract. The unstable warning is inside the stdout document and the complete
+tree follows it. Valid inspection writes nothing to stderr. A fatal error is
+reported on stderr; loading and validation failures produce no stdout
+document.
+
 Restore CLI outcomes are:
 
 ```text
@@ -699,6 +784,10 @@ Refinement must also enforce:
 The executor accepts only a constructed `RestorePlan`, never raw or merely
 deserialized snapshot values.
 
+The inspection renderer accepts only `LoadedSnapshot`, never raw or merely
+deserialized values. Lossless values are converted to terminal-safe display
+encodings before renderer-owned ANSI sequences are introduced.
+
 Structured argv is rendered through the validated target-shell adapter.
 Recovery text is sent literally, and Enter is a separate operation. Manual and
 fallback hints cannot contain embedded Enter or uncontrolled terminal
@@ -711,11 +800,11 @@ working directory, and never removes a server it cannot prove it created.
 
 No error is silently converted into success.
 
-Capture, planning, storage, topology execution, and pane recovery return typed
-outcomes. Capture events identify the attempt and source pane when applicable;
-planning, storage, and execution results retain their failure or fallback, and
-each pane result identifies its source coordinate. The CLI renders them and
-prints a final per-pane restore inventory.
+Capture, inspection loading, planning, storage, topology execution, and pane
+recovery return typed outcomes. Capture events identify the attempt and source
+pane when applicable; planning, storage, and execution results retain their
+failure or fallback, and each pane result identifies its source coordinate.
+The CLI renders them and prints a final per-pane restore inventory.
 
 Expected plan-only completion and planned manual recovery are successful.
 Fatal pre-execution failures and partial post-topology recovery remain
@@ -745,6 +834,12 @@ Core tests use fake external capabilities to verify:
 - exact automatic identity or serve-command confirmation after launch;
 - hint pasting without Enter only through the guarded input operation; and
 - typed outcome and exit-status mapping.
+
+Binary renderer and CLI tests verify exact plain and styled inspection output,
+lossless command/path display encoding, ordered program aggregation, latest and
+explicit selection, unstable and unavailable continuation, per-stream color
+policy, empty stdout on fatal loading failures, and the absence of live tmux,
+process, restore-planning, or preflight access.
 
 Storage tests inject failure before and after each publication commit boundary
 and cover no-replace immutable creation, equal-timestamp collisions, detected

@@ -3,7 +3,7 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand, builder::TypedValueParser, error::ErrorKind};
+use clap::{Parser, Subcommand, ValueEnum, builder::TypedValueParser, error::ErrorKind};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -14,6 +14,8 @@ use tmux_rescue::{
     SourcePaneCoordinate, StateStore, SystemRestoreEnvironment, TargetDisposition, TmuxAdapter,
     TmuxRestoreAdapter, TmuxServerIdentity, TopologyReadPhase, capture_snapshot, plan_restore,
 };
+
+use crate::inspect::{Palette, is_unicode_display_control, render};
 
 pub const EXIT_SUCCESS: u8 = 0;
 pub const EXIT_FAILURE: u8 = 1;
@@ -30,10 +32,77 @@ pub struct Cli {
     pub command: Command,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorMode {
+    fn enabled(self, automatic_support: bool) -> bool {
+        match self {
+            Self::Auto => automatic_support,
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum IconMode {
+    #[default]
+    Unicode,
+    Nerd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalColorSupport {
+    stdout_auto: bool,
+    stderr_auto: bool,
+}
+
+impl TerminalColorSupport {
+    pub const fn new(stdout_auto: bool, stderr_auto: bool) -> Self {
+        Self {
+            stdout_auto,
+            stderr_auto,
+        }
+    }
+
+    fn stdout_palette(self, mode: ColorMode) -> Palette {
+        Self::palette(mode.enabled(self.stdout_auto))
+    }
+
+    fn stderr_palette(self, mode: ColorMode) -> Palette {
+        Self::palette(mode.enabled(self.stderr_auto))
+    }
+
+    fn palette(enabled: bool) -> Palette {
+        if enabled {
+            Palette::colored()
+        } else {
+            Palette::plain()
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Capture the tmux server selected by the invoking tmux context.
     Snapshot,
+    /// Validate and display a captured tmux workspace.
+    Inspect {
+        /// Immutable snapshot path. The global latest snapshot is used when omitted.
+        snapshot: Option<PathBuf>,
+        /// When to use terminal color.
+        #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+        color: ColorMode,
+        /// Which icon set to use.
+        #[arg(long, value_enum, default_value_t = IconMode::Unicode)]
+        icons: IconMode,
+    },
     /// Validate and print a restore plan, then optionally execute it.
     Restore {
         /// Immutable snapshot path. The global latest snapshot is used when omitted.
@@ -87,14 +156,46 @@ pub struct RestoreRequest {
     pub run: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnapshotSelection {
+    Latest,
+    Explicit(PathBuf),
+}
+
+impl From<Option<PathBuf>> for SnapshotSelection {
+    fn from(path: Option<PathBuf>) -> Self {
+        match path {
+            Some(path) => Self::Explicit(path),
+            None => Self::Latest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectRequest {
+    pub selection: SnapshotSelection,
+    pub color: ColorMode,
+    pub icons: IconMode,
+}
+
 pub trait CliRunner {
     fn snapshot(&mut self) -> u8;
+    fn inspect(&mut self, request: InspectRequest) -> u8;
     fn restore(&mut self, request: RestoreRequest) -> u8;
 }
 
 pub fn dispatch(cli: Cli, runner: &mut impl CliRunner) -> u8 {
     match cli.command {
         Command::Snapshot => runner.snapshot(),
+        Command::Inspect {
+            snapshot,
+            color,
+            icons,
+        } => runner.inspect(InspectRequest {
+            selection: snapshot.into(),
+            color,
+            icons,
+        }),
         Command::Restore {
             snapshot,
             target,
@@ -110,15 +211,35 @@ pub fn dispatch(cli: Cli, runner: &mut impl CliRunner) -> u8 {
 pub struct SystemCliRunner<'a, W: Write, E: Write> {
     stdout: &'a mut W,
     stderr: &'a mut E,
+    color_support: TerminalColorSupport,
 }
 
 impl<'a, W: Write, E: Write> SystemCliRunner<'a, W, E> {
-    pub fn new(stdout: &'a mut W, stderr: &'a mut E) -> Self {
-        Self { stdout, stderr }
+    pub fn with_color_support(
+        stdout: &'a mut W,
+        stderr: &'a mut E,
+        color_support: TerminalColorSupport,
+    ) -> Self {
+        Self {
+            stdout,
+            stderr,
+            color_support,
+        }
     }
 
     fn report_failure(&mut self, error: CliError) -> u8 {
         let _ = writeln!(self.stderr, "error: {}", safe_text(&error.to_string()));
+        EXIT_FAILURE
+    }
+
+    fn report_inspect_failure(&mut self, error: CliError, color: ColorMode) -> u8 {
+        let palette = self.color_support.stderr_palette(color);
+        let _ = writeln!(
+            self.stderr,
+            "{} {}",
+            palette.fatal_prefix(),
+            safe_text(&error.to_string())
+        );
         EXIT_FAILURE
     }
 }
@@ -128,6 +249,14 @@ impl<W: Write, E: Write> CliRunner for SystemCliRunner<'_, W, E> {
         match run_snapshot(self.stdout, self.stderr) {
             Ok(code) => code,
             Err(error) => self.report_failure(error),
+        }
+    }
+
+    fn inspect(&mut self, request: InspectRequest) -> u8 {
+        let palette = self.color_support.stdout_palette(request.color);
+        match run_inspect(&request, self.stdout, palette) {
+            Ok(code) => code,
+            Err(error) => self.report_inspect_failure(error, request.color),
         }
     }
 
@@ -200,6 +329,24 @@ pub fn run_snapshot(stdout: &mut impl Write, stderr: &mut impl Write) -> Result<
     let exit_code = snapshot_exit_code(&publication);
     render_publication(stdout, stderr, &publication)?;
     Ok(exit_code)
+}
+
+pub fn run_inspect(
+    request: &InspectRequest,
+    stdout: &mut impl Write,
+    palette: Palette,
+) -> Result<u8, CliError> {
+    let loaded = match &request.selection {
+        SnapshotSelection::Latest => StateStore::from_environment()
+            .map_err(|error| CliError::new(format!("open state store: {error}")))?
+            .load_latest(),
+        SnapshotSelection::Explicit(path) => StateStore::load_explicit_path(path),
+    }
+    .map_err(|error| CliError::new(format!("load snapshot: {error}")))?;
+    let document = render(&loaded, &request.selection, palette, request.icons);
+    stdout.write_all(document.as_bytes()).map_err(io_failure)?;
+    stdout.flush().map_err(io_failure)?;
+    Ok(EXIT_SUCCESS)
 }
 
 pub fn run_restore(
@@ -540,7 +687,7 @@ fn safe_text(value: &str) -> String {
     const MAX_CLI_DIAGNOSTIC_BYTES: usize = 4 * 1024;
     let mut output = String::new();
     for character in value.chars() {
-        let fragment = if character.is_control() {
+        let fragment = if character.is_control() || is_unicode_display_control(character) {
             character.escape_default().to_string()
         } else {
             character.to_string()
@@ -559,6 +706,7 @@ fn io_failure(error: std::io::Error) -> CliError {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::path::{Path, PathBuf};
 
     use clap::Parser;
@@ -569,8 +717,10 @@ mod tests {
     #[derive(Default)]
     struct RecordingRunner {
         snapshot_calls: usize,
+        inspect_requests: Vec<InspectRequest>,
         restore_requests: Vec<RestoreRequest>,
         snapshot_code: u8,
+        inspect_code: u8,
         restore_code: u8,
     }
 
@@ -578,6 +728,11 @@ mod tests {
         fn snapshot(&mut self) -> u8 {
             self.snapshot_calls += 1;
             self.snapshot_code
+        }
+
+        fn inspect(&mut self, request: InspectRequest) -> u8 {
+            self.inspect_requests.push(request);
+            self.inspect_code
         }
 
         fn restore(&mut self, request: RestoreRequest) -> u8 {
@@ -598,7 +753,18 @@ mod tests {
                 target,
                 run,
             } => (snapshot, target, run),
-            Command::Snapshot => panic!("expected restore command"),
+            Command::Snapshot | Command::Inspect { .. } => panic!("expected restore command"),
+        }
+    }
+
+    fn inspect_command(cli: Cli) -> (Option<PathBuf>, ColorMode, IconMode) {
+        match cli.command {
+            Command::Inspect {
+                snapshot,
+                color,
+                icons,
+            } => (snapshot, color, icons),
+            Command::Snapshot | Command::Restore { .. } => panic!("expected inspect command"),
         }
     }
 
@@ -619,6 +785,56 @@ mod tests {
         assert!(Cli::try_parse_from(["tmux-rescue", "snapshot", "unexpected"]).is_err());
         assert!(Cli::try_parse_from(["tmux-rescue", "snapshot", "--run"]).is_err());
         assert!(Cli::try_parse_from(["tmux-rescue", "restore", "--json"]).is_err());
+
+        assert_eq!(
+            inspect_command(parse(&["tmux-rescue", "inspect"])),
+            (None, ColorMode::Auto, IconMode::Unicode),
+        );
+        assert_eq!(
+            inspect_command(parse(&[
+                "tmux-rescue",
+                "inspect",
+                "snapshot.json",
+                "--icons",
+                "nerd",
+            ])),
+            (
+                Some(PathBuf::from("snapshot.json")),
+                ColorMode::Auto,
+                IconMode::Nerd,
+            ),
+        );
+        assert_eq!(
+            inspect_command(parse(&[
+                "tmux-rescue",
+                "inspect",
+                "relative/snapshot.json",
+                "--color",
+                "always",
+            ])),
+            (
+                Some(PathBuf::from("relative/snapshot.json")),
+                ColorMode::Always,
+                IconMode::Unicode,
+            )
+        );
+        assert_eq!(
+            inspect_command(parse(&[
+                "tmux-rescue",
+                "inspect",
+                "--color",
+                "never",
+                "relative/snapshot.json",
+            ])),
+            (
+                Some(PathBuf::from("relative/snapshot.json")),
+                ColorMode::Never,
+                IconMode::Unicode,
+            )
+        );
+        assert!(Cli::try_parse_from(["tmux-rescue", "inspect", "--color", "sometimes"]).is_err());
+        assert!(Cli::try_parse_from(["tmux-rescue", "inspect", "--icons", "automatic"]).is_err());
+        assert!(Cli::try_parse_from(["tmux-rescue", "inspect", "one.json", "two.json"]).is_err());
 
         let (snapshot, target, run) = restore_command(parse(&[
             "tmux-rescue",
@@ -651,6 +867,31 @@ mod tests {
             EXIT_FAILURE
         );
         assert_eq!(runner.snapshot_calls, 1);
+
+        runner.inspect_code = EXIT_SUCCESS;
+        assert_eq!(
+            dispatch(
+                parse(&[
+                    "tmux-rescue",
+                    "inspect",
+                    "relative/snapshot.json",
+                    "--color",
+                    "never",
+                    "--icons",
+                    "nerd",
+                ]),
+                &mut runner,
+            ),
+            EXIT_SUCCESS
+        );
+        assert_eq!(
+            runner.inspect_requests,
+            [InspectRequest {
+                selection: SnapshotSelection::Explicit(PathBuf::from("relative/snapshot.json")),
+                color: ColorMode::Never,
+                icons: IconMode::Nerd,
+            }]
+        );
 
         assert_eq!(
             dispatch(
@@ -688,6 +929,132 @@ mod tests {
         assert_eq!(restore_exit_code(RestoreRunStatus::Complete), EXIT_SUCCESS);
         assert_eq!(restore_exit_code(RestoreRunStatus::Fatal), EXIT_FAILURE);
         assert_eq!(restore_exit_code(RestoreRunStatus::Partial), EXIT_PARTIAL);
+    }
+
+    #[test]
+    fn inspect_color_policy_resolves_per_stream() {
+        assert!(!ColorMode::Auto.enabled(false));
+        assert!(ColorMode::Auto.enabled(true));
+        assert!(ColorMode::Always.enabled(false));
+        assert!(ColorMode::Always.enabled(true));
+        assert!(!ColorMode::Never.enabled(false));
+        assert!(!ColorMode::Never.enabled(true));
+
+        let support = TerminalColorSupport::new(true, false);
+        assert_eq!(
+            support.stdout_palette(ColorMode::Auto),
+            crate::inspect::Palette::colored()
+        );
+        assert_eq!(
+            support.stderr_palette(ColorMode::Auto),
+            crate::inspect::Palette::plain()
+        );
+        assert_eq!(
+            support.stderr_palette(ColorMode::Always).fatal_prefix(),
+            "\x1b[31merror:\x1b[0m"
+        );
+        assert_eq!(
+            support.stdout_palette(ColorMode::Never),
+            crate::inspect::Palette::plain()
+        );
+    }
+
+    #[test]
+    fn inspect_output_failure_is_fatal_and_reports_on_stderr() {
+        struct FailingWriter;
+
+        impl io::Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed stdout"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("snapshot.json");
+        std::fs::write(
+            &snapshot,
+            serde_json::to_vec(&serde_json::json!({
+                "captured_at": "2026-07-24T00:00:00Z",
+                "source": {"encoding": "utf8", "value": "/tmp/source.sock"},
+                "consistency": {"kind": "stable"},
+                "sessions": [{
+                    "name": "work",
+                    "working_directory": {"encoding": "utf8", "value": "/workspace"},
+                    "windows": [{
+                        "source_index": 0,
+                        "name": "shell",
+                        "panes": [{
+                            "source_index": 0,
+                            "working_directory": {
+                                "encoding": "utf8",
+                                "value": "/workspace"
+                            },
+                            "recovery": {"kind": "idle"}
+                        }]
+                    }]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let request = InspectRequest {
+            selection: SnapshotSelection::Explicit(snapshot),
+            color: ColorMode::Always,
+            icons: IconMode::Unicode,
+        };
+        let mut stdout = FailingWriter;
+        let mut stderr = Vec::new();
+        let mut runner = SystemCliRunner::with_color_support(
+            &mut stdout,
+            &mut stderr,
+            TerminalColorSupport::new(false, false),
+        );
+
+        assert_eq!(runner.inspect(request), EXIT_FAILURE);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "\x1b[31merror:\x1b[0m write CLI output: closed stdout\n"
+        );
+    }
+
+    #[test]
+    fn inspect_failure_escapes_unicode_display_controls_on_stderr() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory
+            .path()
+            .join("before\u{202e}middle\u{2028}after\u{2029}.json");
+        let request = InspectRequest {
+            selection: SnapshotSelection::Explicit(snapshot),
+            color: ColorMode::Never,
+            icons: IconMode::Unicode,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut runner = SystemCliRunner::with_color_support(
+            &mut stdout,
+            &mut stderr,
+            TerminalColorSupport::new(false, false),
+        );
+
+        assert_eq!(runner.inspect(request), EXIT_FAILURE);
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        for character in ['\u{2028}', '\u{2029}', '\u{202e}'] {
+            assert!(
+                !stderr.contains(character),
+                "raw {character:?} in fatal stderr: {stderr:?}"
+            );
+        }
+        for escaped in ["\\u{2028}", "\\u{2029}", "\\u{202e}"] {
+            assert!(
+                stderr.contains(escaped),
+                "missing {escaped:?} in fatal stderr: {stderr:?}"
+            );
+        }
     }
 
     #[test]
