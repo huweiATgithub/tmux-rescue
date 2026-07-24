@@ -10,7 +10,7 @@ use tmux_rescue::{
     AutomaticRecovery, CaptureConsistency, CapturedCommand, LoadedSnapshot, PaneRecovery,
 };
 
-use crate::cli::SnapshotSelection;
+use crate::cli::{IconMode, SnapshotSelection};
 
 const TREE_GLYPHS: GlyphPalette = GlyphPalette {
     middle_item: "├",
@@ -25,6 +25,55 @@ const CYAN: Style = AnsiColor::Cyan.on_default();
 const GREEN: Style = AnsiColor::Green.on_default();
 const YELLOW: Style = AnsiColor::Yellow.on_default();
 const RED: Style = AnsiColor::Red.on_default();
+const DETAIL_INDENT: &str = "   ";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IndexSymbols {
+    prefix: &'static str,
+    suffix: &'static str,
+}
+
+impl IndexSymbols {
+    fn render(self, index: u32) -> String {
+        format!("{}{index}{}", self.prefix, self.suffix)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TreeSymbols {
+    window: IndexSymbols,
+    pane: IndexSymbols,
+    cwd: &'static str,
+}
+
+impl From<IconMode> for TreeSymbols {
+    fn from(icons: IconMode) -> Self {
+        match icons {
+            IconMode::Unicode => Self {
+                window: IndexSymbols {
+                    prefix: "[",
+                    suffix: "]",
+                },
+                pane: IndexSymbols {
+                    prefix: "(",
+                    suffix: ")",
+                },
+                cwd: "cwd",
+            },
+            IconMode::Nerd => Self {
+                window: IndexSymbols {
+                    prefix: " ",
+                    suffix: "",
+                },
+                pane: IndexSymbols {
+                    prefix: " ",
+                    suffix: "",
+                },
+                cwd: "",
+            },
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Palette {
@@ -73,8 +122,10 @@ pub(crate) fn render(
     loaded: &LoadedSnapshot,
     selection: &SnapshotSelection,
     palette: Palette,
+    icons: IconMode,
 ) -> String {
-    InspectView::from_loaded(loaded, selection).render(palette)
+    let symbols = TreeSymbols::from(icons);
+    InspectView::from_loaded(loaded, selection).render(palette, symbols)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,7 +195,7 @@ impl InspectView {
         }
     }
 
-    fn render(&self, palette: Palette) -> String {
+    fn render(&self, palette: Palette, symbols: TreeSymbols) -> String {
         let mut output = String::new();
         writeln!(output, "Snapshot     {}", palette.bold(self.selection)).unwrap();
         writeln!(output, "Captured     {}", self.captured_at.as_str()).unwrap();
@@ -195,7 +246,7 @@ impl InspectView {
             if position > 0 {
                 output.push('\n');
             }
-            write!(output, "{}", session.tree(palette)).unwrap();
+            write!(output, "{}", session.tree(palette, symbols)).unwrap();
         }
         output
     }
@@ -289,25 +340,26 @@ impl SessionView {
         }
     }
 
-    fn tree(&self, palette: Palette) -> Tree<String> {
+    fn tree(&self, palette: Palette, symbols: TreeSymbols) -> Tree<String> {
         let pane_count = self
             .windows
             .iter()
             .map(|window| window.panes.len())
             .sum::<usize>();
         let root = format!(
-            "{} {} · {} {} · {} {}\n  cwd {}",
+            "{} {} · {} {} · {} {}\n  {} {}",
             palette.cyan("◆"),
             palette.bold(self.name.as_str()),
             self.windows.len(),
             count_noun(self.windows.len(), "window", "windows"),
             pane_count,
             count_noun(pane_count, "pane", "panes"),
+            symbols.cwd,
             self.working_directory.as_str(),
         );
         let mut tree = Tree::new(root).with_glyphs(TREE_GLYPHS);
         for window in &self.windows {
-            tree.push(window.tree(palette));
+            tree.push(window.tree(palette, symbols));
         }
         tree
     }
@@ -333,16 +385,34 @@ impl WindowView {
         }
     }
 
-    fn tree(&self, palette: Palette) -> Tree<String> {
-        let mut tree = Tree::new(format!(
-            "[{}] {}",
-            self.source_index,
+    fn first_line(&self, palette: Palette, symbols: TreeSymbols) -> String {
+        format!(
+            "{} {}",
+            symbols.window.render(self.source_index),
             palette.bold(self.name.as_str())
-        ));
-        for pane in &self.panes {
-            tree.push(pane.tree(palette));
+        )
+    }
+
+    fn tree(&self, palette: Palette, symbols: TreeSymbols) -> Tree<String> {
+        match self.panes.as_slice() {
+            [] => unreachable!("LoadedSnapshot contains no-pane windows"),
+            [pane] => {
+                let mut root = format!(
+                    "{} › {}",
+                    self.first_line(palette, symbols),
+                    pane.first_line(palette, symbols),
+                );
+                pane.append_details(&mut root, palette, symbols);
+                Tree::new(root).with_multiline(true)
+            }
+            panes => {
+                let mut tree = Tree::new(self.first_line(palette, symbols));
+                for pane in panes {
+                    tree.push(pane.tree(palette, symbols));
+                }
+                tree
+            }
         }
-        tree
     }
 }
 
@@ -394,21 +464,37 @@ impl PaneView {
         }
     }
 
-    fn tree(&self, palette: Palette) -> Tree<String> {
-        let mut root = format!(
-            "[{}] {}",
-            self.source_index,
+    fn first_line(&self, palette: Palette, symbols: TreeSymbols) -> String {
+        format!(
+            "{} {}",
+            symbols.pane.render(self.source_index),
             self.fact.render_title(palette)
-        );
+        )
+    }
+
+    fn append_details(&self, root: &mut String, palette: Palette, symbols: TreeSymbols) {
         for detail in self.fact.details() {
-            write!(root, "\n     {detail}").unwrap();
+            write!(root, "\n{DETAIL_INDENT}{detail}").unwrap();
         }
         match &self.working_directory {
-            PaneWorkingDirectory::Session => root.push_str("\n     cwd = session"),
+            PaneWorkingDirectory::Session => {
+                write!(
+                    root,
+                    "\n{DETAIL_INDENT}{} = {}",
+                    symbols.cwd,
+                    palette.cyan("◆")
+                )
+                .unwrap();
+            }
             PaneWorkingDirectory::Explicit(path) => {
-                write!(root, "\n     cwd {}", path.as_str()).unwrap();
+                write!(root, "\n{DETAIL_INDENT}{} {}", symbols.cwd, path.as_str()).unwrap();
             }
         }
+    }
+
+    fn tree(&self, palette: Palette, symbols: TreeSymbols) -> Tree<String> {
+        let mut root = self.first_line(palette, symbols);
+        self.append_details(&mut root, palette, symbols);
         Tree::new(root).with_multiline(true)
     }
 }
@@ -890,21 +976,22 @@ mod tests {
             &loaded,
             &crate::cli::SnapshotSelection::Explicit(loaded.path().to_owned()),
             Palette::plain(),
+            IconMode::Unicode,
         );
 
         for expected in [
-            "[0] shell",
-            "[1] Codex\n",
+            "(0) shell",
+            "(1) Codex\n",
             "session 019f7ac5-a55c-7e70-8b31-872ae70c9a94",
-            "[2] Claude Code\n",
+            "(2) Claude Code\n",
             "session 8f707f38-6fd3-4a11-a03f-853b03d47b0c",
-            "[3] mdbook serve\n",
+            "(3) mdbook serve\n",
             "executable /usr/bin/mdbook",
-            "[4] book serve\n",
+            "(4) book serve\n",
             "executable /usr/bin/book",
-            "[5] tmux-rescue manual \"two words\"\n",
+            "(5) tmux-rescue manual \"two words\"\n",
             "executable /usr/local/bin/tmux-rescue",
-            "[6] ! program not captured\n",
+            "(6) ! program not captured\n",
             "reason foreground process disappeared",
         ] {
             assert!(
@@ -935,21 +1022,19 @@ mod tests {
                 "◆ MetaNC · 2 windows · 3 panes\n",
                 "  cwd /home/huwei/projects/MetaNC\n",
                 "├─ [0] node\n",
-                "│  ├─ [0] Codex\n",
-                "│  │       session 019f7ac5-a55c-7e70-8b31-872ae70c9a94\n",
-                "│  │       cwd = session\n",
-                "│  └─ [1] shell\n",
-                "│          cwd = session\n",
-                "└─ [1] zsh\n",
-                "   └─ [0] ! program not captured\n",
-                "           reason foreground process disappeared\n",
-                "           cwd /home/huwei/projects/MetaNC/.worktrees/inspect\n",
+                "│  ├─ (0) Codex\n",
+                "│  │     session 019f7ac5-a55c-7e70-8b31-872ae70c9a94\n",
+                "│  │     cwd = ◆\n",
+                "│  └─ (1) shell\n",
+                "│        cwd = ◆\n",
+                "└─ [1] zsh › (0) ! program not captured\n",
+                "      reason foreground process disappeared\n",
+                "      cwd /home/huwei/projects/MetaNC/.worktrees/inspect\n",
                 "\n",
                 "◆ notes · 1 window · 1 pane\n",
                 "  cwd /home/huwei/notes\n",
-                "└─ [4] shell\n",
-                "   └─ [2] shell\n",
-                "           cwd = session\n",
+                "└─ [4] shell › (2) shell\n",
+                "      cwd = ◆\n",
             ),
             loaded.path().display(),
         );
@@ -959,9 +1044,44 @@ mod tests {
                 &loaded,
                 &crate::cli::SnapshotSelection::Explicit(loaded.path().to_owned()),
                 Palette::plain(),
+                IconMode::Unicode,
             ),
             expected
         );
+    }
+
+    #[test]
+    fn renders_nerd_font_tree_with_selected_glyphs() {
+        let (_directory, loaded) = load_fixture(topology_fixture());
+        let output = render(
+            &loaded,
+            &crate::cli::SnapshotSelection::Explicit(loaded.path().to_owned()),
+            Palette::plain(),
+            crate::cli::IconMode::Nerd,
+        );
+        let (_, tree) = output
+            .split_once("\n\n◆ ")
+            .expect("the rendered snapshot has a tree");
+        let expected = concat!(
+            "◆ MetaNC · 2 windows · 3 panes\n",
+            "   /home/huwei/projects/MetaNC\n",
+            "├─  0 node\n",
+            "│  ├─  0 Codex\n",
+            "│  │     session 019f7ac5-a55c-7e70-8b31-872ae70c9a94\n",
+            "│  │      = ◆\n",
+            "│  └─  1 shell\n",
+            "│         = ◆\n",
+            "└─  1 zsh ›  0 ! program not captured\n",
+            "      reason foreground process disappeared\n",
+            "       /home/huwei/projects/MetaNC/.worktrees/inspect\n",
+            "\n",
+            "◆ notes · 1 window · 1 pane\n",
+            "   /home/huwei/notes\n",
+            "└─  4 shell ›  2 shell\n",
+            "       = ◆\n",
+        );
+
+        assert_eq!(format!("◆ {tree}"), expected);
     }
 
     #[test]
@@ -974,27 +1094,28 @@ mod tests {
             &loaded,
             &crate::cli::SnapshotSelection::Latest,
             Palette::plain(),
+            IconMode::Unicode,
         );
 
         assert!(output.contains("Consistency  ▲ unstable topology after 3 attempts\n"));
         assert!(output.contains("◆ notes · 1 window · 1 pane"));
-        assert!(output.ends_with("   └─ [2] shell\n           cwd = session\n"));
+        assert!(output.ends_with("└─ [4] shell › (2) shell\n      cwd = ◆\n"));
     }
 
     #[test]
     fn forced_color_styles_only_approved_tokens() {
         let (_directory, loaded) = load_fixture(topology_fixture());
         let selection = crate::cli::SnapshotSelection::Explicit(loaded.path().to_owned());
-        let plain = render(&loaded, &selection, Palette::plain());
-        let colored = render(&loaded, &selection, Palette::colored());
+        let plain = render(&loaded, &selection, Palette::plain(), IconMode::Unicode);
+        let colored = render(&loaded, &selection, Palette::colored(), IconMode::Unicode);
 
         for expected in [
             "Snapshot     \x1b[1mexplicit\x1b[0m\n",
             "Consistency  \x1b[32m●\x1b[0m stable topology\n",
             "\x1b[36m◆\x1b[0m \x1b[1mMetaNC\x1b[0m · 2 windows · 3 panes\n",
             "├─ [0] \x1b[1mnode\x1b[0m\n",
-            "│  ├─ [0] \x1b[1mCodex\x1b[0m\n",
-            "│  └─ [1] \x1b[1mshell\x1b[0m\n",
+            "│  ├─ (0) \x1b[1mCodex\x1b[0m\n",
+            "│  └─ (1) \x1b[1mshell\x1b[0m\n",
             "\x1b[33m!\x1b[0m \x1b[1mprogram not captured\x1b[0m\n",
         ] {
             assert!(
@@ -1019,6 +1140,7 @@ mod tests {
             &loaded,
             &crate::cli::SnapshotSelection::Latest,
             Palette::colored(),
+            IconMode::Unicode,
         );
         assert!(unstable.contains(concat!(
             "Consistency  \x1b[33m▲\x1b[0m ",
@@ -1066,6 +1188,7 @@ mod tests {
             &loaded,
             &crate::cli::SnapshotSelection::Explicit(loaded.path().to_owned()),
             Palette::plain(),
+            IconMode::Unicode,
         );
 
         assert!(!output.contains('\x1b'));
@@ -1073,7 +1196,7 @@ mod tests {
         assert!(output.contains("Programs     1 \\x80\n"));
         assert!(output.contains("◆ automatic Manual · 1 window · 1 pane\n"));
         assert!(output.contains(concat!(
-            "[0] \"\\x80\" \"\" \"two words\" \"quote\\\"\" ",
+            "[0] quoted window › (0) \"\\x80\" \"\" \"two words\" \"quote\\\"\" ",
             "\"slash\\\\\" \"\\x1b[31m\" 数据\n",
         )));
         assert!(output.contains("executable /usr/bin/\\x80\n"));
@@ -1109,6 +1232,7 @@ mod tests {
             &loaded,
             &crate::cli::SnapshotSelection::Latest,
             Palette::plain(),
+            IconMode::Unicode,
         );
 
         for character in ['\u{2028}', '\u{2029}', '\u{202e}', '\u{2066}'] {
@@ -1118,8 +1242,8 @@ mod tests {
             );
         }
         assert!(output.contains("◆ work\\u{202e} · 1 window · 1 pane\n"));
-        assert!(output.contains("└─ [0] editor\\u{2066}\n"));
+        assert!(output.contains("└─ [0] editor\\u{2066} › (0) ! program not captured\n"));
         assert!(output.contains("reason lost\\u{2028}then\\u{2029}gone\n"));
-        assert!(output.ends_with("cwd = session\n"));
+        assert!(output.ends_with("cwd = ◆\n"));
     }
 }

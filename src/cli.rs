@@ -343,7 +343,7 @@ pub fn run_inspect(
         SnapshotSelection::Explicit(path) => StateStore::load_explicit_path(path),
     }
     .map_err(|error| CliError::new(format!("load snapshot: {error}")))?;
-    let document = render(&loaded, &request.selection, palette);
+    let document = render(&loaded, &request.selection, palette, request.icons);
     stdout.write_all(document.as_bytes()).map_err(io_failure)?;
     stdout.flush().map_err(io_failure)?;
     Ok(EXIT_SUCCESS)
