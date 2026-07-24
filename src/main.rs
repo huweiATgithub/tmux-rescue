@@ -4,6 +4,7 @@ use clap::Parser;
 use clap::error::ErrorKind;
 
 mod cli;
+mod inspect;
 
 use cli::{Cli, EXIT_FAILURE, EXIT_SUCCESS, SystemCliRunner, dispatch};
 

@@ -1,0 +1,679 @@
+use std::ffi::OsStr;
+use std::fmt::Write as _;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::Path;
+
+use termtree::{GlyphPalette, Tree};
+use tmux_rescue::{
+    AutomaticRecovery, CaptureConsistency, CapturedCommand, LoadedSnapshot, PaneRecovery,
+};
+
+use crate::cli::SnapshotSelection;
+
+const TREE_GLYPHS: GlyphPalette = GlyphPalette {
+    middle_item: "├",
+    last_item: "└",
+    item_indent: "─ ",
+    middle_skip: "│",
+    last_skip: " ",
+    skip_indent: "  ",
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Palette;
+
+impl Palette {
+    pub(crate) const fn plain() -> Self {
+        Self
+    }
+}
+
+pub(crate) fn render(
+    loaded: &LoadedSnapshot,
+    selection: &SnapshotSelection,
+    palette: Palette,
+) -> String {
+    InspectView::from_loaded(loaded, selection).render(palette)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DisplayValue(String);
+
+impl DisplayValue {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self(display_bytes(bytes))
+    }
+
+    fn from_os(value: &OsStr) -> Self {
+        Self::from_bytes(value.as_bytes())
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct InspectView {
+    selection: &'static str,
+    captured_at: String,
+    source: DisplayValue,
+    consistency: ConsistencyView,
+    file: DisplayValue,
+    contents: Contents,
+    programs: Vec<ProgramEntry>,
+    sessions: Vec<SessionView>,
+}
+
+impl InspectView {
+    fn from_loaded(loaded: &LoadedSnapshot, selection: &SnapshotSelection) -> Self {
+        let snapshot = loaded.snapshot();
+        let selection = match selection {
+            SnapshotSelection::Latest => "latest",
+            SnapshotSelection::Explicit(_) => "explicit",
+        };
+        let consistency = match snapshot.consistency() {
+            CaptureConsistency::Stable => ConsistencyView::Stable,
+            CaptureConsistency::Unstable { attempts } => ConsistencyView::Unstable {
+                attempts: attempts.get(),
+            },
+        };
+
+        let sessions = snapshot
+            .sessions()
+            .iter()
+            .map(SessionView::from_snapshot)
+            .collect::<Vec<_>>();
+        let contents = Contents::from_sessions(&sessions);
+        let programs = ProgramEntry::from_sessions(&sessions);
+
+        Self {
+            selection,
+            captured_at: snapshot.captured_at().encoded().to_owned(),
+            source: DisplayValue::from_bytes(snapshot.source().path().as_bytes()),
+            consistency,
+            file: DisplayValue::from_os(loaded.path().as_os_str()),
+            contents,
+            programs,
+            sessions,
+        }
+    }
+
+    fn render(&self, _palette: Palette) -> String {
+        let mut output = String::new();
+        writeln!(output, "Snapshot     {}", self.selection).unwrap();
+        writeln!(output, "Captured     {}", self.captured_at).unwrap();
+        writeln!(output, "Source       {}", self.source.as_str()).unwrap();
+        match self.consistency {
+            ConsistencyView::Stable => {
+                writeln!(output, "Consistency  ● stable topology").unwrap();
+            }
+            ConsistencyView::Unstable { attempts } => {
+                writeln!(
+                    output,
+                    "Consistency  ▲ unstable topology after {attempts} attempts"
+                )
+                .unwrap();
+            }
+        }
+        writeln!(output, "File         {}", self.file.as_str()).unwrap();
+        output.push('\n');
+        writeln!(
+            output,
+            "Contents     {} {} · {} {} · {} {}",
+            self.contents.sessions,
+            count_noun(self.contents.sessions, "session", "sessions"),
+            self.contents.windows,
+            count_noun(self.contents.windows, "window", "windows"),
+            self.contents.panes,
+            count_noun(self.contents.panes, "pane", "panes"),
+        )
+        .unwrap();
+        write!(output, "Programs    ").unwrap();
+        for (position, program) in self.programs.iter().enumerate() {
+            if position > 0 {
+                output.push_str(" · ");
+            }
+            write!(output, "{} {}", program.count, program.visible_label()).unwrap();
+        }
+        output.push_str("\n\n");
+
+        for (position, session) in self.sessions.iter().enumerate() {
+            if position > 0 {
+                output.push('\n');
+            }
+            write!(output, "{}", session.tree()).unwrap();
+        }
+        output
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConsistencyView {
+    Stable,
+    Unstable { attempts: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Contents {
+    sessions: usize,
+    windows: usize,
+    panes: usize,
+}
+
+impl Contents {
+    fn from_sessions(sessions: &[SessionView]) -> Self {
+        let windows = sessions.iter().map(|session| session.windows.len()).sum();
+        let panes = sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .map(|window| window.panes.len())
+            .sum();
+        Self {
+            sessions: sessions.len(),
+            windows,
+            panes,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ProgramEntry {
+    identity: String,
+    count: usize,
+}
+
+impl ProgramEntry {
+    fn from_sessions(sessions: &[SessionView]) -> Vec<Self> {
+        let mut programs: Vec<Self> = Vec::new();
+        for pane in sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+        {
+            let identity = pane.fact.program_identity();
+            if let Some(program) = programs
+                .iter_mut()
+                .find(|program| program.identity == identity)
+            {
+                program.count += 1;
+            } else {
+                programs.push(Self { identity, count: 1 });
+            }
+        }
+        programs
+    }
+
+    fn visible_label(&self) -> &str {
+        if self.identity == "shell" && self.count != 1 {
+            "shells"
+        } else {
+            &self.identity
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SessionView {
+    name: String,
+    working_directory: DisplayValue,
+    windows: Vec<WindowView>,
+}
+
+impl SessionView {
+    fn from_snapshot(session: &tmux_rescue::SessionSnapshot) -> Self {
+        let windows = session
+            .windows()
+            .iter()
+            .map(|window| WindowView::from_snapshot(window, session.working_directory().as_bytes()))
+            .collect();
+        Self {
+            name: session.name().to_owned(),
+            working_directory: DisplayValue::from_bytes(session.working_directory().as_bytes()),
+            windows,
+        }
+    }
+
+    fn tree(&self) -> Tree<String> {
+        let pane_count = self
+            .windows
+            .iter()
+            .map(|window| window.panes.len())
+            .sum::<usize>();
+        let root = format!(
+            "◆ {} · {} {} · {} {}\n  cwd {}",
+            self.name,
+            self.windows.len(),
+            count_noun(self.windows.len(), "window", "windows"),
+            pane_count,
+            count_noun(pane_count, "pane", "panes"),
+            self.working_directory.as_str(),
+        );
+        let mut tree = Tree::new(root).with_glyphs(TREE_GLYPHS);
+        for window in &self.windows {
+            tree.push(window.tree());
+        }
+        tree
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct WindowView {
+    source_index: u32,
+    name: String,
+    panes: Vec<PaneView>,
+}
+
+impl WindowView {
+    fn from_snapshot(window: &tmux_rescue::WindowSnapshot, session_cwd: &[u8]) -> Self {
+        Self {
+            source_index: window.source_index(),
+            name: window.name().to_owned(),
+            panes: window
+                .panes()
+                .iter()
+                .map(|pane| PaneView::from_snapshot(pane, session_cwd))
+                .collect(),
+        }
+    }
+
+    fn tree(&self) -> Tree<String> {
+        let mut tree = Tree::new(format!("[{}] {}", self.source_index, self.name));
+        for pane in &self.panes {
+            tree.push(pane.tree());
+        }
+        tree
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PaneView {
+    source_index: u32,
+    fact: PaneFact,
+    working_directory: PaneWorkingDirectory,
+}
+
+impl PaneView {
+    fn from_snapshot(pane: &tmux_rescue::PaneSnapshot, session_cwd: &[u8]) -> Self {
+        let fact = match pane.recovery() {
+            PaneRecovery::Idle => PaneFact::Shell,
+            PaneRecovery::Automatic(AutomaticRecovery::Codex { session_id }) => {
+                PaneFact::ToolSession {
+                    name: "Codex",
+                    session_id: session_id.as_uuid().to_string(),
+                }
+            }
+            PaneRecovery::Automatic(AutomaticRecovery::ClaudeCode { session_id }) => {
+                PaneFact::ToolSession {
+                    name: "Claude Code",
+                    session_id: session_id.as_uuid().to_string(),
+                }
+            }
+            PaneRecovery::Automatic(AutomaticRecovery::MdBookServe { command }) => {
+                PaneFact::Command(CommandView::from_command(command.command()))
+            }
+            PaneRecovery::Automatic(AutomaticRecovery::BookshelfServe { command }) => {
+                PaneFact::Command(CommandView::from_command(command.command()))
+            }
+            PaneRecovery::Manual(command) => PaneFact::Command(CommandView::from_command(command)),
+            PaneRecovery::Unavailable(failure) => PaneFact::Unavailable {
+                reason: failure.message().to_owned(),
+            },
+        };
+        let working_directory = if pane.working_directory().as_bytes() == session_cwd {
+            PaneWorkingDirectory::Session
+        } else {
+            PaneWorkingDirectory::Explicit(DisplayValue::from_bytes(
+                pane.working_directory().as_bytes(),
+            ))
+        };
+        Self {
+            source_index: pane.source_index(),
+            fact,
+            working_directory,
+        }
+    }
+
+    fn tree(&self) -> Tree<String> {
+        let mut root = format!("[{}] {}", self.source_index, self.fact.title());
+        for detail in self.fact.details() {
+            write!(root, "\n    {detail}").unwrap();
+        }
+        match &self.working_directory {
+            PaneWorkingDirectory::Session => root.push_str("\n    cwd = session"),
+            PaneWorkingDirectory::Explicit(path) => {
+                write!(root, "\n    cwd {}", path.as_str()).unwrap();
+            }
+        }
+        Tree::new(root).with_multiline(true)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PaneWorkingDirectory {
+    Session,
+    Explicit(DisplayValue),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PaneFact {
+    Shell,
+    ToolSession {
+        name: &'static str,
+        session_id: String,
+    },
+    Command(CommandView),
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl PaneFact {
+    fn title(&self) -> &str {
+        match self {
+            Self::Shell => "shell",
+            Self::ToolSession { name, .. } => name,
+            Self::Command(command) => &command.command,
+            Self::Unavailable { .. } => "! program not captured",
+        }
+    }
+
+    fn details(&self) -> Vec<String> {
+        match self {
+            Self::Shell => Vec::new(),
+            Self::ToolSession { session_id, .. } => vec![format!("session {session_id}")],
+            Self::Command(command) => {
+                vec![format!("executable {}", command.executable.as_str())]
+            }
+            Self::Unavailable { reason } => vec![format!("reason {reason}")],
+        }
+    }
+
+    fn program_identity(&self) -> String {
+        match self {
+            Self::Shell => "shell".to_owned(),
+            Self::ToolSession { name, .. } => (*name).to_owned(),
+            Self::Command(command) => command.program_identity.clone(),
+            Self::Unavailable { .. } => "not captured".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CommandView {
+    command: String,
+    executable: DisplayValue,
+    program_identity: String,
+}
+
+impl CommandView {
+    fn from_command(command: &CapturedCommand) -> Self {
+        let executable = command.executable().as_os_str();
+        let identity = Path::new(executable).file_name().unwrap_or(executable);
+        Self {
+            command: display_argv(command.argv().iter().map(|argument| argument.as_bytes())),
+            executable: DisplayValue::from_os(executable),
+            program_identity: DisplayValue::from_os(identity).0,
+        }
+    }
+}
+
+fn count_noun(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 { singular } else { plural }
+}
+
+fn display_bytes(mut bytes: &[u8]) -> String {
+    let mut display = String::new();
+    while !bytes.is_empty() {
+        match std::str::from_utf8(bytes) {
+            Ok(value) => {
+                for character in value.chars() {
+                    push_display_character(&mut display, character);
+                }
+                break;
+            }
+            Err(error) => {
+                let valid_length = error.valid_up_to();
+                let valid = std::str::from_utf8(&bytes[..valid_length])
+                    .expect("Utf8Error::valid_up_to identifies a valid prefix");
+                for character in valid.chars() {
+                    push_display_character(&mut display, character);
+                }
+                let invalid_length = error
+                    .error_len()
+                    .unwrap_or_else(|| bytes.len() - valid_length);
+                for byte in &bytes[valid_length..valid_length + invalid_length] {
+                    write!(display, "\\x{byte:02x}").expect("writing to a String cannot fail");
+                }
+                bytes = &bytes[valid_length + invalid_length..];
+            }
+        }
+    }
+    display
+}
+
+fn push_display_character(display: &mut String, character: char) {
+    match character {
+        '\\' => display.push_str("\\\\"),
+        '"' => display.push_str("\\\""),
+        '\n' => display.push_str("\\n"),
+        '\r' => display.push_str("\\r"),
+        '\t' => display.push_str("\\t"),
+        character if character.is_control() && u32::from(character) <= 0x7f => {
+            write!(display, "\\x{:02x}", u32::from(character))
+                .expect("writing to a String cannot fail");
+        }
+        character if character.is_control() => {
+            write!(display, "\\u{{{:x}}}", u32::from(character))
+                .expect("writing to a String cannot fail");
+        }
+        character => display.push(character),
+    }
+}
+
+fn display_argv<'a>(arguments: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut display = String::new();
+    for (position, argument) in arguments.into_iter().enumerate() {
+        if position > 0 {
+            display.push(' ');
+        }
+        let encoded = display_bytes(argument);
+        if argument_needs_quotes(argument) {
+            display.push('"');
+            display.push_str(&encoded);
+            display.push('"');
+        } else {
+            display.push_str(&encoded);
+        }
+    }
+    display
+}
+
+fn argument_needs_quotes(argument: &[u8]) -> bool {
+    if argument.is_empty() {
+        return true;
+    }
+    match std::str::from_utf8(argument) {
+        Ok(value) => value.chars().any(|character| {
+            character.is_whitespace() || character.is_control() || matches!(character, '"' | '\\')
+        }),
+        Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use tmux_rescue::{LoadedSnapshot, StateStore};
+
+    use super::*;
+
+    fn encoded(value: &str) -> Value {
+        json!({"encoding": "utf8", "value": value})
+    }
+
+    fn command(executable: &str, arguments: &[&str]) -> Value {
+        json!({
+            "executable": encoded(executable),
+            "argv": arguments.iter().map(|argument| encoded(argument)).collect::<Vec<_>>(),
+        })
+    }
+
+    fn load_fixture(value: Value) -> (tempfile::TempDir, LoadedSnapshot) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = StateStore::load_explicit_path(&path).unwrap();
+        (directory, loaded)
+    }
+
+    fn mapped_recovery_fixture() -> Value {
+        json!({
+            "captured_at": "2026-07-24T05:31:32.581307924+08:00",
+            "source": encoded("/tmp/tmux-1000/default"),
+            "consistency": {"kind": "stable"},
+            "sessions": [{
+                "name": "automatic",
+                "working_directory": encoded("/workspace"),
+                "windows": [{
+                    "source_index": 0,
+                    "name": "manual",
+                    "panes": [
+                        {
+                            "source_index": 0,
+                            "working_directory": encoded("/workspace"),
+                            "recovery": {"kind": "idle"},
+                        },
+                        {
+                            "source_index": 1,
+                            "working_directory": encoded("/workspace/codex"),
+                            "recovery": {
+                                "kind": "automatic",
+                                "recovery": {
+                                    "kind": "codex",
+                                    "session_id": "019f7ac5-a55c-7e70-8b31-872ae70c9a94",
+                                },
+                            },
+                        },
+                        {
+                            "source_index": 2,
+                            "working_directory": encoded("/workspace/claude"),
+                            "recovery": {
+                                "kind": "automatic",
+                                "recovery": {
+                                    "kind": "claude_code",
+                                    "session_id": "8f707f38-6fd3-4a11-a03f-853b03d47b0c",
+                                },
+                            },
+                        },
+                        {
+                            "source_index": 3,
+                            "working_directory": encoded("/workspace/mdbook"),
+                            "recovery": {
+                                "kind": "automatic",
+                                "recovery": {
+                                    "kind": "md_book_serve",
+                                    "command": command("/usr/bin/mdbook", &["mdbook", "serve"]),
+                                },
+                            },
+                        },
+                        {
+                            "source_index": 4,
+                            "working_directory": encoded("/workspace/book"),
+                            "recovery": {
+                                "kind": "automatic",
+                                "recovery": {
+                                    "kind": "bookshelf_serve",
+                                    "command": command("/usr/bin/book", &["book", "serve"]),
+                                },
+                            },
+                        },
+                        {
+                            "source_index": 5,
+                            "working_directory": encoded("/workspace/custom"),
+                            "recovery": {
+                                "kind": "manual",
+                                "command": command(
+                                    "/usr/local/bin/tmux-rescue",
+                                    &["tmux-rescue", "manual", "two words"],
+                                ),
+                            },
+                        },
+                        {
+                            "source_index": 6,
+                            "working_directory": encoded("/workspace/missing"),
+                            "recovery": {
+                                "kind": "unavailable",
+                                "failure": "foreground process disappeared",
+                            },
+                        },
+                    ],
+                }],
+            }],
+        })
+    }
+
+    #[test]
+    fn encodes_lossless_values_without_terminal_controls() {
+        assert_eq!(display_bytes(b"/tmp/plain"), "/tmp/plain");
+        assert_eq!(display_bytes("/tmp/数据".as_bytes()), "/tmp/数据");
+        assert_eq!(
+            display_bytes(b"quote\"slash\\tab\tescape\x1b"),
+            "quote\\\"slash\\\\tab\\tescape\\x1b"
+        );
+        assert_eq!(display_bytes(&[b'f', 0x80, b'o']), "f\\x80o");
+    }
+
+    #[test]
+    fn preserves_argv_boundaries_in_diagnostic_commands() {
+        let arguments: &[&[u8]] = &[
+            b"cmd",
+            b"",
+            b"two words",
+            b"quote\"",
+            b"slash\\",
+            &[0x80],
+            "数据".as_bytes(),
+        ];
+
+        assert_eq!(
+            display_argv(arguments.iter().copied()),
+            "cmd \"\" \"two words\" \"quote\\\"\" \"slash\\\\\" \"\\x80\" 数据"
+        );
+    }
+
+    #[test]
+    fn renders_recovery_variants_as_user_facts() {
+        let (_directory, loaded) = load_fixture(mapped_recovery_fixture());
+        let output = render(
+            &loaded,
+            &crate::cli::SnapshotSelection::Explicit(loaded.path().to_owned()),
+            Palette::plain(),
+        );
+
+        for expected in [
+            "[0] shell",
+            "[1] Codex\n",
+            "session 019f7ac5-a55c-7e70-8b31-872ae70c9a94",
+            "[2] Claude Code\n",
+            "session 8f707f38-6fd3-4a11-a03f-853b03d47b0c",
+            "[3] mdbook serve\n",
+            "executable /usr/bin/mdbook",
+            "[4] book serve\n",
+            "executable /usr/bin/book",
+            "[5] tmux-rescue manual \"two words\"\n",
+            "executable /usr/local/bin/tmux-rescue",
+            "[6] ! program not captured\n",
+            "reason foreground process disappeared",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing {expected:?} in:\n{output}"
+            );
+        }
+        assert!(output.contains("◆ automatic"));
+        assert!(output.contains("[0] manual"));
+        assert!(!output.contains("Automatic"));
+        assert!(!output.contains("Manual"));
+    }
+}

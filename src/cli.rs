@@ -710,12 +710,8 @@ mod tests {
                 ColorMode::Never,
             )
         );
-        assert!(
-            Cli::try_parse_from(["tmux-rescue", "inspect", "--color", "sometimes"]).is_err()
-        );
-        assert!(
-            Cli::try_parse_from(["tmux-rescue", "inspect", "one.json", "two.json"]).is_err()
-        );
+        assert!(Cli::try_parse_from(["tmux-rescue", "inspect", "--color", "sometimes"]).is_err());
+        assert!(Cli::try_parse_from(["tmux-rescue", "inspect", "one.json", "two.json"]).is_err());
 
         let (snapshot, target, run) = restore_command(parse(&[
             "tmux-rescue",
@@ -766,9 +762,7 @@ mod tests {
         assert_eq!(
             runner.inspect_requests,
             [InspectRequest {
-                selection: SnapshotSelection::Explicit(PathBuf::from(
-                    "relative/snapshot.json"
-                )),
+                selection: SnapshotSelection::Explicit(PathBuf::from("relative/snapshot.json")),
                 color: ColorMode::Never,
             }]
         );
