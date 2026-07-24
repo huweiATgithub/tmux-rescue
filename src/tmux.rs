@@ -319,11 +319,12 @@ fn require_success(operation: &str, output: Output) -> Result<Vec<u8>, TmuxAdapt
     })
 }
 
-const SERVER_FIELDS: usize = 3;
+const SERVER_FIELDS: usize = 4;
 const SERVER_FORMAT: &str = concat!(
     "#{n:pid}:#{pid}",
     "#{n:start_time}:#{start_time}",
     "#{n:server_sessions}:#{server_sessions}",
+    "#{n:@tmux_rescue_owner}:#{@tmux_rescue_owner}",
 );
 const CREATED_PANE_FIELDS: usize = 9;
 const CREATED_PANE_FORMAT: &str = concat!(
@@ -446,24 +447,23 @@ struct FailedClaimCleanupProof {
 impl MatchedServerIdentity {
     fn observe(destination: &RestoreDestination, expected_token: &str) -> Result<Self, String> {
         let first = read_server_observation(destination)?;
-        let process = OwnedProcessIdentity::capture(first.process_id)?;
-        let token = read_owner_token(destination)?;
-        if token != expected_token {
+        if first.owner_token != expected_token.as_bytes() {
             return Err("target ownership token does not match this claim attempt".to_owned());
         }
+        let process = OwnedProcessIdentity::capture(first.process_id)?;
         let confirmed = read_server_observation(destination)?;
-        if confirmed.process_id != first.process_id || confirmed.start_time != first.start_time {
+        if confirmed != first {
             return Err("target server identity changed during claim observation".to_owned());
         }
         process.ensure_same_live()?;
         Ok(Self {
             server: OwnedServer {
                 destination: destination.clone(),
-                token,
+                token: expected_token.to_owned(),
                 process,
-                start_time: confirmed.start_time,
+                start_time: first.start_time,
             },
-            sessions: confirmed.sessions,
+            sessions: first.sessions,
         })
     }
 
@@ -1263,11 +1263,7 @@ impl OwnedServer {
                     .disposition_when_endpoint_is_absent(removed_if_absent);
             }
         };
-        let token = match read_owner_token(&self.destination) {
-            Ok(token) => token,
-            Err(_) => return TargetDisposition::Unknown,
-        };
-        if token == self.token
+        if observation.owner_token == self.token.as_bytes()
             && observation.process_id == self.process.process_id
             && observation.start_time == self.start_time
             && matches!(
@@ -1283,8 +1279,7 @@ impl OwnedServer {
 
     fn ensure_cleanup_identity(&self) -> Result<(), String> {
         let observation = read_server_observation(&self.destination)?;
-        let token = read_owner_token(&self.destination)?;
-        if token != self.token
+        if observation.owner_token != self.token.as_bytes()
             || observation.process_id != self.process.process_id
             || observation.start_time != self.start_time
         {
@@ -1351,7 +1346,14 @@ enum OwnedProcessState {
 }
 
 fn observe_owned_process(identity: OwnedProcessIdentity) -> OwnedProcessState {
-    let stat = match read_process_stat(identity.process_id) {
+    observe_owned_process_with(identity, read_process_stat)
+}
+
+fn observe_owned_process_with(
+    identity: OwnedProcessIdentity,
+    read_stat: impl FnOnce(u32) -> Result<Option<crate::ProcessStat>, String>,
+) -> OwnedProcessState {
+    let stat = match read_stat(identity.process_id) {
         Ok(Some(stat)) => stat,
         Ok(None) => return OwnedProcessState::GoneOrReused,
         Err(_) => return OwnedProcessState::Indeterminate,
@@ -1384,10 +1386,12 @@ enum ConditionalFailure {
     Failed(String),
 }
 
+#[derive(Debug, Eq, PartialEq)]
 struct ServerObservation {
     process_id: u32,
     start_time: u64,
     sessions: u32,
+    owner_token: Vec<u8>,
 }
 
 fn read_server_observation(destination: &RestoreDestination) -> Result<ServerObservation, String> {
@@ -1402,7 +1406,7 @@ fn read_server_observation(destination: &RestoreDestination) -> Result<ServerObs
         return Err("target identity did not contain exactly one record".to_owned());
     }
     let fields = records.remove(0);
-    let [process_id, start_time, sessions]: [Vec<u8>; SERVER_FIELDS] = fields
+    let [process_id, start_time, sessions, owner_token]: [Vec<u8>; SERVER_FIELDS] = fields
         .try_into()
         .map_err(|_| "target identity had the wrong field count".to_owned())?;
     Ok(ServerObservation {
@@ -1411,23 +1415,8 @@ fn read_server_observation(destination: &RestoreDestination) -> Result<ServerObs
         start_time: parse_ascii_u64(start_time, "target server start time")?,
         sessions: parse_u32(sessions, "target server session count")
             .map_err(|error| error.to_string())?,
+        owner_token,
     })
-}
-
-fn read_owner_token(destination: &RestoreDestination) -> Result<String, String> {
-    let output = run_target_stdout(
-        destination,
-        &[os("show-options"), os("-sv"), os("@tmux_rescue_owner")],
-        "read target ownership token",
-    )?;
-    let token = output
-        .strip_suffix(b"\n")
-        .ok_or_else(|| "target ownership token lacks a terminating newline".to_owned())?;
-    if token.is_empty() || token.contains(&b'\n') {
-        return Err("target ownership token is malformed".to_owned());
-    }
-    String::from_utf8(token.to_vec())
-        .map_err(|_| "target ownership token is not valid UTF-8".to_owned())
 }
 
 fn parse_created_pane(output: &[u8]) -> Result<CreatedPane, String> {
@@ -1614,8 +1603,9 @@ mod tests {
     use crate::{RestoreDestination, RestoreTargetState, TargetDisposition, TmuxSelector};
 
     use super::{
-        OwnedServer, TemporaryClaimConfig, UnconfirmedClaim, automatic_launch_commands,
-        literal_paste_commands, os, read_server_observation,
+        OwnedProcessIdentity, OwnedProcessState, OwnedServer, TemporaryClaimConfig,
+        UnconfirmedClaim, automatic_launch_commands, literal_paste_commands,
+        observe_owned_process_with, os, read_server_observation,
     };
 
     struct TestProcessGuard(u32);
@@ -1630,6 +1620,25 @@ mod tests {
                 libc::kill(self.0 as i32, libc::SIGTERM);
             }
         }
+    }
+
+    #[test]
+    fn owned_process_identity_rejects_same_pid_with_changed_os_start_time() {
+        let identity = OwnedProcessIdentity {
+            process_id: 4242,
+            proc_start_time: 11,
+        };
+
+        let state = observe_owned_process_with(identity, |process_id| {
+            let stat = format!(
+                "{process_id} (tmux: server) S 1 {process_id} {process_id} 0 {process_id} 0 0 0 0 0 1 2 0 0 20 0 1 0 22\n"
+            );
+            Ok(Some(
+                crate::parse_proc_stat(process_id, stat.as_bytes()).unwrap(),
+            ))
+        });
+
+        assert!(matches!(state, OwnedProcessState::GoneOrReused));
     }
 
     #[test]
