@@ -321,9 +321,16 @@ fn named_and_path_sources_publish_to_one_global_stream() {
         Some(state_home.join("tmux-rescue/snapshots").as_path())
     );
     assert_ne!(named_snapshot, path_snapshot);
+    let expected_latest = [
+        named_snapshot.file_name().unwrap(),
+        path_snapshot.file_name().unwrap(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap();
     assert_eq!(
         fs::read_link(state_home.join("tmux-rescue/latest")).unwrap(),
-        Path::new("snapshots").join(path_snapshot.file_name().unwrap())
+        Path::new("snapshots").join(expected_latest)
     );
     let named = ValidatedSnapshot::from_json(&fs::read(named_snapshot).unwrap()).unwrap();
     let path = ValidatedSnapshot::from_json(&fs::read(path_snapshot).unwrap()).unwrap();
