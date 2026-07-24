@@ -566,6 +566,7 @@ fn argument_needs_quotes(argument: &[u8]) -> bool {
 mod tests {
     use std::io::Write as _;
 
+    use base64::Engine as _;
     use serde_json::{Value, json};
     use tmux_rescue::{LoadedSnapshot, StateStore};
 
@@ -573,6 +574,16 @@ mod tests {
 
     fn encoded(value: &str) -> Value {
         json!({"encoding": "utf8", "value": value})
+    }
+
+    fn encoded_bytes(value: &[u8]) -> Value {
+        match std::str::from_utf8(value) {
+            Ok(value) => encoded(value),
+            Err(_) => json!({
+                "encoding": "base64",
+                "value": base64::engine::general_purpose::STANDARD.encode(value),
+            }),
+        }
     }
 
     fn command(executable: &str, arguments: &[&str]) -> Value {
@@ -911,5 +922,59 @@ mod tests {
             "Consistency  \x1b[33m▲\x1b[0m ",
             "\x1b[1munstable topology after 3 attempts\x1b[0m\n",
         )));
+    }
+
+    #[test]
+    fn hostile_os_values_remain_complete_visible_text() {
+        let fixture = json!({
+            "captured_at": "2026-07-24T00:00:00Z",
+            "source": encoded_bytes(b"/tmp/source\x1b[31m.sock"),
+            "consistency": {"kind": "stable"},
+            "sessions": [{
+                "name": "automatic Manual",
+                "working_directory": encoded("/workspace"),
+                "windows": [{
+                    "source_index": 0,
+                    "name": "quoted window",
+                    "panes": [{
+                        "source_index": 0,
+                        "working_directory": encoded_bytes(b"/workspace/\x80\x1b[31m"),
+                        "recovery": {
+                            "kind": "manual",
+                            "command": {
+                                "executable": encoded_bytes(b"/usr/bin/\x80"),
+                                "argv": [
+                                    encoded_bytes(&[0x80]),
+                                    encoded(""),
+                                    encoded("two words"),
+                                    encoded("quote\""),
+                                    encoded("slash\\"),
+                                    encoded_bytes(b"\x1b[31m"),
+                                    encoded("数据"),
+                                ],
+                            },
+                        },
+                    }],
+                }],
+            }],
+        });
+        let (_directory, loaded) = load_fixture(fixture);
+
+        let output = render(
+            &loaded,
+            &crate::cli::SnapshotSelection::Explicit(loaded.path().to_owned()),
+            Palette::plain(),
+        );
+
+        assert!(!output.contains('\x1b'));
+        assert!(output.contains("Source       /tmp/source\\x1b[31m.sock\n"));
+        assert!(output.contains("Programs     1 \\x80\n"));
+        assert!(output.contains("◆ automatic Manual · 1 window · 1 pane\n"));
+        assert!(output.contains(concat!(
+            "[0] \"\\x80\" \"\" \"two words\" \"quote\\\"\" ",
+            "\"slash\\\\\" \"\\x1b[31m\" 数据\n",
+        )));
+        assert!(output.contains("executable /usr/bin/\\x80\n"));
+        assert!(output.contains("cwd /workspace/\\x80\\x1b[31m\n"));
     }
 }

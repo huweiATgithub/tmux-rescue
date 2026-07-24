@@ -15,7 +15,7 @@ use tmux_rescue::{
     TmuxRestoreAdapter, TmuxServerIdentity, TopologyReadPhase, capture_snapshot, plan_restore,
 };
 
-use crate::inspect::Palette;
+use crate::inspect::{Palette, render};
 
 pub const EXIT_SUCCESS: u8 = 0;
 pub const EXIT_FAILURE: u8 = 1;
@@ -215,6 +215,17 @@ impl<'a, W: Write, E: Write> SystemCliRunner<'a, W, E> {
         let _ = writeln!(self.stderr, "error: {}", safe_text(&error.to_string()));
         EXIT_FAILURE
     }
+
+    fn report_inspect_failure(&mut self, error: CliError, color: ColorMode) -> u8 {
+        let palette = self.color_support.stderr_palette(color);
+        let _ = writeln!(
+            self.stderr,
+            "{} {}",
+            palette.fatal_prefix(),
+            safe_text(&error.to_string())
+        );
+        EXIT_FAILURE
+    }
 }
 
 impl<W: Write, E: Write> CliRunner for SystemCliRunner<'_, W, E> {
@@ -226,8 +237,11 @@ impl<W: Write, E: Write> CliRunner for SystemCliRunner<'_, W, E> {
     }
 
     fn inspect(&mut self, request: InspectRequest) -> u8 {
-        let _palette = self.color_support.stdout_palette(request.color);
-        EXIT_FAILURE
+        let palette = self.color_support.stdout_palette(request.color);
+        match run_inspect(&request, self.stdout, palette) {
+            Ok(code) => code,
+            Err(error) => self.report_inspect_failure(error, request.color),
+        }
     }
 
     fn restore(&mut self, request: RestoreRequest) -> u8 {
@@ -299,6 +313,24 @@ pub fn run_snapshot(stdout: &mut impl Write, stderr: &mut impl Write) -> Result<
     let exit_code = snapshot_exit_code(&publication);
     render_publication(stdout, stderr, &publication)?;
     Ok(exit_code)
+}
+
+pub fn run_inspect(
+    request: &InspectRequest,
+    stdout: &mut impl Write,
+    palette: Palette,
+) -> Result<u8, CliError> {
+    let loaded = match &request.selection {
+        SnapshotSelection::Latest => StateStore::from_environment()
+            .map_err(|error| CliError::new(format!("open state store: {error}")))?
+            .load_latest(),
+        SnapshotSelection::Explicit(path) => StateStore::load_explicit_path(path),
+    }
+    .map_err(|error| CliError::new(format!("load snapshot: {error}")))?;
+    let document = render(&loaded, &request.selection, palette);
+    stdout.write_all(document.as_bytes()).map_err(io_failure)?;
+    stdout.flush().map_err(io_failure)?;
+    Ok(EXIT_SUCCESS)
 }
 
 pub fn run_restore(
@@ -658,6 +690,7 @@ fn io_failure(error: std::io::Error) -> CliError {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::path::{Path, PathBuf};
 
     use clap::Parser;
@@ -883,6 +916,67 @@ mod tests {
         assert_eq!(
             support.stdout_palette(ColorMode::Never),
             crate::inspect::Palette::plain()
+        );
+    }
+
+    #[test]
+    fn inspect_output_failure_is_fatal_and_reports_on_stderr() {
+        struct FailingWriter;
+
+        impl io::Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed stdout"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("snapshot.json");
+        std::fs::write(
+            &snapshot,
+            serde_json::to_vec(&serde_json::json!({
+                "captured_at": "2026-07-24T00:00:00Z",
+                "source": {"encoding": "utf8", "value": "/tmp/source.sock"},
+                "consistency": {"kind": "stable"},
+                "sessions": [{
+                    "name": "work",
+                    "working_directory": {"encoding": "utf8", "value": "/workspace"},
+                    "windows": [{
+                        "source_index": 0,
+                        "name": "shell",
+                        "panes": [{
+                            "source_index": 0,
+                            "working_directory": {
+                                "encoding": "utf8",
+                                "value": "/workspace"
+                            },
+                            "recovery": {"kind": "idle"}
+                        }]
+                    }]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let request = InspectRequest {
+            selection: SnapshotSelection::Explicit(snapshot),
+            color: ColorMode::Always,
+        };
+        let mut stdout = FailingWriter;
+        let mut stderr = Vec::new();
+        let mut runner = SystemCliRunner::with_color_support(
+            &mut stdout,
+            &mut stderr,
+            TerminalColorSupport::new(false, false),
+        );
+
+        assert_eq!(runner.inspect(request), EXIT_FAILURE);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "\x1b[31merror:\x1b[0m write CLI output: closed stdout\n"
         );
     }
 
