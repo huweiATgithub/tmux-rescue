@@ -5,14 +5,14 @@ use std::rc::Rc;
 use serde_json::{Value, json};
 use tmux_rescue::{
     AttentionReason, AutomaticFallbackReason, AutomaticPaneObservation,
-    AutomaticRecoveryExpectation, ExecutionCheckedTarget, GuardedPaneFailure, GuardedPaneOperation,
-    GuardedPaneResult, LosslessOsString, OwnedRestoreTarget, PaneRestoreOutcome, PaneRestoreResult,
-    PlanningExecutable, RecordedAbsolutePath, RecoveryRestoreTarget, RestoreEnvironment,
-    RestoreEnvironmentFailure, RestoreExecutionFailure, RestoreExecutor, RestorePlan,
-    RestoreRunResult, RestoreRunStatus, RestoreTargetCapability, RestoreTargetState,
+    AutomaticRecoveryExpectation, GuardedPaneFailure, GuardedPaneOperation, GuardedPaneResult,
+    LosslessOsString, OwnedRestoreTarget, PaneRestoreOutcome, PaneRestoreResult,
+    PlanningExecutable, RecordedAbsolutePath, RecoveryRestoreTarget, RestoreDestination,
+    RestoreEnvironment, RestoreEnvironmentFailure, RestoreExecutionFailure, RestoreExecutor,
+    RestorePlan, RestoreRunResult, RestoreRunStatus, RestoreTargetCapability, RestoreTargetState,
     RollbackFailure, RollbackFailureDisposition, RollbackOutcome, SourcePaneCoordinate,
-    TargetClaimFailure, TargetDisposition, TargetProbe, TargetShell, TmuxServerIdentity,
-    TopologyFailure, ValidatedSnapshot, plan_restore,
+    TargetClaimFailure, TargetDisposition, TargetShell, TmuxSelector, TopologyFailure,
+    ValidatedSnapshot, plan_restore,
 };
 
 fn encoded(value: &str) -> Value {
@@ -97,10 +97,6 @@ impl PlanningEnvironment {
 }
 
 impl RestoreEnvironment for PlanningEnvironment {
-    fn probe_target(&self, _target: &TmuxServerIdentity) -> TargetProbe {
-        TargetProbe::MissingPath
-    }
-
     fn target_shell(&self) -> Result<TargetShell, RestoreEnvironmentFailure> {
         TargetShell::try_from_bytes(b"/bin/sh".to_vec())
             .map_err(|error| RestoreEnvironmentFailure::new(error.to_string()))
@@ -168,6 +164,7 @@ struct SentInput {
 struct TargetLog {
     events: Vec<&'static str>,
     claim_calls: usize,
+    claim_destinations: Vec<TmuxSelector>,
     topology_calls: usize,
     rollback_calls: usize,
     begin_recovery_calls: usize,
@@ -178,7 +175,6 @@ struct TargetLog {
 }
 
 struct TargetScript {
-    recheck: TargetProbe,
     claim_failure: Option<TargetClaimFailure>,
     topology_failure: Option<TopologyFailure>,
     rollback_outcome: RollbackOutcome,
@@ -190,7 +186,6 @@ struct TargetScript {
 impl TargetScript {
     fn successful() -> Self {
         Self {
-            recheck: TargetProbe::MissingPath,
             claim_failure: None,
             topology_failure: None,
             rollback_outcome: RollbackOutcome::Removed,
@@ -220,19 +215,15 @@ impl FakeTarget {
 }
 
 impl RestoreTargetCapability for FakeTarget {
-    fn recheck(&mut self, _target: &TmuxServerIdentity) -> TargetProbe {
-        self.log.borrow_mut().events.push("recheck");
-        self.script.as_ref().unwrap().recheck.clone()
-    }
-
     fn claim(
         &mut self,
-        _checked: ExecutionCheckedTarget,
+        destination: &RestoreDestination,
         _shell: &TargetShell,
     ) -> Result<Box<dyn OwnedRestoreTarget>, TargetClaimFailure> {
         let mut log = self.log.borrow_mut();
         log.events.push("claim");
         log.claim_calls += 1;
+        log.claim_destinations.push(destination.selector().clone());
         drop(log);
 
         let mut script = self.script.take().expect("claim is attempted once");
@@ -360,55 +351,6 @@ fn execute(plan: RestorePlan, script: TargetScript) -> (RestoreRunResult, Rc<Ref
 }
 
 #[test]
-fn ownership_preexisting_target_never_reaches_claim() {
-    let plan = plan_with(vec![idle_pane(0)], &[]);
-    let mut script = TargetScript::successful();
-    script.recheck = TargetProbe::Present;
-
-    let (result, log) = execute(plan, script);
-
-    assert_eq!(result.status(), RestoreRunStatus::Fatal);
-    assert_eq!(result.target_state(), &RestoreTargetState::NotEstablished);
-    assert!(matches!(
-        result.failure(),
-        Some(RestoreExecutionFailure::TargetExists { .. })
-    ));
-    assert_eq!(log.borrow().events, ["recheck"]);
-    assert_eq!(log.borrow().claim_calls, 0);
-}
-
-#[test]
-fn ownership_refused_crash_socket_reaches_the_claim_boundary() {
-    let plan = plan_with(vec![idle_pane(0)], &[]);
-    let mut script = TargetScript::successful();
-    script.recheck = TargetProbe::RefusedSocket;
-    script.guarded_results.push_back(Ok(()));
-
-    let (result, log) = execute(plan, script);
-
-    assert_eq!(result.status(), RestoreRunStatus::Complete);
-    assert_eq!(log.borrow().claim_calls, 1);
-}
-
-#[test]
-fn ownership_indeterminate_target_never_reaches_claim() {
-    let plan = plan_with(vec![idle_pane(0)], &[]);
-    let mut script = TargetScript::successful();
-    script.recheck = TargetProbe::Indeterminate("permission denied".to_owned());
-
-    let (result, log) = execute(plan, script);
-
-    assert_eq!(result.status(), RestoreRunStatus::Fatal);
-    assert_eq!(result.target_state(), &RestoreTargetState::NotEstablished);
-    assert!(matches!(
-        result.failure(),
-        Some(RestoreExecutionFailure::TargetIndeterminate { .. })
-    ));
-    assert_eq!(log.borrow().events, ["recheck"]);
-    assert_eq!(log.borrow().claim_calls, 0);
-}
-
-#[test]
 fn ownership_claim_race_never_exposes_topology_capability() {
     let plan = plan_with(vec![idle_pane(0)], &[]);
     let mut script = TargetScript::successful();
@@ -422,7 +364,13 @@ fn ownership_claim_race_never_exposes_topology_capability() {
         result.failure(),
         Some(RestoreExecutionFailure::TargetClaimFailed { .. })
     ));
-    assert_eq!(log.borrow().events, ["recheck", "claim"]);
+    assert_eq!(log.borrow().events, ["claim"]);
+    assert_eq!(
+        log.borrow().claim_destinations,
+        [TmuxSelector::SocketPath(
+            "/tmp/tmux-rescue-restore-target.sock".into()
+        )]
+    );
     assert_eq!(log.borrow().topology_calls, 0);
     assert_eq!(log.borrow().rollback_calls, 0);
 }
@@ -447,7 +395,7 @@ fn ownership_claim_failure_after_creation_preserves_observed_state() {
         result.failure(),
         Some(RestoreExecutionFailure::TargetClaimFailed { .. })
     ));
-    assert_eq!(log.borrow().events, ["recheck", "claim"]);
+    assert_eq!(log.borrow().events, ["claim"]);
     assert_eq!(log.borrow().rollback_calls, 0);
 }
 
@@ -470,10 +418,7 @@ fn ownership_topology_failure_consumes_capability_for_rollback() {
         Some(RestoreExecutionFailure::TopologyFailed { .. })
     ));
     assert!(result.panes().is_empty());
-    assert_eq!(
-        log.borrow().events,
-        ["recheck", "claim", "topology", "rollback"]
-    );
+    assert_eq!(log.borrow().events, ["claim", "topology", "rollback"]);
     assert_eq!(log.borrow().rollback_calls, 1);
     assert_eq!(log.borrow().begin_recovery_calls, 0);
 }

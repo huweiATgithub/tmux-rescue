@@ -1,7 +1,6 @@
 use std::process::ExitCode;
 
 use anstream::{AutoStream, ColorChoice};
-use clap::Parser;
 use clap::error::ErrorKind;
 
 mod cli;

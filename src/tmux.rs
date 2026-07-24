@@ -13,14 +13,14 @@ use thiserror::Error;
 
 use crate::{
     AutomaticPaneObservation, AutomaticRecoveryExpectation, CaptureFailure, CaptureSource,
-    CaptureSourceFailure, ExecutionCheckedTarget, GuardedPaneFailure, GuardedPaneOperation,
-    GuardedPaneResult, LinuxProcessInspector, LosslessOsString, OwnedRestoreTarget,
-    PaneInitialProcess, PaneProcessAnchor, PaneProcessObservation, PaneProcessProbe, PaneRecovery,
-    RecordedAbsolutePath, RecoveryRestoreTarget, RestorePlan, RestoreTargetCapability,
-    RestoreTargetState, RollbackFailure, RollbackFailureDisposition, RollbackOutcome,
-    SnapshotSource, SourcePaneCoordinate, TargetClaimFailure, TargetDisposition, TargetProbe,
-    TargetShell, TmuxServerIdentity, TopologyFailure, TopologyObservation, TopologyPane,
-    TopologySession, TopologyWindow, classify_pane, parse_proc_stat, probe_tmux_target,
+    CaptureSourceFailure, GuardedPaneFailure, GuardedPaneOperation, GuardedPaneResult,
+    LinuxProcessInspector, LosslessOsString, OwnedRestoreTarget, PaneInitialProcess,
+    PaneProcessAnchor, PaneProcessObservation, PaneProcessProbe, PaneRecovery,
+    RecordedAbsolutePath, RecoveryRestoreTarget, RestoreDestination, RestorePlan,
+    RestoreTargetCapability, RestoreTargetState, RollbackFailure, RollbackFailureDisposition,
+    RollbackOutcome, SnapshotSource, SourcePaneCoordinate, TargetClaimFailure, TargetDisposition,
+    TargetShell, TmuxSelector, TopologyFailure, TopologyObservation, TopologyPane, TopologySession,
+    TopologyWindow, classify_pane, parse_proc_stat,
 };
 
 const SOURCE_FIELDS: usize = 10;
@@ -39,13 +39,16 @@ const SOURCE_FORMAT: &str = concat!(
 
 pub struct TmuxAdapter<P = LinuxProcessInspector> {
     source: SnapshotSource,
+    selector: TmuxSelector,
     process_probe: P,
 }
 
 impl<P> TmuxAdapter<P> {
     pub fn new(source: SnapshotSource, process_probe: P) -> Self {
+        let selector = TmuxSelector::SocketPath(source.path().as_os_str().to_owned());
         Self {
             source,
+            selector,
             process_probe,
         }
     }
@@ -56,26 +59,31 @@ impl<P> TmuxAdapter<P> {
 }
 
 impl TmuxAdapter<LinuxProcessInspector> {
-    pub fn selected_source() -> Result<SnapshotSource, TmuxAdapterError> {
-        let output = Command::new("tmux")
-            .args([
-                "-u",
-                "-N",
-                "display-message",
-                "-p",
-                "#{n:socket_path}:#{socket_path}",
-            ])
+    pub fn selected_source(
+        selector: Option<TmuxSelector>,
+    ) -> Result<TmuxAdapter<LinuxProcessInspector>, TmuxAdapterError> {
+        let mut command = source_client_command(selector.as_ref());
+        let output = command
+            .args(["display-message", "-p", "#{n:socket_path}:#{socket_path}"])
             .output()
             .map_err(|error| TmuxAdapterError::CommandUnavailable(error.to_string()))?;
-        require_success("resolve selected tmux server", output).and_then(|stdout| {
-            let mut records = parse_length_prefixed_records(&stdout, 1)?;
-            if records.len() != 1 {
-                return Err(TmuxAdapterError::MalformedOutput(
-                    "selected server response did not contain exactly one record".to_owned(),
-                ));
-            }
-            SnapshotSource::try_from_bytes(records.remove(0).remove(0))
-                .map_err(|error| TmuxAdapterError::MalformedOutput(error.to_string()))
+        let source =
+            require_success("resolve selected tmux server", output).and_then(|stdout| {
+                let mut records = parse_length_prefixed_records(&stdout, 1)?;
+                if records.len() != 1 {
+                    return Err(TmuxAdapterError::MalformedOutput(
+                        "selected server response did not contain exactly one record".to_owned(),
+                    ));
+                }
+                SnapshotSource::try_from_bytes(records.remove(0).remove(0))
+                    .map_err(|error| TmuxAdapterError::MalformedOutput(error.to_string()))
+            })?;
+        let selector = selector
+            .unwrap_or_else(|| TmuxSelector::SocketPath(source.path().as_os_str().to_owned()));
+        Ok(TmuxAdapter {
+            source,
+            selector,
+            process_probe: LinuxProcessInspector::new(),
         })
     }
 }
@@ -102,17 +110,24 @@ impl<P: PaneProcessProbe> CaptureSource for TmuxAdapter<P> {
 
 impl<P> TmuxAdapter<P> {
     fn read_source_topology(&self) -> Result<TopologyObservation, TmuxAdapterError> {
-        let output = Command::new("tmux")
-            .args(["-u", "-N", "-S"])
-            .arg(self.source.path().as_os_str())
+        let output = source_client_command(Some(&self.selector))
             .args(["list-panes", "-a", "-F", SOURCE_FORMAT])
-            .env_remove("TMUX")
             .output()
             .map_err(|error| TmuxAdapterError::CommandUnavailable(error.to_string()))?;
         let stdout = require_success("read tmux source topology", output)?;
         let records = parse_length_prefixed_records(&stdout, SOURCE_FIELDS)?;
         topology_from_records(records)
     }
+}
+
+fn source_client_command(selector: Option<&TmuxSelector>) -> Command {
+    let mut command = Command::new("tmux");
+    command.args(["-u", "-N"]);
+    if let Some(selector) = selector {
+        selector.append_to(&mut command);
+        command.env_remove("TMUX");
+    }
+    command
 }
 
 #[derive(Clone)]
@@ -304,9 +319,8 @@ fn require_success(operation: &str, output: Output) -> Result<Vec<u8>, TmuxAdapt
     })
 }
 
-const SERVER_FIELDS: usize = 4;
+const SERVER_FIELDS: usize = 3;
 const SERVER_FORMAT: &str = concat!(
-    "#{n:socket_path}:#{socket_path}",
     "#{n:pid}:#{pid}",
     "#{n:start_time}:#{start_time}",
     "#{n:server_sessions}:#{server_sessions}",
@@ -353,13 +367,9 @@ impl Default for TmuxRestoreAdapter<LinuxProcessInspector> {
 }
 
 impl<P: PaneProcessProbe + 'static> RestoreTargetCapability for TmuxRestoreAdapter<P> {
-    fn recheck(&mut self, target: &TmuxServerIdentity) -> TargetProbe {
-        probe_tmux_target(target)
-    }
-
     fn claim(
         &mut self,
-        checked: ExecutionCheckedTarget,
+        destination: &RestoreDestination,
         shell: &TargetShell,
     ) -> Result<Box<dyn OwnedRestoreTarget>, TargetClaimFailure> {
         if self.process_probe.is_none() {
@@ -369,9 +379,7 @@ impl<P: PaneProcessProbe + 'static> RestoreTargetCapability for TmuxRestoreAdapt
         }
         let token = random_owner_token()?;
         let config = TemporaryClaimConfig::create(&token)?;
-        let output = Command::new("tmux")
-            .args(["-u", "-S"])
-            .arg(checked.target().socket_path().as_os_str())
+        let output = start_capable_target_command(destination)
             .args(["-f"])
             .arg(config.path())
             .arg("start-server")
@@ -381,7 +389,7 @@ impl<P: PaneProcessProbe + 'static> RestoreTargetCapability for TmuxRestoreAdapt
                 TargetClaimFailure::new(format!("tmux start-server is unavailable: {error}"))
             })?;
         let unconfirmed = UnconfirmedClaim {
-            target: checked.target().clone(),
+            destination: destination.clone(),
             token,
         };
         if !output.status.success() {
@@ -406,7 +414,7 @@ impl<P: PaneProcessProbe + 'static> RestoreTargetCapability for TmuxRestoreAdapt
 }
 
 struct UnconfirmedClaim {
-    target: TmuxServerIdentity,
+    destination: RestoreDestination,
     token: String,
 }
 
@@ -423,12 +431,9 @@ impl UnconfirmedCleanup {
 
 impl UnconfirmedClaim {
     fn confirm(self) -> Result<OwnedServer, TargetClaimFailure> {
-        let verification = read_server_observation(&self.target).and_then(|server| {
-            let observed_token = read_owner_token(&self.target)?;
-            if observed_token != self.token
-                || server.socket_path.as_bytes() != self.target.socket_path().as_bytes()
-                || server.sessions != 0
-            {
+        let verification = read_server_observation(&self.destination).and_then(|server| {
+            let observed_token = read_owner_token(&self.destination)?;
+            if observed_token != self.token || server.sessions != 0 {
                 return Err("target ownership was not established after start-server".to_owned());
             }
             Ok(server)
@@ -445,7 +450,7 @@ impl UnconfirmedClaim {
                 };
                 Ok(OwnedServer {
                     process,
-                    target: self.target,
+                    destination: self.destination,
                     token: self.token,
                     start_time: server.start_time,
                 })
@@ -482,19 +487,18 @@ impl UnconfirmedClaim {
     }
 
     fn observed_owned_process(&self) -> Option<OwnedProcessIdentity> {
-        let server = read_server_observation(&self.target).ok()?;
-        let token = read_owner_token(&self.target).ok()?;
-        (token == self.token
-            && server.socket_path.as_bytes() == self.target.socket_path().as_bytes())
-        .then(|| OwnedProcessIdentity::capture(server.process_id).ok())
-        .flatten()
+        let server = read_server_observation(&self.destination).ok()?;
+        let token = read_owner_token(&self.destination).ok()?;
+        (token == self.token)
+            .then(|| OwnedProcessIdentity::capture(server.process_id).ok())
+            .flatten()
     }
 
     fn remove_if_still_owned(&self) -> Result<(), String> {
         let marker = format!("TMUX_RESCUE_UNCONFIRMED_NOT_OWNED_{}", self.token);
         let condition = ["#{==:#{@tmux_rescue_owner},", &self.token, "}"].concat();
         let output = run_target_stdout(
-            &self.target,
+            &self.destination,
             &[
                 os("if-shell"),
                 os("-F"),
@@ -530,16 +534,13 @@ impl UnconfirmedClaim {
         owned_process: Option<OwnedProcessIdentity>,
         cleanup: &UnconfirmedCleanup,
     ) -> TargetDisposition {
-        match probe_tmux_target(&self.target) {
-            TargetProbe::MissingPath | TargetProbe::RefusedSocket => match owned_process {
+        match read_owner_token(&self.destination) {
+            Ok(token) if token == self.token => TargetDisposition::Retained,
+            Ok(_) => TargetDisposition::Unknown,
+            Err(_) => match owned_process {
                 Some(identity) => identity.disposition_when_endpoint_is_absent(true),
                 None if cleanup.permits_absent_endpoint_as_removal() => TargetDisposition::Removed,
                 None => TargetDisposition::Unknown,
-            },
-            TargetProbe::Indeterminate(_) => TargetDisposition::Unknown,
-            TargetProbe::Present => match read_owner_token(&self.target) {
-                Ok(token) if token == self.token => TargetDisposition::Retained,
-                Ok(_) | Err(_) => TargetDisposition::Unknown,
             },
         }
     }
@@ -586,7 +587,7 @@ impl Drop for TemporaryClaimConfig {
 
 #[derive(Clone)]
 struct OwnedServer {
-    target: TmuxServerIdentity,
+    destination: RestoreDestination,
     token: String,
     process: OwnedProcessIdentity,
     start_time: u64,
@@ -621,7 +622,7 @@ struct CreatedPane {
 
 impl<P: PaneProcessProbe + 'static> OwnedRestoreTarget for TmuxOwnedTarget<P> {
     fn create_topology(&mut self, plan: &RestorePlan) -> Result<(), TopologyFailure> {
-        if plan.target_shell() != &self.shell || plan.target() != &self.server.target {
+        if plan.target_shell() != &self.shell || plan.destination() != &self.server.destination {
             return Err(TopologyFailure::new(
                 "restore plan does not match the claimed target capability",
             ));
@@ -924,7 +925,7 @@ impl<P: PaneProcessProbe> TmuxOwnedTarget<P> {
 
     fn pane_still_exists(&self, pane: &RestoredPane) -> bool {
         run_target_stdout(
-            &self.server.target,
+            &self.server.destination,
             &[
                 os("display-message"),
                 os("-p"),
@@ -1117,7 +1118,7 @@ impl OwnedServer {
     fn run_guarded(&self, command: &[OsString], operation: &str) -> Result<Vec<u8>, String> {
         let marker = format!("TMUX_RESCUE_OWNERSHIP_LOST_{}", self.token);
         let output = run_target_stdout(
-            &self.target,
+            &self.destination,
             &[
                 os("if-shell"),
                 os("-F"),
@@ -1152,7 +1153,7 @@ impl OwnedServer {
     ) -> Result<(), ConditionalFailure> {
         let marker = format!("TMUX_RESCUE_INPUT_BLOCKED_{}", self.token);
         let output = run_target_stdout(
-            &self.target,
+            &self.destination,
             &[
                 os("if-shell"),
                 os("-F"),
@@ -1198,23 +1199,19 @@ impl OwnedServer {
     }
 
     fn observe_disposition(&self, removed_if_absent: bool) -> TargetDisposition {
-        match probe_tmux_target(&self.target) {
-            TargetProbe::MissingPath | TargetProbe::RefusedSocket => self
+        match self.matches_live_server() {
+            Ok(true) => TargetDisposition::Retained,
+            Ok(false) => TargetDisposition::Unknown,
+            Err(_) => self
                 .process
                 .disposition_when_endpoint_is_absent(removed_if_absent),
-            TargetProbe::Indeterminate(_) => TargetDisposition::Unknown,
-            TargetProbe::Present => match self.matches_live_server() {
-                Ok(true) => TargetDisposition::Retained,
-                Ok(false) | Err(_) => TargetDisposition::Unknown,
-            },
         }
     }
 
     fn matches_live_server(&self) -> Result<bool, String> {
-        let observation = read_server_observation(&self.target)?;
-        let token = read_owner_token(&self.target)?;
+        let observation = read_server_observation(&self.destination)?;
+        let token = read_owner_token(&self.destination)?;
         Ok(token == self.token
-            && observation.socket_path.as_bytes() == self.target.socket_path().as_bytes()
             && observation.process_id == self.process.process_id
             && observation.start_time == self.start_time)
     }
@@ -1294,15 +1291,14 @@ enum ConditionalFailure {
 }
 
 struct ServerObservation {
-    socket_path: RecordedAbsolutePath,
     process_id: u32,
     start_time: u64,
     sessions: u32,
 }
 
-fn read_server_observation(target: &TmuxServerIdentity) -> Result<ServerObservation, String> {
+fn read_server_observation(destination: &RestoreDestination) -> Result<ServerObservation, String> {
     let output = run_target_stdout(
-        target,
+        destination,
         &[os("display-message"), os("-p"), os(SERVER_FORMAT)],
         "read target server identity",
     )?;
@@ -1312,12 +1308,10 @@ fn read_server_observation(target: &TmuxServerIdentity) -> Result<ServerObservat
         return Err("target identity did not contain exactly one record".to_owned());
     }
     let fields = records.remove(0);
-    let [socket_path, process_id, start_time, sessions]: [Vec<u8>; SERVER_FIELDS] = fields
+    let [process_id, start_time, sessions]: [Vec<u8>; SERVER_FIELDS] = fields
         .try_into()
         .map_err(|_| "target identity had the wrong field count".to_owned())?;
     Ok(ServerObservation {
-        socket_path: RecordedAbsolutePath::try_from_bytes(socket_path)
-            .map_err(|error| error.to_string())?,
         process_id: parse_u32(process_id, "target server process ID")
             .map_err(|error| error.to_string())?,
         start_time: parse_ascii_u64(start_time, "target server start time")?,
@@ -1326,9 +1320,9 @@ fn read_server_observation(target: &TmuxServerIdentity) -> Result<ServerObservat
     })
 }
 
-fn read_owner_token(target: &TmuxServerIdentity) -> Result<String, String> {
+fn read_owner_token(destination: &RestoreDestination) -> Result<String, String> {
     let output = run_target_stdout(
-        target,
+        destination,
         &[os("show-options"), os("-sv"), os("@tmux_rescue_owner")],
         "read target ownership token",
     )?;
@@ -1422,18 +1416,32 @@ fn random_owner_token() -> Result<String, TargetClaimFailure> {
 }
 
 fn run_target_stdout(
-    target: &TmuxServerIdentity,
+    destination: &RestoreDestination,
     args: &[OsString],
     operation: &str,
 ) -> Result<Vec<u8>, String> {
-    let output = Command::new("tmux")
-        .args(["-u", "-N", "-S"])
-        .arg(target.socket_path().as_os_str())
+    let output = no_start_target_command(destination)
         .args(args)
         .env_remove("TMUX")
         .output()
         .map_err(|error| format!("{operation}: tmux is unavailable: {error}"))?;
     require_success(operation, output).map_err(|error| error.to_string())
+}
+
+fn start_capable_target_command(destination: &RestoreDestination) -> Command {
+    let mut command = Command::new("tmux");
+    command.arg("-u");
+    destination.selector().append_to(&mut command);
+    command.env_remove("TMUX");
+    command
+}
+
+fn no_start_target_command(destination: &RestoreDestination) -> Command {
+    let mut command = Command::new("tmux");
+    command.args(["-u", "-N"]);
+    destination.selector().append_to(&mut command);
+    command.env_remove("TMUX");
+    command
 }
 
 fn tmux_command(args: &[OsString]) -> OsString {
@@ -1507,10 +1515,9 @@ pub enum TmuxAdapterError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::ffi::OsStrExt;
     use std::process::Command;
 
-    use crate::{RestoreTargetState, TargetDisposition, TmuxServerIdentity, probe_tmux_target};
+    use crate::{RestoreDestination, RestoreTargetState, TargetDisposition, TmuxSelector};
 
     use super::{
         OwnedServer, TemporaryClaimConfig, UnconfirmedClaim, automatic_launch_commands,
@@ -1518,6 +1525,10 @@ mod tests {
     };
 
     struct TestProcessGuard(u32);
+
+    fn destination(socket: &std::path::Path) -> RestoreDestination {
+        RestoreDestination::from_selector(TmuxSelector::SocketPath(socket.as_os_str().to_owned()))
+    }
 
     impl Drop for TestProcessGuard {
         fn drop(&mut self) {
@@ -1598,8 +1609,7 @@ mod tests {
     fn failed_claim_readback_removes_only_the_server_with_our_token() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("unconfirmed-claim.sock");
-        let target =
-            TmuxServerIdentity::try_from_bytes(socket.as_os_str().as_bytes().to_vec()).unwrap();
+        let destination = destination(&socket);
         let token = "11".repeat(32);
         let config = TemporaryClaimConfig::create(&token).unwrap();
         let output = Command::new("tmux")
@@ -1613,8 +1623,11 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
 
-        let failure =
-            UnconfirmedClaim { target, token }.into_failure("forced ownership readback failure");
+        let failure = UnconfirmedClaim {
+            destination: destination.clone(),
+            token,
+        }
+        .into_failure("forced ownership readback failure");
 
         assert_eq!(
             failure.target_state(),
@@ -1625,21 +1638,14 @@ mod tests {
                 .message()
                 .contains("forced ownership readback failure")
         );
-        assert!(matches!(
-            probe_tmux_target(
-                &TmuxServerIdentity::try_from_bytes(socket.as_os_str().as_bytes().to_vec())
-                    .unwrap()
-            ),
-            crate::TargetProbe::MissingPath | crate::TargetProbe::RefusedSocket
-        ));
+        assert!(read_server_observation(&destination).is_err());
     }
 
     #[test]
     fn missing_socket_is_not_removal_while_the_owned_server_process_is_live() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("unlinked-owned-server.sock");
-        let target =
-            TmuxServerIdentity::try_from_bytes(socket.as_os_str().as_bytes().to_vec()).unwrap();
+        let destination = destination(&socket);
         let token = "22".repeat(32);
         let config = TemporaryClaimConfig::create(&token).unwrap();
         let output = Command::new("tmux")
@@ -1652,10 +1658,10 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        let observation = read_server_observation(&target).unwrap();
+        let observation = read_server_observation(&destination).unwrap();
         let _process = TestProcessGuard(observation.process_id);
         let server = OwnedServer {
-            target,
+            destination,
             token,
             process: super::OwnedProcessIdentity::capture(observation.process_id).unwrap(),
             start_time: observation.start_time,
@@ -1672,8 +1678,7 @@ mod tests {
     fn failed_unconfirmed_cleanup_does_not_infer_removal_from_a_missing_socket() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("unlinked-unconfirmed-server.sock");
-        let target =
-            TmuxServerIdentity::try_from_bytes(socket.as_os_str().as_bytes().to_vec()).unwrap();
+        let destination = destination(&socket);
         let token = "33".repeat(32);
         let config = TemporaryClaimConfig::create(&token).unwrap();
         let output = Command::new("tmux")
@@ -1686,12 +1691,12 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        let observation = read_server_observation(&target).unwrap();
+        let observation = read_server_observation(&destination).unwrap();
         let _process = TestProcessGuard(observation.process_id);
         fs::remove_file(&socket).unwrap();
 
-        let failure =
-            UnconfirmedClaim { target, token }.into_failure("forced ownership readback failure");
+        let failure = UnconfirmedClaim { destination, token }
+            .into_failure("forced ownership readback failure");
 
         assert_eq!(
             failure.target_state(),

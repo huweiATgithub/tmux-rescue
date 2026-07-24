@@ -276,10 +276,9 @@ fn missing_latest_inspect_is_fatal_without_a_partial_document() {
 }
 
 #[test]
-fn explicit_restore_bypasses_state_root_and_prints_a_fatal_target_summary() {
+fn explicit_restore_bypasses_state_root_and_renders_the_exact_selector() {
     let temp = tempfile::tempdir().unwrap();
     let snapshot = temp.path().join("snapshot.json");
-    let target = temp.path().join("occupied");
     std::fs::write(
         &snapshot,
         serde_json::to_vec(&serde_json::json!({
@@ -303,24 +302,19 @@ fn explicit_restore_bypasses_state_root_and_prints_a_fatal_target_summary() {
         .unwrap(),
     )
     .unwrap();
-    std::fs::write(&target, b"occupied").unwrap();
-
     let output = binary()
-        .arg("restore")
+        .args(["-L", "abc", "restore"])
         .arg(&snapshot)
-        .arg("--target")
-        .arg(&target)
         .env_remove("XDG_STATE_HOME")
         .env_remove("HOME")
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("restore: fatal"));
-    assert!(stdout.contains("target state: not established"));
-    assert!(stderr.contains("target state is indeterminate"));
+    assert!(stdout.starts_with("target: -L abc\n"));
+    assert!(stderr.is_empty(), "{stderr}");
     assert!(!stderr.contains("HOME is not set"));
 }
 
@@ -333,12 +327,12 @@ fn malformed_usage_does_not_reuse_the_partial_recovery_exit_code() {
 }
 
 #[test]
-fn invalid_target_is_rejected_at_cli_parse_before_snapshot_io() {
+fn selector_after_restore_is_rejected_before_snapshot_io() {
     let output = binary()
         .args([
             "restore",
             "/definitely/missing/snapshot.json",
-            "--target",
+            "-S",
             "relative.sock",
         ])
         .output()
@@ -346,6 +340,6 @@ fn invalid_target_is_rejected_at_cli_parse_before_snapshot_io() {
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--target requires an absolute socket path"));
+    assert!(stderr.contains("unexpected argument '-S'"));
     assert!(!stderr.contains("load snapshot"));
 }

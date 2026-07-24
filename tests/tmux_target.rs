@@ -1,8 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Mutex;
@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use tmux_rescue::{
     AttentionReason, LosslessOsString, PaneRestoreOutcome, PlanningExecutable,
     RecordedAbsolutePath, RestoreEnvironment, RestoreEnvironmentFailure, RestoreExecutionFailure,
-    RestoreExecutor, RestoreRunStatus, RestoreTargetState, TargetDisposition, TargetProbe,
-    TargetShell, TmuxRestoreAdapter, TmuxServerIdentity, ValidatedSnapshot, plan_restore,
+    RestoreExecutor, RestoreRunStatus, RestoreTargetState, TargetDisposition, TargetShell,
+    TmuxRestoreAdapter, TmuxSelector, ValidatedSnapshot, plan_restore,
 };
 
 static ISOLATED_TMUX_TEST: Mutex<()> = Mutex::new(());
@@ -128,10 +128,6 @@ impl PlanningEnvironment {
 }
 
 impl RestoreEnvironment for PlanningEnvironment {
-    fn probe_target(&self, _target: &TmuxServerIdentity) -> TargetProbe {
-        TargetProbe::MissingPath
-    }
-
     fn target_shell(&self) -> Result<TargetShell, RestoreEnvironmentFailure> {
         TargetShell::try_from_bytes(b"/bin/sh".to_vec())
             .map_err(|error| RestoreEnvironmentFailure::new(error.to_string()))
@@ -157,9 +153,8 @@ impl RestoreEnvironment for PlanningEnvironment {
     }
 }
 
-fn target_identity(socket: &Path) -> TmuxServerIdentity {
-    assert!(socket.is_absolute());
-    TmuxServerIdentity::try_from_bytes(socket.as_os_str().as_bytes().to_vec()).unwrap()
+fn target_selector(socket: &Path) -> TmuxSelector {
+    TmuxSelector::SocketPath(socket.as_os_str().to_owned())
 }
 
 fn isolated_tmux(socket: &Path) -> Command {
@@ -203,6 +198,56 @@ struct IsolatedServerGuard {
 struct EnvironmentGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
+}
+
+struct TargetCommandContext {
+    path: Option<OsString>,
+    tmux: Option<OsString>,
+    log: Option<OsString>,
+}
+
+impl Drop for TargetCommandContext {
+    fn drop(&mut self) {
+        for (key, value) in [
+            ("PATH", &self.path),
+            ("TMUX", &self.tmux),
+            ("FAKE_TMUX_LOG", &self.log),
+        ] {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+}
+
+fn install_fake_target_tmux(temp: &Path) -> (PathBuf, TargetCommandContext) {
+    let bin = temp.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let executable = bin.join("tmux");
+    fs::write(
+        &executable,
+        b"#!/bin/sh\n{ printf 'BEGIN\\nPWD=%s\\nTMUX=%s\\n' \"$PWD\" \"${TMUX-unset}\"; for arg do printf 'ARG=%s\\n' \"$arg\"; done; } >> \"$FAKE_TMUX_LOG\"\ncase \" $* \" in\n  *' start-server '*) exit 0 ;;\n  *' display-message '*) printf '1:11:11:0\\n' ;;\n  *' show-options '*) printf 'wrong-token\\n' ;;\n  *' if-shell '*) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let log = temp.join("target-tmux.log");
+    let old_path = std::env::var_os("PATH");
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        old_path.as_deref().unwrap_or(OsStr::new("")),
+    )))
+    .unwrap();
+    let guard = TargetCommandContext {
+        path: old_path,
+        tmux: std::env::var_os("TMUX"),
+        log: std::env::var_os("FAKE_TMUX_LOG"),
+    };
+    unsafe {
+        std::env::set_var("PATH", path);
+        std::env::set_var("TMUX", "ambient.sock,1,0");
+        std::env::set_var("FAKE_TMUX_LOG", &log);
+    }
+    (log, guard)
 }
 
 impl EnvironmentGuard {
@@ -346,7 +391,94 @@ fn create_directory(parent: &Path, name: &str) -> PathBuf {
 }
 
 #[test]
-fn target_that_appears_after_planning_is_rejected_and_unchanged() {
+fn claim_and_later_clients_keep_the_exact_explicit_selector() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let session_directory = create_directory(temp.path(), "session");
+    let pane_directory = create_directory(temp.path(), "pane");
+    let snapshot = snapshot(
+        &temp.path().join("source.sock"),
+        vec![session(
+            "work",
+            &session_directory,
+            vec![window(0, "work", vec![idle_pane(0, &pane_directory)])],
+        )],
+    );
+    let (log_path, _context) = install_fake_target_tmux(temp.path());
+    let expected_directory = format!("PWD={}\n", std::env::current_dir().unwrap().display());
+    for (selector, selector_arguments) in [
+        (
+            TmuxSelector::SocketName(OsString::from("exact-name")),
+            b"ARG=-L\nARG=exact-name\n".as_slice(),
+        ),
+        (
+            TmuxSelector::SocketPath(OsString::from("./relative.sock")),
+            b"ARG=-S\nARG=./relative.sock\n".as_slice(),
+        ),
+    ] {
+        fs::write(&log_path, b"").unwrap();
+        let plan = plan_restore(
+            &snapshot,
+            Some(selector),
+            &PlanningEnvironment::new(temp.path()),
+        )
+        .unwrap();
+        let mut executor = RestoreExecutor::new(TmuxRestoreAdapter::new());
+
+        let result = executor.execute(plan);
+
+        assert_eq!(result.status(), RestoreRunStatus::Fatal);
+        let log = fs::read(&log_path).unwrap();
+        let starts = log
+            .windows(b"BEGIN\n".len())
+            .enumerate()
+            .filter_map(|(index, bytes)| (bytes == b"BEGIN\n").then_some(index))
+            .collect::<Vec<_>>();
+        assert!(starts.len() >= 2, "{}", String::from_utf8_lossy(&log));
+        for (index, start) in starts.iter().copied().enumerate() {
+            let end = starts.get(index + 1).copied().unwrap_or(log.len());
+            let command = &log[start..end];
+            assert!(
+                command
+                    .windows(selector_arguments.len())
+                    .any(|bytes| bytes == selector_arguments)
+            );
+            assert!(
+                command
+                    .windows(b"TMUX=unset\n".len())
+                    .any(|bytes| bytes == b"TMUX=unset\n")
+            );
+            assert!(
+                command
+                    .windows(expected_directory.len())
+                    .any(|bytes| bytes == expected_directory.as_bytes())
+            );
+            if index == 0 {
+                assert!(
+                    command
+                        .windows(b"ARG=start-server\n".len())
+                        .any(|bytes| bytes == b"ARG=start-server\n")
+                );
+                assert!(
+                    !command
+                        .windows(b"ARG=-N\n".len())
+                        .any(|bytes| bytes == b"ARG=-N\n")
+                );
+            } else {
+                assert!(
+                    command
+                        .windows(b"ARG=-N\n".len())
+                        .any(|bytes| bytes == b"ARG=-N\n")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn claim_rejects_a_preexisting_target_and_leaves_it_unchanged() {
     let _tmux_test = ISOLATED_TMUX_TEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -369,7 +501,7 @@ fn target_that_appears_after_planning_is_rejected_and_unchanged() {
     );
     let plan = plan_restore(
         &snapshot,
-        Some(target_identity(&socket)),
+        Some(target_selector(&socket)),
         &PlanningEnvironment::new(temp.path()),
     )
     .unwrap();
@@ -381,17 +513,19 @@ fn target_that_appears_after_planning_is_rejected_and_unchanged() {
     let result = executor.execute(plan);
 
     assert_eq!(result.status(), RestoreRunStatus::Fatal);
-    assert_eq!(result.target_state(), &RestoreTargetState::NotEstablished);
+    assert_eq!(
+        result.target_state(),
+        &RestoreTargetState::Observed(TargetDisposition::Unknown)
+    );
     assert!(matches!(
         result.failure(),
-        Some(RestoreExecutionFailure::TargetExists { target })
-            if target.socket_path().as_bytes() == socket.as_os_str().as_bytes()
+        Some(RestoreExecutionFailure::TargetClaimFailed { .. })
     ));
     assert_eq!(server.fingerprint(), before);
 }
 
 #[test]
-fn restore_reclaims_a_refused_socket_left_by_a_crashed_server() {
+fn restore_creates_the_selected_target_server() {
     let _tmux_test = ISOLATED_TMUX_TEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -413,12 +547,10 @@ fn restore_reclaims_a_refused_socket_left_by_a_crashed_server() {
     );
     let plan = plan_restore(
         &snapshot,
-        Some(target_identity(&socket)),
+        Some(target_selector(&socket)),
         &PlanningEnvironment::new(temp.path()),
     )
     .unwrap();
-    let crashed = UnixListener::bind(&socket).unwrap();
-    drop(crashed);
     let _server = IsolatedServerGuard::for_socket(&socket);
     let mut executor = RestoreExecutor::new(TmuxRestoreAdapter::new());
 
@@ -480,7 +612,7 @@ fn creates_recorded_multi_session_topology_with_interactive_target_shells() {
     );
     let plan = plan_restore(
         &snapshot,
-        Some(target_identity(&socket)),
+        Some(target_selector(&socket)),
         &PlanningEnvironment::new(temp.path()),
     )
     .unwrap();
@@ -584,7 +716,7 @@ fn pastes_manual_input_literally_without_enter() {
     );
     let plan = plan_restore(
         &snapshot,
-        Some(target_identity(&socket)),
+        Some(target_selector(&socket)),
         &PlanningEnvironment::new(temp.path()),
     )
     .unwrap();
@@ -655,7 +787,7 @@ fn topology_failure_rolls_back_only_the_newly_owned_server() {
     );
     let plan = plan_restore(
         &snapshot,
-        Some(target_identity(&socket)),
+        Some(target_selector(&socket)),
         &PlanningEnvironment::new(temp.path()),
     )
     .unwrap();
@@ -727,7 +859,7 @@ fn automatic_recovery_sends_literal_input_then_a_separate_enter() {
     );
     let plan = plan_restore(
         &snapshot,
-        Some(target_identity(&socket)),
+        Some(target_selector(&socket)),
         &PlanningEnvironment::new(temp.path()).with_executable(&mdbook),
     )
     .unwrap();
@@ -790,7 +922,7 @@ fn changed_automatic_executable_is_not_launched() {
     );
     let plan = plan_restore(
         &snapshot,
-        Some(target_identity(&socket)),
+        Some(target_selector(&socket)),
         &PlanningEnvironment::new(temp.path()).with_executable(&executable),
     )
     .unwrap();

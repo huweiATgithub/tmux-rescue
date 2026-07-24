@@ -1,12 +1,14 @@
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 
 use serde_json::json;
 use tmux_rescue::{
     AutomaticFallbackReason, LosslessOsString, MAX_RENDERED_SHELL_INPUT_BYTES, PlannedPaneAction,
     PlanningExecutable, RecordedAbsolutePath, ResolvedDirectoryOrigin, RestoreEnvironment,
-    RestoreEnvironmentFailure, RestorePlanningError, TargetProbe, TargetShell, TmuxServerIdentity,
-    ValidatedSnapshot, plan_restore,
+    RestoreEnvironmentFailure, RestorePlanningError, TargetShell, TmuxSelector, ValidatedSnapshot,
+    plan_restore,
 };
 
 fn encoded(value: &str) -> serde_json::Value {
@@ -16,7 +18,7 @@ fn encoded(value: &str) -> serde_json::Value {
 fn snapshot() -> ValidatedSnapshot {
     let value = json!({
         "captured_at": "2026-07-23T00:00:00Z",
-        "source": encoded("/tmp/source.sock"),
+        "source": encoded("/recorded/source.sock"),
         "consistency": {"kind": "stable"},
         "sessions": [{
             "name": "work",
@@ -68,7 +70,6 @@ fn snapshot() -> ValidatedSnapshot {
 }
 
 struct FakeEnvironment {
-    target_probe: TargetProbe,
     existing_directories: HashSet<Vec<u8>>,
     available_commands: HashSet<Vec<u8>>,
 }
@@ -76,7 +77,6 @@ struct FakeEnvironment {
 impl FakeEnvironment {
     fn absent() -> Self {
         Self {
-            target_probe: TargetProbe::MissingPath,
             existing_directories: [b"/home/user".to_vec(), b"/recorded/idle".to_vec()]
                 .into_iter()
                 .collect(),
@@ -86,10 +86,6 @@ impl FakeEnvironment {
 }
 
 impl RestoreEnvironment for FakeEnvironment {
-    fn probe_target(&self, _target: &TmuxServerIdentity) -> TargetProbe {
-        self.target_probe.clone()
-    }
-
     fn target_shell(&self) -> Result<TargetShell, RestoreEnvironmentFailure> {
         TargetShell::try_from_bytes(b"/bin/sh".to_vec())
             .map_err(|error| RestoreEnvironmentFailure::new(error.to_string()))
@@ -116,22 +112,72 @@ impl RestoreEnvironment for FakeEnvironment {
 }
 
 #[test]
-fn rejects_an_existing_target_even_for_plan_only() {
-    let mut environment = FakeEnvironment::absent();
-    environment.target_probe = TargetProbe::Present;
+fn destination_refines_explicit_name_path_and_recorded_default_without_resolution() {
+    let environment = FakeEnvironment::absent();
+    let named = plan_restore(
+        &snapshot(),
+        Some(TmuxSelector::SocketName(OsString::from("abc"))),
+        &environment,
+    )
+    .unwrap();
+    let relative = plan_restore(
+        &snapshot(),
+        Some(TmuxSelector::SocketPath(OsString::from("./rescue.sock"))),
+        &environment,
+    )
+    .unwrap();
+    let recorded = plan_restore(&snapshot(), None, &environment).unwrap();
 
-    assert!(matches!(
-        plan_restore(&snapshot(), None, &environment),
-        Err(RestorePlanningError::TargetExists { .. })
-    ));
+    assert_eq!(
+        named.destination().selector(),
+        &TmuxSelector::SocketName(OsString::from("abc"))
+    );
+    assert_eq!(
+        relative.destination().selector(),
+        &TmuxSelector::SocketPath(OsString::from("./rescue.sock"))
+    );
+    assert_eq!(
+        recorded.destination().selector(),
+        &TmuxSelector::SocketPath(OsString::from("/recorded/source.sock"))
+    );
+    assert!(named.render_human().starts_with("target: -L abc\n"));
+    assert!(
+        relative
+            .render_human()
+            .starts_with("target: -S ./rescue.sock\n")
+    );
+    assert!(
+        recorded
+            .render_human()
+            .starts_with("target: -S /recorded/source.sock\n")
+    );
 }
 
 #[test]
-fn accepts_a_refused_socket_left_by_a_crashed_server() {
-    let mut environment = FakeEnvironment::absent();
-    environment.target_probe = TargetProbe::RefusedSocket;
+fn human_plan_has_no_vacancy_or_resolution_fields() {
+    let rendered = plan_restore(&snapshot(), None, &FakeEnvironment::absent())
+        .unwrap()
+        .render_human();
 
-    assert!(plan_restore(&snapshot(), None, &environment).is_ok());
+    for line in rendered.lines() {
+        let field = line
+            .trim_start()
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            ![
+                "vacant",
+                "absent",
+                "available",
+                "resolved",
+                "target vacancy"
+            ]
+            .contains(&field.as_str()),
+            "{rendered}"
+        );
+    }
 }
 
 #[test]
@@ -140,7 +186,10 @@ fn resolves_directories_and_refines_every_pane_action() {
 
     let plan = plan_restore(&snapshot(), None, &environment).unwrap();
 
-    assert_eq!(plan.target().socket_path().as_bytes(), b"/tmp/source.sock");
+    assert_eq!(
+        plan.destination().selector(),
+        &TmuxSelector::SocketPath(OsString::from("/recorded/source.sock"))
+    );
     assert_eq!(plan.panes().len(), 4);
     assert!(matches!(
         plan.panes()[0].action(),
@@ -406,24 +455,21 @@ fn human_plan_prints_execution_relevant_fallbacks_and_inputs() {
 
 #[test]
 fn human_plan_renders_non_utf8_paths_as_exact_byte_escapes() {
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&snapshot().to_json_pretty().unwrap()).unwrap();
-    value["source"] = serde_json::json!({"encoding": "base64", "value": "L3RtcC//"});
-    let snapshot = ValidatedSnapshot::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
-
-    let rendered = plan_restore(&snapshot, None, &FakeEnvironment::absent())
+    let selector = TmuxSelector::SocketPath(OsString::from_vec(b"./\xff".to_vec()));
+    let rendered = plan_restore(&snapshot(), Some(selector), &FakeEnvironment::absent())
         .unwrap()
         .render_human();
 
-    assert!(rendered.contains(r"target: /tmp/\xff"));
+    assert!(rendered.contains(r"target: -S ./\xff"));
     assert!(!rendered.contains('\u{fffd}'));
 
-    value["source"] = encoded(r"/tmp/\xff");
-    let ascii_snapshot =
-        ValidatedSnapshot::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
-    let ascii_rendered = plan_restore(&ascii_snapshot, None, &FakeEnvironment::absent())
-        .unwrap()
-        .render_human();
+    let ascii_rendered = plan_restore(
+        &snapshot(),
+        Some(TmuxSelector::SocketPath(OsString::from(r"./\xff"))),
+        &FakeEnvironment::absent(),
+    )
+    .unwrap()
+    .render_human();
     assert_ne!(rendered, ascii_rendered);
-    assert!(ascii_rendered.contains(r"target: /tmp/\\xff"));
+    assert!(ascii_rendered.contains(r"target: -S ./\\xff"));
 }

@@ -1,18 +1,19 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand, ValueEnum, builder::TypedValueParser, error::ErrorKind};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use tmux_rescue::{
     AttentionReason, AutomaticFallbackReason, CaptureConsistency, CaptureEvent, CaptureTime,
-    LatestDisposition, LinuxProcessInspector, PaneRestoreOutcome, RestoreExecutor, RestorePlan,
-    RestoreRunResult, RestoreRunStatus, RestoreTargetState, SnapshotPublication,
-    SourcePaneCoordinate, StateStore, SystemRestoreEnvironment, TargetDisposition, TmuxAdapter,
-    TmuxRestoreAdapter, TmuxServerIdentity, TopologyReadPhase, capture_snapshot, plan_restore,
+    LatestDisposition, PaneRestoreOutcome, RestoreEnvironment, RestoreExecutor, RestorePlan,
+    RestoreRunResult, RestoreRunStatus, RestoreTargetCapability, RestoreTargetState,
+    SnapshotPublication, SourcePaneCoordinate, StateStore, SystemRestoreEnvironment,
+    TargetDisposition, TmuxAdapter, TmuxRestoreAdapter, TmuxSelector, TopologyReadPhase,
+    capture_snapshot, plan_restore,
 };
 
 use crate::inspect::{Palette, is_unicode_display_control, render};
@@ -21,15 +22,32 @@ pub const EXIT_SUCCESS: u8 = 0;
 pub const EXIT_FAILURE: u8 = 1;
 pub const EXIT_PARTIAL: u8 = 2;
 
+#[derive(Debug)]
+pub struct Cli {
+    pub command: Command,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "tmux-rescue",
     version,
     about = "Snapshot and restore tmux programs"
 )]
-pub struct Cli {
+struct RawCli {
+    #[arg(
+        short = 'L',
+        value_name = "SOCKET_NAME",
+        conflicts_with = "socket_path"
+    )]
+    socket_name: Option<OsString>,
+    #[arg(
+        short = 'S',
+        value_name = "SOCKET_PATH",
+        conflicts_with = "socket_name"
+    )]
+    socket_path: Option<OsString>,
     #[command(subcommand)]
-    pub command: Command,
+    command: RawCommand,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -89,7 +107,7 @@ impl TerminalColorSupport {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum Command {
+enum RawCommand {
     /// Capture the tmux server selected by the invoking tmux context.
     Snapshot,
     /// Validate and display a captured tmux workspace.
@@ -107,52 +125,77 @@ pub enum Command {
     Restore {
         /// Immutable snapshot path. The global latest snapshot is used when omitted.
         snapshot: Option<PathBuf>,
-        /// Absolute socket path of the absent target tmux server.
-        #[arg(long, value_name = "server", value_parser = RestoreTargetParser)]
-        target: Option<RestoreTarget>,
         /// Execute the printed plan.
         #[arg(long)]
         run: bool,
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RestoreTarget(TmuxServerIdentity);
+#[derive(Debug)]
+pub enum Command {
+    Snapshot(SnapshotRequest),
+    Inspect {
+        snapshot: Option<PathBuf>,
+        color: ColorMode,
+        icons: IconMode,
+    },
+    Restore(RestoreRequest),
+}
 
-impl RestoreTarget {
-    fn identity(&self) -> TmuxServerIdentity {
-        self.0.clone()
+impl Cli {
+    pub fn try_parse() -> Result<Self, clap::Error> {
+        Self::try_parse_from(std::env::args_os())
+    }
+
+    pub fn try_parse_from<I, T>(arguments: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let raw = RawCli::try_parse_from(arguments)?;
+        let selector = raw
+            .socket_name
+            .map(TmuxSelector::SocketName)
+            .or_else(|| raw.socket_path.map(TmuxSelector::SocketPath));
+        let command = match raw.command {
+            RawCommand::Snapshot => Command::Snapshot(SnapshotRequest { selector }),
+            RawCommand::Inspect {
+                snapshot,
+                color,
+                icons,
+            } => {
+                if selector.is_some() {
+                    return Err(clap::Error::raw(
+                        ErrorKind::ArgumentConflict,
+                        "tmux selectors cannot be used with inspect",
+                    )
+                    .with_cmd(&RawCli::command()));
+                }
+                Command::Inspect {
+                    snapshot,
+                    color,
+                    icons,
+                }
+            }
+            RawCommand::Restore { snapshot, run } => Command::Restore(RestoreRequest {
+                snapshot,
+                selector,
+                run,
+            }),
+        };
+        Ok(Self { command })
     }
 }
 
-#[derive(Clone, Debug)]
-struct RestoreTargetParser;
-
-impl TypedValueParser for RestoreTargetParser {
-    type Value = RestoreTarget;
-
-    fn parse_ref(
-        &self,
-        command: &clap::Command,
-        _argument: Option<&clap::Arg>,
-        value: &OsStr,
-    ) -> Result<Self::Value, clap::Error> {
-        TmuxServerIdentity::try_from_bytes(value.as_bytes().to_vec())
-            .map(RestoreTarget)
-            .map_err(|error| {
-                clap::Error::raw(
-                    ErrorKind::ValueValidation,
-                    format!("--target requires an absolute socket path: {error}"),
-                )
-                .with_cmd(command)
-            })
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotRequest {
+    pub selector: Option<TmuxSelector>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoreRequest {
     pub snapshot: Option<PathBuf>,
-    pub target: Option<RestoreTarget>,
+    pub selector: Option<TmuxSelector>,
     pub run: bool,
 }
 
@@ -179,14 +222,14 @@ pub struct InspectRequest {
 }
 
 pub trait CliRunner {
-    fn snapshot(&mut self) -> u8;
+    fn snapshot(&mut self, request: SnapshotRequest) -> u8;
     fn inspect(&mut self, request: InspectRequest) -> u8;
     fn restore(&mut self, request: RestoreRequest) -> u8;
 }
 
 pub fn dispatch(cli: Cli, runner: &mut impl CliRunner) -> u8 {
     match cli.command {
-        Command::Snapshot => runner.snapshot(),
+        Command::Snapshot(request) => runner.snapshot(request),
         Command::Inspect {
             snapshot,
             color,
@@ -196,15 +239,7 @@ pub fn dispatch(cli: Cli, runner: &mut impl CliRunner) -> u8 {
             color,
             icons,
         }),
-        Command::Restore {
-            snapshot,
-            target,
-            run,
-        } => runner.restore(RestoreRequest {
-            snapshot,
-            target,
-            run,
-        }),
+        Command::Restore(request) => runner.restore(request),
     }
 }
 
@@ -245,8 +280,8 @@ impl<'a, W: Write, E: Write> SystemCliRunner<'a, W, E> {
 }
 
 impl<W: Write, E: Write> CliRunner for SystemCliRunner<'_, W, E> {
-    fn snapshot(&mut self) -> u8 {
-        match run_snapshot(self.stdout, self.stderr) {
+    fn snapshot(&mut self, request: SnapshotRequest) -> u8 {
+        match run_snapshot(request, self.stdout, self.stderr) {
             Ok(code) => code,
             Err(error) => self.report_failure(error),
         }
@@ -308,12 +343,15 @@ pub fn restore_exit_code(status: RestoreRunStatus) -> u8 {
     }
 }
 
-pub fn run_snapshot(stdout: &mut impl Write, stderr: &mut impl Write) -> Result<u8, CliError> {
+pub fn run_snapshot(
+    request: SnapshotRequest,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<u8, CliError> {
     writeln!(stderr, "resolving source tmux server").map_err(io_failure)?;
-    let source = TmuxAdapter::selected_source()
+    let mut source = TmuxAdapter::selected_source(request.selector)
         .map_err(|error| CliError::new(format!("resolve source: {error}")))?;
     let captured_at = current_capture_time()?;
-    let mut source = TmuxAdapter::new(source, LinuxProcessInspector::new());
     writeln!(stderr, "capturing tmux topology and foreground programs").map_err(io_failure)?;
     let capture = match capture_snapshot(&mut source, captured_at) {
         Ok(capture) => capture,
@@ -354,7 +392,23 @@ pub fn run_restore(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<u8, CliError> {
-    let plan = match prepare_restore_plan(&request) {
+    run_restore_with_factory(
+        request,
+        stdout,
+        stderr,
+        &SystemRestoreEnvironment,
+        TmuxRestoreAdapter::new,
+    )
+}
+
+fn run_restore_with_factory<T: RestoreTargetCapability>(
+    request: RestoreRequest,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    environment: &impl RestoreEnvironment,
+    target_factory: impl FnOnce() -> T,
+) -> Result<u8, CliError> {
+    let plan = match prepare_and_render_restore(&request, environment, stdout) {
         Ok(plan) => plan,
         Err(error) => {
             render_unestablished_failure(stdout)?;
@@ -362,20 +416,22 @@ pub fn run_restore(
         }
     };
 
-    write!(stdout, "{plan}").map_err(io_failure)?;
-    stdout.flush().map_err(io_failure)?;
     if !request.run {
         return Ok(EXIT_SUCCESS);
     }
 
     writeln!(stderr, "executing restore topology and pane recovery").map_err(io_failure)?;
-    let mut executor = RestoreExecutor::new(TmuxRestoreAdapter::new());
+    let mut executor = RestoreExecutor::new(target_factory());
     let result = executor.execute(plan);
     render_restore_result(stdout, stderr, &result)?;
     Ok(restore_exit_code(result.status()))
 }
 
-fn prepare_restore_plan(request: &RestoreRequest) -> Result<RestorePlan, CliError> {
+fn prepare_and_render_restore(
+    request: &RestoreRequest,
+    environment: &impl RestoreEnvironment,
+    stdout: &mut impl Write,
+) -> Result<RestorePlan, CliError> {
     let loaded = match &request.snapshot {
         Some(path) => StateStore::load_explicit_path(path),
         None => StateStore::from_environment()
@@ -383,9 +439,11 @@ fn prepare_restore_plan(request: &RestoreRequest) -> Result<RestorePlan, CliErro
             .load_latest(),
     }
     .map_err(|error| CliError::new(format!("load snapshot: {error}")))?;
-    let target = request.target.as_ref().map(RestoreTarget::identity);
-    plan_restore(loaded.snapshot(), target, &SystemRestoreEnvironment)
-        .map_err(|error| CliError::new(format!("plan restore: {error}")))
+    let plan = plan_restore(loaded.snapshot(), request.selector.clone(), environment)
+        .map_err(|error| CliError::new(format!("plan restore: {error}")))?;
+    write!(stdout, "{plan}").map_err(io_failure)?;
+    stdout.flush().map_err(io_failure)?;
+    Ok(plan)
 }
 
 fn render_unestablished_failure(stdout: &mut impl Write) -> Result<(), CliError> {
@@ -706,17 +764,25 @@ fn io_failure(error: std::io::Error) -> CliError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::ffi::OsString;
     use std::io;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
 
-    use clap::Parser;
-    use tmux_rescue::{CaptureConsistency, LatestDisposition, SnapshotPublication, StorageError};
+    use tmux_rescue::{
+        CaptureConsistency, LatestDisposition, LosslessOsString, OwnedRestoreTarget,
+        PlanningExecutable, RecordedAbsolutePath, RestoreDestination, RestoreEnvironment,
+        RestoreEnvironmentFailure, RestoreTargetCapability, SnapshotPublication, StorageError,
+        TargetClaimFailure, TargetShell, TmuxSelector,
+    };
 
     use super::*;
 
     #[derive(Default)]
     struct RecordingRunner {
-        snapshot_calls: usize,
+        snapshot_requests: Vec<SnapshotRequest>,
         inspect_requests: Vec<InspectRequest>,
         restore_requests: Vec<RestoreRequest>,
         snapshot_code: u8,
@@ -725,8 +791,8 @@ mod tests {
     }
 
     impl CliRunner for RecordingRunner {
-        fn snapshot(&mut self) -> u8 {
-            self.snapshot_calls += 1;
+        fn snapshot(&mut self, request: SnapshotRequest) -> u8 {
+            self.snapshot_requests.push(request);
             self.snapshot_code
         }
 
@@ -746,14 +812,10 @@ mod tests {
             .unwrap_or_else(|error| panic!("failed to parse {args:?}: {error}"))
     }
 
-    fn restore_command(cli: Cli) -> (Option<PathBuf>, Option<RestoreTarget>, bool) {
+    fn restore_command(cli: Cli) -> RestoreRequest {
         match cli.command {
-            Command::Restore {
-                snapshot,
-                target,
-                run,
-            } => (snapshot, target, run),
-            Command::Snapshot | Command::Inspect { .. } => panic!("expected restore command"),
+            Command::Restore(request) => request,
+            Command::Snapshot(_) | Command::Inspect { .. } => panic!("expected restore command"),
         }
     }
 
@@ -764,7 +826,7 @@ mod tests {
                 color,
                 icons,
             } => (snapshot, color, icons),
-            Command::Snapshot | Command::Restore { .. } => panic!("expected inspect command"),
+            Command::Snapshot(_) | Command::Restore(_) => panic!("expected inspect command"),
         }
     }
 
@@ -776,11 +838,92 @@ mod tests {
         }
     }
 
+    struct TestRestoreEnvironment;
+
+    impl RestoreEnvironment for TestRestoreEnvironment {
+        fn target_shell(&self) -> Result<TargetShell, RestoreEnvironmentFailure> {
+            TargetShell::try_from_bytes(b"/bin/sh".to_vec())
+                .map_err(|error| RestoreEnvironmentFailure::new(error.to_string()))
+        }
+
+        fn home_directory(&self) -> Result<RecordedAbsolutePath, RestoreEnvironmentFailure> {
+            RecordedAbsolutePath::try_from_bytes(b"/tmp".to_vec())
+                .map_err(|error| RestoreEnvironmentFailure::new(error.to_string()))
+        }
+
+        fn directory_exists(&self, _directory: &RecordedAbsolutePath) -> bool {
+            true
+        }
+
+        fn resolve_executable(
+            &self,
+            _directory: &RecordedAbsolutePath,
+            _command_word: &LosslessOsString,
+        ) -> Option<PlanningExecutable> {
+            None
+        }
+    }
+
+    struct ClaimFailureTarget;
+
+    impl RestoreTargetCapability for ClaimFailureTarget {
+        fn claim(
+            &mut self,
+            _destination: &RestoreDestination,
+            _shell: &TargetShell,
+        ) -> Result<Box<dyn OwnedRestoreTarget>, TargetClaimFailure> {
+            Err(TargetClaimFailure::new("stop after construction"))
+        }
+    }
+
+    struct FlushTrackingWriter {
+        bytes: Vec<u8>,
+        flushed: Rc<Cell<bool>>,
+    }
+
+    impl io::Write for FlushTrackingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed.set(true);
+            Ok(())
+        }
+    }
+
+    fn restore_fixture(path: &Path) {
+        std::fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "captured_at": "2026-07-24T00:00:00Z",
+                "source": {"encoding": "utf8", "value": "/recorded/source.sock"},
+                "consistency": {"kind": "stable"},
+                "sessions": [{
+                    "name": "work",
+                    "working_directory": {"encoding": "utf8", "value": "/tmp"},
+                    "windows": [{
+                        "source_index": 0,
+                        "name": "work",
+                        "panes": [{
+                            "source_index": 0,
+                            "working_directory": {"encoding": "utf8", "value": "/tmp"},
+                            "recovery": {"kind": "idle"}
+                        }]
+                    }]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn parses_the_exact_command_surface() {
         assert!(matches!(
             parse(&["tmux-rescue", "snapshot"]).command,
-            Command::Snapshot
+            Command::Snapshot(SnapshotRequest { selector: None })
         ));
         assert!(Cli::try_parse_from(["tmux-rescue", "snapshot", "unexpected"]).is_err());
         assert!(Cli::try_parse_from(["tmux-rescue", "snapshot", "--run"]).is_err());
@@ -836,23 +979,169 @@ mod tests {
         assert!(Cli::try_parse_from(["tmux-rescue", "inspect", "--icons", "automatic"]).is_err());
         assert!(Cli::try_parse_from(["tmux-rescue", "inspect", "one.json", "two.json"]).is_err());
 
-        let (snapshot, target, run) = restore_command(parse(&[
+        let request = restore_command(parse(&[
             "tmux-rescue",
+            "-L",
+            "abc",
             "restore",
             "/state/snapshot.json",
-            "--target",
-            "/tmp/target.sock",
             "--run",
         ]));
-        assert_eq!(snapshot.as_deref(), Some(Path::new("/state/snapshot.json")));
         assert_eq!(
-            target.unwrap().0.socket_path().as_bytes(),
-            b"/tmp/target.sock"
+            request.snapshot.as_deref(),
+            Some(Path::new("/state/snapshot.json"))
         );
-        assert!(run);
+        assert_eq!(
+            request.selector,
+            Some(TmuxSelector::SocketName(OsString::from("abc")))
+        );
+        assert!(request.run);
 
-        let (snapshot, target, run) = restore_command(parse(&["tmux-rescue", "restore"]));
-        assert_eq!((snapshot, target, run), (None, None, false));
+        assert_eq!(
+            restore_command(parse(&["tmux-rescue", "restore"])),
+            RestoreRequest {
+                snapshot: None,
+                selector: None,
+                run: false
+            }
+        );
+    }
+
+    #[test]
+    fn parses_root_selectors_only_before_snapshot_and_restore() {
+        for (flag, value, expected) in [
+            (
+                "-L",
+                OsString::from("abc"),
+                TmuxSelector::SocketName(OsString::from("abc")),
+            ),
+            (
+                "-S",
+                OsString::from("./rescue.sock"),
+                TmuxSelector::SocketPath(OsString::from("./rescue.sock")),
+            ),
+        ] {
+            let snapshot = Cli::try_parse_from([
+                OsString::from("tmux-rescue"),
+                OsString::from(flag),
+                value.clone(),
+                OsString::from("snapshot"),
+            ])
+            .unwrap();
+            assert!(
+                matches!(snapshot.command, Command::Snapshot(SnapshotRequest { selector: Some(selector) }) if selector == expected)
+            );
+
+            let restore = Cli::try_parse_from([
+                OsString::from("tmux-rescue"),
+                OsString::from(flag),
+                value,
+                OsString::from("restore"),
+            ])
+            .unwrap();
+            assert_eq!(restore_command(restore).selector, Some(expected));
+        }
+
+        for args in [
+            vec!["tmux-rescue", "-L", "one", "-S", "two", "snapshot"],
+            vec!["tmux-rescue", "-S", "two", "-L", "one", "restore"],
+            vec!["tmux-rescue", "-L", "one", "-L", "two", "snapshot"],
+            vec!["tmux-rescue", "-S", "one", "-S", "two", "restore"],
+            vec!["tmux-rescue", "snapshot", "-L", "one"],
+            vec!["tmux-rescue", "snapshot", "-S", "one"],
+            vec!["tmux-rescue", "restore", "-L", "one"],
+            vec!["tmux-rescue", "restore", "-S", "one"],
+            vec!["tmux-rescue", "-L", "one", "inspect"],
+            vec!["tmux-rescue", "-S", "one", "inspect"],
+            vec!["tmux-rescue", "-L"],
+            vec!["tmux-rescue", "-S"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn parser_preserves_non_utf8_selector_bytes() {
+        let bytes = vec![b'.', b'/', 0xff];
+        let cli = Cli::try_parse_from([
+            OsString::from("tmux-rescue"),
+            OsString::from("-S"),
+            OsString::from_vec(bytes.clone()),
+            OsString::from("restore"),
+        ])
+        .unwrap();
+
+        let selector = restore_command(cli).selector.unwrap();
+        let TmuxSelector::SocketPath(path) = selector else {
+            panic!("expected socket path")
+        };
+        assert_eq!(path.as_os_str().as_bytes(), bytes);
+    }
+
+    #[test]
+    fn plan_only_restore_never_constructs_the_target_adapter() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("snapshot.json");
+        restore_fixture(&snapshot);
+        let constructed = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&constructed);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let result = run_restore_with_factory(
+            RestoreRequest {
+                snapshot: Some(snapshot),
+                selector: None,
+                run: false,
+            },
+            &mut stdout,
+            &mut stderr,
+            &TestRestoreEnvironment,
+            move || {
+                observed.set(true);
+                ClaimFailureTarget
+            },
+        );
+
+        assert_eq!(result.unwrap(), EXIT_SUCCESS);
+        assert!(!constructed.get());
+        assert!(stdout.starts_with(b"target: -S /recorded/source.sock\n"));
+    }
+
+    #[test]
+    fn run_flushes_the_plan_before_constructing_the_target_adapter() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("snapshot.json");
+        restore_fixture(&snapshot);
+        let flushed = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&flushed);
+        let mut stdout = FlushTrackingWriter {
+            bytes: Vec::new(),
+            flushed: Rc::clone(&flushed),
+        };
+        let mut stderr = Vec::new();
+
+        let result = run_restore_with_factory(
+            RestoreRequest {
+                snapshot: Some(snapshot),
+                selector: None,
+                run: true,
+            },
+            &mut stdout,
+            &mut stderr,
+            &TestRestoreEnvironment,
+            move || {
+                assert!(observed.get());
+                ClaimFailureTarget
+            },
+        );
+
+        assert_eq!(result.unwrap(), EXIT_FAILURE);
+        assert!(
+            stdout
+                .bytes
+                .starts_with(b"target: -S /recorded/source.sock\n")
+        );
     }
 
     #[test]
@@ -866,7 +1155,10 @@ mod tests {
             dispatch(parse(&["tmux-rescue", "snapshot"]), &mut runner),
             EXIT_FAILURE
         );
-        assert_eq!(runner.snapshot_calls, 1);
+        assert_eq!(
+            runner.snapshot_requests,
+            [SnapshotRequest { selector: None }]
+        );
 
         runner.inspect_code = EXIT_SUCCESS;
         assert_eq!(
@@ -897,10 +1189,10 @@ mod tests {
             dispatch(
                 parse(&[
                     "tmux-rescue",
+                    "-S",
+                    "./target.sock",
                     "restore",
                     "/state/snapshot.json",
-                    "--target",
-                    "/tmp/target.sock",
                     "--run",
                 ]),
                 &mut runner,
@@ -909,6 +1201,10 @@ mod tests {
         );
         assert_eq!(runner.restore_requests.len(), 1);
         assert!(runner.restore_requests[0].run);
+        assert_eq!(
+            runner.restore_requests[0].selector,
+            Some(TmuxSelector::SocketPath(OsString::from("./target.sock")))
+        );
     }
 
     #[test]

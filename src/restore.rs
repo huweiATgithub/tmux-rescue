@@ -2,49 +2,32 @@ use std::ffi::{CStr, CString, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
 use crate::{
     AutomaticRecoveryExpectation, CaptureFailure, LosslessOsString, PaneRecovery,
-    RecordedAbsolutePath, RecoveryCommand, SourcePaneCoordinate, ValidatedSnapshot,
+    RecordedAbsolutePath, RecoveryCommand, SourcePaneCoordinate, TmuxSelector, ValidatedSnapshot,
     derive_automatic_command,
 };
 
 pub const MAX_RENDERED_SHELL_INPUT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TmuxServerIdentity {
-    socket_path: RecordedAbsolutePath,
+pub struct RestoreDestination {
+    selector: TmuxSelector,
 }
 
-impl TmuxServerIdentity {
-    pub fn try_from_bytes(bytes: Vec<u8>) -> Result<Self, RestorePlanningError> {
-        let socket_path = RecordedAbsolutePath::try_from_bytes(bytes)
-            .map_err(|error| RestorePlanningError::InvalidTarget(error.to_string()))?;
-        Ok(Self { socket_path })
+impl RestoreDestination {
+    pub(crate) fn from_selector(selector: TmuxSelector) -> Self {
+        Self { selector }
     }
 
-    pub fn socket_path(&self) -> &RecordedAbsolutePath {
-        &self.socket_path
+    pub fn selector(&self) -> &TmuxSelector {
+        &self.selector
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TargetProbe {
-    MissingPath,
-    RefusedSocket,
-    Present,
-    Indeterminate(String),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TargetVacancy {
-    MissingPath,
-    RefusedSocket,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,7 +159,6 @@ impl RestoreEnvironmentFailure {
 }
 
 pub trait RestoreEnvironment {
-    fn probe_target(&self, target: &TmuxServerIdentity) -> TargetProbe;
     fn target_shell(&self) -> Result<TargetShell, RestoreEnvironmentFailure>;
     fn home_directory(&self) -> Result<RecordedAbsolutePath, RestoreEnvironmentFailure>;
     fn directory_exists(&self, directory: &RecordedAbsolutePath) -> bool;
@@ -191,10 +173,6 @@ pub trait RestoreEnvironment {
 pub struct SystemRestoreEnvironment;
 
 impl RestoreEnvironment for SystemRestoreEnvironment {
-    fn probe_target(&self, target: &TmuxServerIdentity) -> TargetProbe {
-        probe_tmux_target(target)
-    }
-
     fn target_shell(&self) -> Result<TargetShell, RestoreEnvironmentFailure> {
         let passwd = effective_user_record();
         let catalog = ShellRuntimeCatalog::from_system();
@@ -261,32 +239,6 @@ impl RestoreEnvironment for SystemRestoreEnvironment {
             })
             .find_map(|candidate| PlanningExecutable::try_from_path(candidate).ok())
     }
-}
-
-pub(crate) fn probe_tmux_target(target: &TmuxServerIdentity) -> TargetProbe {
-    let path = Path::new(target.socket_path.as_os_str());
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => TargetProbe::MissingPath,
-        Err(error) => TargetProbe::Indeterminate(terminal_safe_text(error.to_string().as_bytes())),
-        Ok(metadata) if !metadata.file_type().is_socket() => {
-            TargetProbe::Indeterminate("target path exists and is not a Unix socket".to_owned())
-        }
-        Ok(_) => match UnixStream::connect(path) {
-            Ok(_) => TargetProbe::Present,
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                TargetProbe::RefusedSocket
-            }
-            Err(error) => {
-                TargetProbe::Indeterminate(terminal_safe_text(error.to_string().as_bytes()))
-            }
-        },
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AvailableAtPlanning {
-    target: TmuxServerIdentity,
-    vacancy: TargetVacancy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -550,8 +502,7 @@ pub enum PlanDegradation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestorePlan {
-    target: TmuxServerIdentity,
-    available_at_planning: AvailableAtPlanning,
+    destination: RestoreDestination,
     target_shell: TargetShell,
     sessions: Vec<PlannedSession>,
     panes: Vec<PlannedPane>,
@@ -559,12 +510,8 @@ pub struct RestorePlan {
 }
 
 impl RestorePlan {
-    pub fn target(&self) -> &TmuxServerIdentity {
-        &self.target
-    }
-
-    pub fn target_vacancy(&self) -> TargetVacancy {
-        self.available_at_planning.vacancy
+    pub fn destination(&self) -> &RestoreDestination {
+        &self.destination
     }
 
     pub fn target_shell(&self) -> &TargetShell {
@@ -585,12 +532,8 @@ impl RestorePlan {
 
     pub fn render_human(&self) -> String {
         let mut output = format!(
-            "target: {}\ntarget vacancy: {}\nshell: {}\n",
-            display_os(self.target.socket_path.as_bytes()),
-            match self.target_vacancy() {
-                TargetVacancy::MissingPath => "missing path",
-                TargetVacancy::RefusedSocket => "refused crash socket",
-            },
+            "target: {}\nshell: {}\n",
+            display_selector(self.destination.selector()),
             display_os(self.target_shell.executable.as_bytes())
         );
         for session in &self.sessions {
@@ -715,26 +658,12 @@ impl fmt::Display for RestorePlan {
 
 pub fn plan_restore(
     snapshot: &ValidatedSnapshot,
-    explicit_target: Option<TmuxServerIdentity>,
+    explicit_selector: Option<TmuxSelector>,
     environment: &impl RestoreEnvironment,
 ) -> Result<RestorePlan, RestorePlanningError> {
-    let target = explicit_target.unwrap_or_else(|| TmuxServerIdentity {
-        socket_path: snapshot.source().path().clone(),
-    });
-    let vacancy = match environment.probe_target(&target) {
-        TargetProbe::MissingPath => TargetVacancy::MissingPath,
-        TargetProbe::RefusedSocket => TargetVacancy::RefusedSocket,
-        TargetProbe::Present => {
-            return Err(RestorePlanningError::TargetExists { target });
-        }
-        TargetProbe::Indeterminate(reason) => {
-            return Err(RestorePlanningError::TargetIndeterminate { target, reason });
-        }
-    };
-    let available_at_planning = AvailableAtPlanning {
-        target: target.clone(),
-        vacancy,
-    };
+    let destination = RestoreDestination::from_selector(explicit_selector.unwrap_or_else(|| {
+        TmuxSelector::SocketPath(snapshot.source().path().as_os_str().to_owned())
+    }));
     let target_shell = environment
         .target_shell()
         .map_err(|error| RestorePlanningError::Environment(error.to_string()))?;
@@ -813,8 +742,7 @@ pub fn plan_restore(
     }
 
     Ok(RestorePlan {
-        target,
-        available_at_planning,
+        destination,
         target_shell,
         sessions,
         panes,
@@ -1340,6 +1268,13 @@ fn display_os(bytes: &[u8]) -> String {
     }
 }
 
+fn display_selector(selector: &TmuxSelector) -> String {
+    match selector {
+        TmuxSelector::SocketName(value) => format!("-L {}", display_os(value.as_bytes())),
+        TmuxSelector::SocketPath(value) => format!("-S {}", display_os(value.as_bytes())),
+    }
+}
+
 fn display_rendered_input(bytes: &[u8]) -> String {
     let mut output = String::new();
     for byte in bytes {
@@ -1373,22 +1308,6 @@ fn automatic_expectation_label(expected: &AutomaticRecoveryExpectation) -> Strin
         AutomaticRecoveryExpectation::BookshelfServe(_) => {
             "mdbook-bookshelf serve command".to_owned()
         }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionCheckedTarget {
-    target: TmuxServerIdentity,
-    vacancy: TargetVacancy,
-}
-
-impl ExecutionCheckedTarget {
-    pub fn target(&self) -> &TmuxServerIdentity {
-        &self.target
-    }
-
-    pub fn vacancy(&self) -> TargetVacancy {
-        self.vacancy
     }
 }
 
@@ -1523,11 +1442,9 @@ pub enum AutomaticPaneObservation {
 }
 
 pub trait RestoreTargetCapability {
-    fn recheck(&mut self, target: &TmuxServerIdentity) -> TargetProbe;
-
     fn claim(
         &mut self,
-        checked: ExecutionCheckedTarget,
+        destination: &RestoreDestination,
         shell: &TargetShell,
     ) -> Result<Box<dyn OwnedRestoreTarget>, TargetClaimFailure>;
 }
@@ -1600,13 +1517,6 @@ pub enum RestoreRunStatus {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum RestoreExecutionFailure {
-    #[error("restore target already exists at execution time")]
-    TargetExists { target: TmuxServerIdentity },
-    #[error("restore target is indeterminate at execution time: {reason}")]
-    TargetIndeterminate {
-        target: TmuxServerIdentity,
-        reason: String,
-    },
     #[error("restore target claim failed: {failure}")]
     TargetClaimFailed { failure: TargetClaimFailure },
     #[error("restore topology failed: {failure}")]
@@ -1663,26 +1573,7 @@ impl<T: RestoreTargetCapability> RestoreExecutor<T> {
     }
 
     pub fn execute(&mut self, plan: RestorePlan) -> RestoreRunResult {
-        let target = plan.available_at_planning.target.clone();
-        let vacancy = match self.target.recheck(&target) {
-            TargetProbe::Present => {
-                return RestoreRunResult::fatal(
-                    RestoreExecutionFailure::TargetExists { target },
-                    RestoreTargetState::NotEstablished,
-                );
-            }
-            TargetProbe::Indeterminate(reason) => {
-                return RestoreRunResult::fatal(
-                    RestoreExecutionFailure::TargetIndeterminate { target, reason },
-                    RestoreTargetState::NotEstablished,
-                );
-            }
-            TargetProbe::MissingPath => TargetVacancy::MissingPath,
-            TargetProbe::RefusedSocket => TargetVacancy::RefusedSocket,
-        };
-
-        let checked = ExecutionCheckedTarget { target, vacancy };
-        let mut owned = match self.target.claim(checked, plan.target_shell()) {
+        let mut owned = match self.target.claim(plan.destination(), plan.target_shell()) {
             Ok(owned) => owned,
             Err(failure) => {
                 let target_state = failure.target_state().clone();
@@ -1852,15 +1743,6 @@ fn pane_outcome_is_partial(outcome: &PaneRestoreOutcome) -> bool {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum RestorePlanningError {
-    #[error("restore target already exists")]
-    TargetExists { target: TmuxServerIdentity },
-    #[error("restore target state is indeterminate: {reason}")]
-    TargetIndeterminate {
-        target: TmuxServerIdentity,
-        reason: String,
-    },
-    #[error("restore target is invalid: {0}")]
-    InvalidTarget(String),
     #[error("restore environment failed: {0}")]
     Environment(String),
     #[error("pane {pane:?} argument {argument_index} contains terminal control bytes")]
@@ -1879,20 +1761,8 @@ pub enum RestorePlanningError {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
 
     use super::*;
-
-    #[test]
-    fn real_probe_distinguishes_a_refused_socket_from_a_missing_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("crashed.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        drop(listener);
-        let target = TmuxServerIdentity::try_from_bytes(path.into_os_string().into_vec()).unwrap();
-
-        assert_eq!(probe_tmux_target(&target), TargetProbe::RefusedSocket);
-    }
 
     #[test]
     fn rejects_a_truncated_elf_even_when_its_path_is_registered() {
