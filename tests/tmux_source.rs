@@ -1,4 +1,5 @@
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -7,7 +8,7 @@ use std::sync::Mutex;
 
 use tmux_rescue::{
     CaptureSource, LinuxProcessInspector, PaneProcessObservation, SnapshotSource, TmuxAdapter,
-    TmuxSelector,
+    TmuxSelector, ValidatedSnapshot,
 };
 
 static SOURCE_COMMAND_TEST: Mutex<()> = Mutex::new(());
@@ -75,14 +76,26 @@ fn install_fake_tmux(temp: &Path, directory: &Path, fail: bool) -> (PathBuf, Pro
 }
 
 struct TemporaryTmuxServer {
-    socket: PathBuf,
+    selector: TmuxSelector,
+    tmux_tmpdir: Option<PathBuf>,
 }
 
 impl TemporaryTmuxServer {
     fn start(socket: &Path, session_cwd: &Path) -> Self {
-        let output = Command::new("tmux")
-            .args(["-u", "-S"])
-            .arg(socket)
+        Self::start_selected(
+            TmuxSelector::SocketPath(socket.as_os_str().to_owned()),
+            None,
+            session_cwd,
+        )
+    }
+
+    fn start_selected(
+        selector: TmuxSelector,
+        tmux_tmpdir: Option<&Path>,
+        session_cwd: &Path,
+    ) -> Self {
+        let mut command = selected_tmux(&selector, tmux_tmpdir, false);
+        let output = command
             .args(["-f", "/dev/null", "new-session", "-d", "-s", "work", "-n"])
             .arg("editor: main")
             .args(["-c"])
@@ -95,14 +108,13 @@ impl TemporaryTmuxServer {
             String::from_utf8_lossy(&output.stderr)
         );
         Self {
-            socket: socket.to_owned(),
+            selector,
+            tmux_tmpdir: tmux_tmpdir.map(Path::to_owned),
         }
     }
 
     fn run(&self, arguments: &[&str]) {
-        let output = Command::new("tmux")
-            .args(["-u", "-N", "-S"])
-            .arg(&self.socket)
+        let output = selected_tmux(&self.selector, self.tmux_tmpdir.as_deref(), true)
             .args(arguments)
             .output()
             .unwrap();
@@ -114,9 +126,8 @@ impl TemporaryTmuxServer {
     }
 
     fn start_with_explicit_shell(socket: &Path, session_cwd: &Path) -> Self {
-        let output = Command::new("tmux")
-            .args(["-u", "-S"])
-            .arg(socket)
+        let selector = TmuxSelector::SocketPath(socket.as_os_str().to_owned());
+        let output = selected_tmux(&selector, None, false)
             .args(["-f", "/dev/null", "new-session", "-d", "-s", "work", "-c"])
             .arg(session_cwd)
             .args(["/bin/sh", "-i"])
@@ -128,19 +139,78 @@ impl TemporaryTmuxServer {
             String::from_utf8_lossy(&output.stderr)
         );
         Self {
-            socket: socket.to_owned(),
+            selector,
+            tmux_tmpdir: None,
         }
+    }
+
+    fn reported_socket_path(&self) -> PathBuf {
+        let output = selected_tmux(&self.selector, self.tmux_tmpdir.as_deref(), true)
+            .args(["display-message", "-p", "#{socket_path}"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to read selected socket path: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
     }
 }
 
 impl Drop for TemporaryTmuxServer {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-u", "-N", "-S"])
-            .arg(&self.socket)
+        let _ = selected_tmux(&self.selector, self.tmux_tmpdir.as_deref(), true)
             .arg("kill-server")
             .status();
     }
+}
+
+fn selected_tmux(selector: &TmuxSelector, tmux_tmpdir: Option<&Path>, no_start: bool) -> Command {
+    let mut command = Command::new("tmux");
+    command.arg("-u");
+    if no_start {
+        command.arg("-N");
+    }
+    command.arg(selector.flag()).arg(selector.value());
+    command.env_remove("TMUX").env_remove("TMUX_PANE");
+    if let Some(tmux_tmpdir) = tmux_tmpdir {
+        command.env("TMUX_TMPDIR", tmux_tmpdir);
+    } else {
+        command.env_remove("TMUX_TMPDIR");
+    }
+    command
+}
+
+fn capture_selected_source(
+    selector: &TmuxSelector,
+    tmux_tmpdir: Option<&Path>,
+    state_home: &Path,
+) -> PathBuf {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tmux-rescue"));
+    command
+        .arg(selector.flag())
+        .arg(selector.value())
+        .arg("snapshot")
+        .env("XDG_STATE_HOME", state_home)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE");
+    if let Some(tmux_tmpdir) = tmux_tmpdir {
+        command.env("TMUX_TMPDIR", tmux_tmpdir);
+    } else {
+        command.env_remove("TMUX_TMPDIR");
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "snapshot failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("snapshot: ").map(PathBuf::from))
+        .expect("snapshot output omitted its immutable path")
 }
 
 #[test]
@@ -217,6 +287,54 @@ fn classifies_a_tmux_explicit_interactive_shell_as_idle() {
         adapter.inspect_pane(pane),
         PaneProcessObservation::Idle
     ));
+}
+
+#[test]
+fn named_and_path_sources_publish_to_one_global_stream() {
+    let _serial = SOURCE_COMMAND_TEST.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let named_work = temp.path().join("named-work");
+    let path_work = temp.path().join("path-work");
+    let tmux_tmpdir = temp.path().join("tmux-tmp");
+    let state_home = temp.path().join("state");
+    fs::create_dir(&named_work).unwrap();
+    fs::create_dir(&path_work).unwrap();
+    fs::create_dir(&tmux_tmpdir).unwrap();
+    let named_selector = TmuxSelector::SocketName(OsString::from("global-stream-name"));
+    let path_selector =
+        TmuxSelector::SocketPath(temp.path().join("global-stream.sock").into_os_string());
+    let named_server = TemporaryTmuxServer::start_selected(
+        named_selector.clone(),
+        Some(&tmux_tmpdir),
+        &named_work,
+    );
+    let path_server = TemporaryTmuxServer::start_selected(path_selector.clone(), None, &path_work);
+    let named_reported_socket = named_server.reported_socket_path();
+    let path_reported_socket = path_server.reported_socket_path();
+
+    let named_snapshot = capture_selected_source(&named_selector, Some(&tmux_tmpdir), &state_home);
+    let path_snapshot = capture_selected_source(&path_selector, None, &state_home);
+
+    assert_eq!(named_snapshot.parent(), path_snapshot.parent());
+    assert_eq!(
+        named_snapshot.parent(),
+        Some(state_home.join("tmux-rescue/snapshots").as_path())
+    );
+    assert_ne!(named_snapshot, path_snapshot);
+    assert_eq!(
+        fs::read_link(state_home.join("tmux-rescue/latest")).unwrap(),
+        Path::new("snapshots").join(path_snapshot.file_name().unwrap())
+    );
+    let named = ValidatedSnapshot::from_json(&fs::read(named_snapshot).unwrap()).unwrap();
+    let path = ValidatedSnapshot::from_json(&fs::read(path_snapshot).unwrap()).unwrap();
+    assert_eq!(
+        named.source().path().as_os_str(),
+        named_reported_socket.as_os_str()
+    );
+    assert_eq!(
+        path.source().path().as_os_str(),
+        path_reported_socket.as_os_str()
+    );
 }
 
 #[test]

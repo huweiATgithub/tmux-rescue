@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::sync::Mutex;
@@ -201,6 +201,25 @@ struct ChildProcessGuard {
 struct EnvironmentGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
+}
+
+struct CurrentDirectoryGuard {
+    previous: PathBuf,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TreeEntry {
+    path: PathBuf,
+    contents: TreeContents,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum TreeContents {
+    Directory,
+    File(Vec<u8>),
+    Symlink(Vec<u8>),
+    Socket,
+    Other,
 }
 
 struct TargetCommandContext {
@@ -503,12 +522,26 @@ impl EnvironmentGuard {
     }
 }
 
+impl CurrentDirectoryGuard {
+    fn set(directory: &Path) -> Self {
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(directory).unwrap();
+        Self { previous }
+    }
+}
+
 impl Drop for EnvironmentGuard {
     fn drop(&mut self) {
         match &self.previous {
             Some(value) => unsafe { std::env::set_var(self.key, value) },
             None => unsafe { std::env::remove_var(self.key) },
         }
+    }
+}
+
+impl Drop for CurrentDirectoryGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.previous).unwrap();
     }
 }
 
@@ -704,6 +737,44 @@ fn create_directory(parent: &Path, name: &str) -> PathBuf {
     let path = parent.join(name);
     fs::create_dir(&path).unwrap();
     path
+}
+
+fn inventory_controlled_trees(trees: &[(&str, &Path)]) -> Vec<TreeEntry> {
+    let mut inventory = Vec::new();
+    for (name, root) in trees {
+        inventory_tree(Path::new(name), root, &mut inventory);
+    }
+    inventory
+}
+
+fn inventory_tree(label: &Path, path: &Path, inventory: &mut Vec<TreeEntry>) {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    let file_type = metadata.file_type();
+    let contents = if file_type.is_dir() {
+        TreeContents::Directory
+    } else if file_type.is_file() {
+        TreeContents::File(fs::read(path).unwrap())
+    } else if file_type.is_symlink() {
+        TreeContents::Symlink(fs::read_link(path).unwrap().as_os_str().as_bytes().to_vec())
+    } else if file_type.is_socket() {
+        TreeContents::Socket
+    } else {
+        TreeContents::Other
+    };
+    inventory.push(TreeEntry {
+        path: label.to_owned(),
+        contents,
+    });
+    if file_type.is_dir() {
+        let mut children = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            inventory_tree(&label.join(child.file_name()), &child.path(), inventory);
+        }
+    }
 }
 
 fn single_pane_plan(temp: &Path, selector: TmuxSelector) -> RestorePlan {
@@ -1309,6 +1380,104 @@ fn claim_rejects_preexisting_name_and_path_servers_without_changing_their_identi
         ));
         assert_eq!(server.fingerprint(), before);
     }
+}
+
+#[test]
+fn plan_only_binary_does_not_contact_destinations_or_change_controlled_trees() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let controlled_cwd = create_directory(temp.path(), "cwd");
+    let controlled_tmp = create_directory(temp.path(), "tmp");
+    let controlled_state = create_directory(temp.path(), "state");
+    let controlled_home = create_directory(temp.path(), "home");
+    let controlled_tmux = create_directory(temp.path(), "tmux");
+    let planned_session = create_directory(&controlled_home, "planned-session");
+    let planned_pane = create_directory(&controlled_home, "planned-pane");
+    let named_existing = create_directory(&controlled_home, "named-existing");
+    let path_existing = create_directory(&controlled_home, "path-existing");
+    let snapshot_path = controlled_cwd.join("snapshot.json");
+    let fixture = snapshot(
+        &temp.path().join("source.sock"),
+        vec![session(
+            "planned",
+            &planned_session,
+            vec![window(
+                4,
+                "planned-window",
+                vec![idle_pane(0, &planned_pane)],
+            )],
+        )],
+    );
+    fs::write(&snapshot_path, fixture.to_json_pretty().unwrap()).unwrap();
+
+    let _cwd = CurrentDirectoryGuard::set(&controlled_cwd);
+    let _environment = [
+        EnvironmentGuard::set("TMPDIR", &controlled_tmp),
+        EnvironmentGuard::set("XDG_STATE_HOME", &controlled_state),
+        EnvironmentGuard::set("HOME", &controlled_home),
+        EnvironmentGuard::set("TMUX_TMPDIR", &controlled_tmux),
+    ];
+    let named_selector = TmuxSelector::SocketName(OsString::from("plan-only-name"));
+    let path_selector = TmuxSelector::SocketPath(OsString::from("relative-target.sock"));
+    let named_server =
+        SelectedServerGuard::start_preexisting(named_selector.clone(), &named_existing);
+    let path_server = SelectedServerGuard::start_preexisting(path_selector.clone(), &path_existing);
+    let named_fingerprint = named_server.fingerprint();
+    let path_fingerprint = path_server.fingerprint();
+    let (contact_log, contact_guards) = install_logging_tmux_proxy(&controlled_tmp);
+    let controlled_trees = [
+        ("cwd", controlled_cwd.as_path()),
+        ("tmp", controlled_tmp.as_path()),
+        ("state", controlled_state.as_path()),
+        ("home", controlled_home.as_path()),
+        ("tmux", controlled_tmux.as_path()),
+    ];
+    let before = inventory_controlled_trees(&controlled_trees);
+
+    for (selector, expected_target) in [
+        (named_selector, "target: -L plan-only-name"),
+        (path_selector, "target: -S relative-target.sock"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tmux-rescue"))
+            .arg(selector.flag())
+            .arg(selector.value())
+            .arg("restore")
+            .arg(&snapshot_path)
+            .current_dir(&controlled_cwd)
+            .env("TMPDIR", &controlled_tmp)
+            .env("XDG_STATE_HOME", &controlled_state)
+            .env("HOME", &controlled_home)
+            .env("TMUX_TMPDIR", &controlled_tmux)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "plan-only restore failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout.lines().next(), Some(expected_target));
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| line.starts_with("target: "))
+                .collect::<Vec<_>>(),
+            vec![expected_target]
+        );
+        assert_eq!(
+            fs::read(&contact_log).unwrap_or_default(),
+            b"",
+            "plan-only restore contacted a tmux destination"
+        );
+        assert_eq!(inventory_controlled_trees(&controlled_trees), before);
+    }
+    drop(contact_guards);
+    assert_eq!(named_server.fingerprint(), named_fingerprint);
+    assert_eq!(path_server.fingerprint(), path_fingerprint);
 }
 
 #[test]

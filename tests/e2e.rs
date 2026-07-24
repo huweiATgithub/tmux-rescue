@@ -9,7 +9,10 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tmux_rescue::{AutomaticRecovery, PaneRecovery, ValidatedSnapshot};
+use tmux_rescue::{
+    AutomaticRecovery, CaptureSource, LinuxProcessInspector, PaneProcessObservation, PaneRecovery,
+    SnapshotSource, TmuxAdapter, ValidatedSnapshot,
+};
 
 const SESSION: &str = "e2e";
 const WINDOW_INDEX: u32 = 3;
@@ -128,6 +131,68 @@ fn pane_command(socket: &Path, target: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+fn pane_coordinates(socket: &Path, target: &str) -> Option<(String, u32, u32)> {
+    let output = isolated_tmux(socket)
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{session_name}\t#{window_index}\t#{pane_index}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let fields = String::from_utf8(output.stdout).ok()?;
+    let mut fields = fields.trim().split('\t');
+    let coordinates = (
+        fields.next()?.to_owned(),
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+    );
+    fields.next().is_none().then_some(coordinates)
+}
+
+fn pane_process_observation(socket: &Path, pane_id: &str) -> Option<PaneProcessObservation> {
+    let (session_name, window_index, pane_index) = pane_coordinates(socket, pane_id)?;
+    let source = SnapshotSource::try_from_bytes(socket.as_os_str().as_bytes().to_vec())
+        .expect("socket path");
+    let mut adapter = TmuxAdapter::new(source, LinuxProcessInspector::new());
+    let topology = adapter.read_topology().ok()?;
+    let pane = topology
+        .sessions()
+        .iter()
+        .find(|session| session.name() == session_name)?
+        .windows()
+        .iter()
+        .find(|window| window.source_index() == window_index)?
+        .panes()
+        .iter()
+        .find(|pane| pane.source_index() == pane_index)?;
+    Some(adapter.inspect_pane(pane))
+}
+
+fn wait_for_consecutive_idle_observations(socket: &Path, pane_id: &str) {
+    let mut consecutive = 0;
+    wait_until(
+        "initial pane to remain an idle shell",
+        Duration::from_secs(5),
+        || {
+            if matches!(
+                pane_process_observation(socket, pane_id),
+                Some(PaneProcessObservation::Idle)
+            ) {
+                consecutive += 1;
+            } else {
+                consecutive = 0;
+            }
+            consecutive >= 2
+        },
+    );
+}
+
 fn server_is_running(socket: &Path) -> bool {
     isolated_tmux(socket)
         .arg("has-session")
@@ -192,6 +257,9 @@ fn start_source_server(
             "/dev/null",
             "new-session",
             "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
             "-s",
             SESSION,
             "-n",
@@ -201,7 +269,11 @@ fn start_source_server(
         .arg(idle_directory)
         .output()
         .expect("tmux is installed");
-    require_success("start isolated source tmux server", output);
+    let initial_pane =
+        String::from_utf8(require_success("start isolated source tmux server", output))
+            .unwrap()
+            .trim()
+            .to_owned();
 
     tmux_stdout(
         socket,
@@ -281,6 +353,7 @@ fn start_source_server(
     wait_until("mdbook source listener", Duration::from_secs(5), || {
         port_accepts_connections(port)
     });
+    wait_for_consecutive_idle_observations(socket, &initial_pane);
     guard
 }
 
@@ -487,8 +560,9 @@ fn snapshots_plans_and_restores_an_isolated_real_tmux_server() {
     });
 
     let plan_output = cli(&state_home)
-        .args(["restore", "--target"])
+        .arg("-S")
         .arg(&target_socket)
+        .arg("restore")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .output()
@@ -501,7 +575,10 @@ fn snapshots_plans_and_restores_an_isolated_real_tmux_server() {
         stderr_text(&plan_output)
     );
     let plan_stdout = stdout_text(&plan_output);
-    assert!(plan_stdout.contains(target_socket.to_str().unwrap()));
+    assert_eq!(
+        plan_stdout.lines().next(),
+        Some(format!("target: -S {}", target_socket.display()).as_str())
+    );
     assert!(plan_stdout.contains(WINDOW_NAME));
     assert!(plan_stdout.contains("leave idle shell"));
     assert!(plan_stdout.contains("paste manual hint"));
@@ -513,9 +590,9 @@ fn snapshots_plans_and_restores_an_isolated_real_tmux_server() {
     assert!(port_is_available(port));
 
     let restore_output = cli(&state_home)
-        .args(["restore", "--target"])
+        .arg("-S")
         .arg(&target_socket)
-        .arg("--run")
+        .args(["restore", "--run"])
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .output()

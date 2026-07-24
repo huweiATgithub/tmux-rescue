@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::Path;
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::Duration;
 
@@ -15,9 +16,13 @@ fn encoded(value: &str) -> serde_json::Value {
 }
 
 fn snapshot(captured_at: &str, session_name: &str) -> ValidatedSnapshot {
+    snapshot_from_source(captured_at, session_name, "/tmp/source.sock")
+}
+
+fn snapshot_from_source(captured_at: &str, session_name: &str, source: &str) -> ValidatedSnapshot {
     let value = json!({
         "captured_at": captured_at,
-        "source": encoded("/tmp/source.sock"),
+        "source": encoded(source),
         "consistency": {"kind": "stable"},
         "sessions": [{
             "name": session_name,
@@ -34,6 +39,29 @@ fn snapshot(captured_at: &str, session_name: &str) -> ValidatedSnapshot {
         }]
     });
     ValidatedSnapshot::from_json(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
+#[test]
+fn different_sources_publish_into_one_global_snapshot_stream() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state/tmux-rescue");
+    let store = StateStore::new(root.clone());
+    let named = snapshot_from_source("2026-07-23T00:00:00Z", "named", "/tmp/named.sock");
+    let path = snapshot_from_source("2026-07-23T01:00:00Z", "path", "/tmp/path.sock");
+
+    let named_publication = store.publish(&named);
+    let path_publication = store.publish(&path);
+
+    let named_path = published_path(&named_publication);
+    let path_path = published_path(&path_publication);
+    assert_eq!(named_path.parent(), path_path.parent());
+    assert_eq!(named_path.parent(), Some(root.join("snapshots").as_path()));
+    assert_ne!(named_path, path_path);
+    assert_eq!(
+        fs::read_link(root.join("latest")).unwrap(),
+        Path::new("snapshots").join(path_path.file_name().unwrap())
+    );
+    assert_eq!(store.load_latest().unwrap().snapshot(), &path);
 }
 
 fn published_path(publication: &SnapshotPublication) -> &std::path::Path {
