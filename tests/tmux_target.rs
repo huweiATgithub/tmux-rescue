@@ -4,7 +4,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -13,8 +13,9 @@ use serde_json::{Value, json};
 use tmux_rescue::{
     AttentionReason, LosslessOsString, PaneRestoreOutcome, PlanningExecutable,
     RecordedAbsolutePath, RestoreEnvironment, RestoreEnvironmentFailure, RestoreExecutionFailure,
-    RestoreExecutor, RestoreRunStatus, RestoreTargetState, TargetDisposition, TargetShell,
-    TmuxRestoreAdapter, TmuxSelector, ValidatedSnapshot, plan_restore,
+    RestoreExecutor, RestorePlan, RestoreRunStatus, RestoreTargetCapability, RestoreTargetState,
+    RollbackOutcome, TargetDisposition, TargetShell, TmuxRestoreAdapter, TmuxSelector,
+    ValidatedSnapshot, plan_restore,
 };
 
 static ISOLATED_TMUX_TEST: Mutex<()> = Mutex::new(());
@@ -167,13 +168,6 @@ fn isolated_tmux(socket: &Path) -> Command {
     command
 }
 
-fn isolated_tmux_start(socket: &Path) -> Command {
-    assert!(socket.is_absolute());
-    let mut command = Command::new("tmux");
-    command.args(["-u", "-S"]).arg(socket).env_remove("TMUX");
-    command
-}
-
 fn require_success(operation: &str, output: Output) -> Vec<u8> {
     assert!(
         output.status.success(),
@@ -193,6 +187,14 @@ fn tmux_stdout(socket: &Path, arguments: &[&str]) -> Vec<u8> {
 
 struct IsolatedServerGuard {
     socket: PathBuf,
+}
+
+struct SelectedServerGuard {
+    selector: TmuxSelector,
+}
+
+struct ChildProcessGuard {
+    child: Child,
 }
 
 struct EnvironmentGuard {
@@ -250,10 +252,167 @@ fn install_fake_target_tmux(temp: &Path) -> (PathBuf, TargetCommandContext) {
     (log, guard)
 }
 
+fn install_claim_evidence_tmux(
+    temp: &Path,
+    scenario: &str,
+    server_process_id: u32,
+) -> (PathBuf, Vec<EnvironmentGuard>) {
+    let bin = temp.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let executable = bin.join("tmux");
+    fs::write(
+        &executable,
+        br#"#!/bin/sh
+{
+    printf 'BEGIN\nPWD=%s\nTMUX=%s\n' "$PWD" "${TMUX-unset}"
+    for arg do printf 'ARG=%s\n' "$arg"; done
+} >> "$FAKE_TMUX_LOG"
+case " $* " in
+  *' start-server '*)
+    previous=
+    config=
+    for arg do
+      if [ "$previous" = '-f' ]; then config=$arg; fi
+      previous=$arg
+    done
+    sed -n 's/^set-option -s @tmux_rescue_owner //p' "$config" > "$FAKE_TMUX_STATE"
+    exit 1
+    ;;
+  *' display-message '*)
+    case "$FAKE_TMUX_SCENARIO" in
+      missing_pid) printf '0:1:11:1:0\n'; exit 0 ;;
+      missing_tmux_start) printf '%s:%s0:1:0\n' "${#FAKE_SERVER_PID}" "$FAKE_SERVER_PID"; exit 0 ;;
+      missing_os_process) pid=4294967294 ;;
+      *) pid=$FAKE_SERVER_PID ;;
+    esac
+    sessions=0
+    if [ "$FAKE_TMUX_SCENARIO" = 'sessions_present' ]; then sessions=1; fi
+    printf '%s:%s%s:%s%s:%s\n' "${#pid}" "$pid" 2 11 "${#sessions}" "$sessions"
+    exit 0
+    ;;
+  *' show-options '*)
+    case "$FAKE_TMUX_SCENARIO" in
+      missing_token) exit 1 ;;
+      mismatched_token) printf 'wrong-token\n'; exit 0 ;;
+      replaced_os_process)
+        cat "$FAKE_TMUX_STATE"
+        kill "$FAKE_SERVER_PID" 2>/dev/null || true
+        exit 0
+        ;;
+      *) cat "$FAKE_TMUX_STATE"; exit 0 ;;
+    esac
+    ;;
+  *' if-shell '*)
+    case "$FAKE_TMUX_SCENARIO" in
+      mismatched_pid)
+        case " $* " in
+          *'#{==:#{pid},'"$FAKE_SERVER_PID"'}'*) exit 0 ;;
+        esac
+        ;;
+      mismatched_tmux_start)
+        case " $* " in *'#{==:#{start_time},11}'*) exit 0 ;; esac
+        ;;
+      sessions_appeared)
+        case " $* " in *'#{==:#{server_sessions},0}'*) exit 0 ;; esac
+        ;;
+    esac
+    printf 'KILL_EXECUTED\n' >> "$FAKE_TMUX_LOG"
+    exit 0
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let log = temp.join("target-tmux.log");
+    let state = temp.join("target-tmux.state");
+    let old_path = std::env::var_os("PATH");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        old_path.as_deref().unwrap_or(OsStr::new("")),
+    )))
+    .unwrap();
+    let guards = vec![
+        EnvironmentGuard::set("PATH", &path),
+        EnvironmentGuard::set("TMUX", "ambient.sock,1,0"),
+        EnvironmentGuard::set("FAKE_TMUX_LOG", &log),
+        EnvironmentGuard::set("FAKE_TMUX_STATE", &state),
+        EnvironmentGuard::set("FAKE_TMUX_SCENARIO", scenario),
+        EnvironmentGuard::set("FAKE_SERVER_PID", server_process_id.to_string()),
+    ];
+    (log, guards)
+}
+
+fn install_owned_target_tmux(
+    temp: &Path,
+    server_process_id: u32,
+) -> (PathBuf, Vec<EnvironmentGuard>) {
+    let bin = temp.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let executable = bin.join("tmux");
+    fs::write(
+        &executable,
+        br#"#!/bin/sh
+{
+    printf 'BEGIN\nPWD=%s\nTMUX=%s\n' "$PWD" "${TMUX-unset}"
+    for arg do printf 'ARG=%s\n' "$arg"; done
+} >> "$FAKE_TMUX_LOG"
+case " $* " in
+  *' start-server '*)
+    previous=
+    config=
+    for arg do
+      if [ "$previous" = '-f' ]; then config=$arg; fi
+      previous=$arg
+    done
+    sed -n 's/^set-option -s @tmux_rescue_owner //p' "$config" > "$FAKE_TMUX_STATE"
+    exit 0
+    ;;
+  *' display-message '*)
+    if [ -e "$FAKE_TMUX_REMOVED" ]; then exit 1; fi
+    pid=$FAKE_SERVER_PID
+    printf '%s:%s2:111:0\n' "${#pid}" "$pid"
+    exit 0
+    ;;
+  *' show-options '*)
+    if [ -e "$FAKE_TMUX_REMOVED" ]; then exit 1; fi
+    cat "$FAKE_TMUX_STATE"
+    exit 0
+    ;;
+  *' if-shell '*)
+    : > "$FAKE_TMUX_REMOVED"
+    kill "$FAKE_SERVER_PID" 2>/dev/null || true
+    exit 0
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let log = temp.join("target-tmux.log");
+    let state = temp.join("target-tmux.state");
+    let removed = temp.join("target-tmux.removed");
+    let old_path = std::env::var_os("PATH");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        old_path.as_deref().unwrap_or(OsStr::new("")),
+    )))
+    .unwrap();
+    let guards = vec![
+        EnvironmentGuard::set("PATH", &path),
+        EnvironmentGuard::set("TMUX", "ambient.sock,1,0"),
+        EnvironmentGuard::set("FAKE_TMUX_LOG", &log),
+        EnvironmentGuard::set("FAKE_TMUX_STATE", &state),
+        EnvironmentGuard::set("FAKE_TMUX_REMOVED", &removed),
+        EnvironmentGuard::set("FAKE_SERVER_PID", server_process_id.to_string()),
+    ];
+    (log, guards)
+}
+
 impl EnvironmentGuard {
-    fn set(key: &'static str, value: &Path) -> Self {
+    fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
         let previous = std::env::var_os(key);
-        unsafe { std::env::set_var(key, value) };
+        unsafe { std::env::set_var(key, value.as_ref()) };
         Self { key, previous }
     }
 }
@@ -274,10 +433,12 @@ impl IsolatedServerGuard {
             socket: socket.to_owned(),
         }
     }
+}
 
-    fn start_preexisting(socket: &Path, working_directory: &Path) -> Self {
-        let guard = Self::for_socket(socket);
-        let output = isolated_tmux_start(socket)
+impl SelectedServerGuard {
+    fn start_preexisting(selector: TmuxSelector, working_directory: &Path) -> Self {
+        let guard = Self { selector };
+        let output = selected_tmux(&guard.selector, false)
             .args([
                 "-f",
                 "/dev/null",
@@ -292,24 +453,42 @@ impl IsolatedServerGuard {
             .arg(working_directory)
             .output()
             .expect("tmux is installed");
-        require_success("start pre-existing isolated tmux server", output);
-        tmux_stdout(
-            socket,
-            &[
-                "set-option",
-                "-g",
-                "@tmux_target_test_sentinel",
-                "untouched",
-            ],
+        require_success("start pre-existing selected tmux server", output);
+        require_success(
+            "set pre-existing sentinel",
+            selected_tmux(&guard.selector, true)
+                .args([
+                    "set-option",
+                    "-g",
+                    "@tmux_target_test_sentinel",
+                    "untouched",
+                ])
+                .output()
+                .unwrap(),
         );
         guard
     }
 
     fn fingerprint(&self) -> Vec<u8> {
-        let mut fingerprint = tmux_stdout(&self.socket, &["show-options", "-g"]);
+        let mut fingerprint =
+            selected_tmux_stdout(&self.selector, &["display-message", "-p", "#{pid}"]);
         fingerprint.push(0);
-        fingerprint.extend(tmux_stdout(
-            &self.socket,
+        fingerprint.extend(selected_tmux_stdout(
+            &self.selector,
+            &[
+                "list-sessions",
+                "-F",
+                "#{session_name}\t#{session_windows}\t#{session_path}",
+            ],
+        ));
+        fingerprint.push(0);
+        fingerprint.extend(selected_tmux_stdout(
+            &self.selector,
+            &["show-options", "-gv", "@tmux_target_test_sentinel"],
+        ));
+        fingerprint.push(0);
+        fingerprint.extend(selected_tmux_stdout(
+            &self.selector,
             &[
                 "list-panes",
                 "-a",
@@ -321,10 +500,61 @@ impl IsolatedServerGuard {
     }
 }
 
+impl Drop for SelectedServerGuard {
+    fn drop(&mut self) {
+        let _ = selected_tmux(&self.selector, true)
+            .arg("kill-server")
+            .output();
+    }
+}
+
+impl ChildProcessGuard {
+    fn sleeping() -> Self {
+        Self {
+            child: Command::new("/bin/sleep").arg("30").spawn().unwrap(),
+        }
+    }
+
+    fn process_id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for ChildProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Drop for IsolatedServerGuard {
     fn drop(&mut self) {
         let _ = isolated_tmux(&self.socket).arg("kill-server").output();
     }
+}
+
+fn selected_tmux(selector: &TmuxSelector, no_start: bool) -> Command {
+    let mut command = Command::new("tmux");
+    command.arg("-u");
+    if no_start {
+        command.arg("-N");
+    }
+    command.arg(selector.flag()).arg(selector.value());
+    command.env_remove("TMUX");
+    command
+}
+
+fn selected_tmux_stdout(selector: &TmuxSelector, arguments: &[&str]) -> Vec<u8> {
+    let output = selected_tmux(selector, true)
+        .args(arguments)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run selected tmux: {error}"));
+    require_success("selected tmux command", output)
 }
 
 #[derive(Debug)]
@@ -388,6 +618,24 @@ fn create_directory(parent: &Path, name: &str) -> PathBuf {
     let path = parent.join(name);
     fs::create_dir(&path).unwrap();
     path
+}
+
+fn single_pane_plan(temp: &Path, selector: TmuxSelector) -> RestorePlan {
+    let session_directory = create_directory(temp, "planned-session");
+    let pane_directory = create_directory(temp, "planned-pane");
+    let snapshot = snapshot(
+        &temp.join("source.sock"),
+        vec![session(
+            "planned",
+            &session_directory,
+            vec![window(
+                0,
+                "planned-window",
+                vec![idle_pane(0, &pane_directory)],
+            )],
+        )],
+    );
+    plan_restore(&snapshot, Some(selector), &PlanningEnvironment::new(temp)).unwrap()
 }
 
 #[test]
@@ -478,15 +726,250 @@ fn claim_and_later_clients_keep_the_exact_explicit_selector() {
 }
 
 #[test]
-fn claim_rejects_a_preexisting_target_and_leaves_it_unchanged() {
+fn claim_dispatch_failure_is_not_established_and_consumes_the_attempt() {
     let _tmux_test = ISOLATED_TMUX_TEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp = tempfile::tempdir().unwrap();
+    let plan = single_pane_plan(
+        temp.path(),
+        TmuxSelector::SocketPath(OsString::from("dispatch-failure.sock")),
+    );
+    let bin = temp.path().join("empty-bin");
+    fs::create_dir(&bin).unwrap();
+    let _path = EnvironmentGuard::set("PATH", &bin);
+    let mut adapter = TmuxRestoreAdapter::new();
+
+    let first_failure = match adapter.claim(plan.destination(), plan.target_shell()) {
+        Ok(_) => panic!("a missing tmux executable cannot establish ownership"),
+        Err(failure) => failure,
+    };
+
+    assert_eq!(
+        first_failure.target_state(),
+        &RestoreTargetState::NotEstablished
+    );
+
+    let dispatch_log = temp.path().join("unexpected-retry");
+    let executable = bin.join("tmux");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf dispatched >> '{}'\nexit 1\n",
+            dispatch_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let retry_failure = match adapter.claim(plan.destination(), plan.target_shell()) {
+        Ok(_) => panic!("a consumed claim attempt cannot return an owned target"),
+        Err(failure) => failure,
+    };
+
+    assert!(retry_failure.message().contains("already claimed a target"));
+    assert!(
+        !dispatch_log.exists(),
+        "the consumed attempt was dispatched again"
+    );
+}
+
+#[test]
+fn dispatched_claim_failure_is_observed_returns_no_capability_and_cannot_retry() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let plan = single_pane_plan(
+        temp.path(),
+        TmuxSelector::SocketPath(OsString::from("post-dispatch.sock")),
+    );
+    let (log_path, _guards) =
+        install_claim_evidence_tmux(temp.path(), "missing_token", std::process::id());
+    let mut adapter = TmuxRestoreAdapter::new();
+
+    let first_failure = match adapter.claim(plan.destination(), plan.target_shell()) {
+        Ok(_) => panic!("a failed post-dispatch claim cannot return an owned target"),
+        Err(failure) => failure,
+    };
+
+    assert!(matches!(
+        first_failure.target_state(),
+        RestoreTargetState::Observed(_)
+    ));
+
+    let retry_failure = match adapter.claim(plan.destination(), plan.target_shell()) {
+        Ok(_) => panic!("an ambiguous dispatched attempt cannot be retried"),
+        Err(failure) => failure,
+    };
+    assert!(retry_failure.message().contains("already claimed a target"));
+    let log = fs::read(&log_path).unwrap();
+    assert_eq!(
+        log.windows(b"ARG=start-server\n".len())
+            .filter(|bytes| *bytes == b"ARG=start-server\n")
+            .count(),
+        1,
+        "start-server was dispatched more than once: {}",
+        String::from_utf8_lossy(&log)
+    );
+}
+
+#[test]
+fn failed_claim_cleanup_requires_complete_matching_identity_and_zero_sessions() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (scenario, proof_can_be_constructed) in [
+        ("missing_token", false),
+        ("mismatched_token", false),
+        ("missing_pid", false),
+        ("missing_tmux_start", false),
+        ("missing_os_process", false),
+        ("replaced_os_process", false),
+        ("sessions_present", false),
+        ("mismatched_pid", true),
+        ("mismatched_tmux_start", true),
+        ("sessions_appeared", true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = single_pane_plan(
+            temp.path(),
+            TmuxSelector::SocketPath(OsString::from("failed-cleanup.sock")),
+        );
+        let replaced_process =
+            (scenario == "replaced_os_process").then(ChildProcessGuard::sleeping);
+        let server_process_id = replaced_process
+            .as_ref()
+            .map_or_else(std::process::id, ChildProcessGuard::process_id);
+        let (log_path, _guards) =
+            install_claim_evidence_tmux(temp.path(), scenario, server_process_id);
+        let mut adapter = TmuxRestoreAdapter::new();
+
+        let failure = match adapter.claim(plan.destination(), plan.target_shell()) {
+            Ok(_) => panic!("scenario {scenario} returned an owned target after claim failure"),
+            Err(failure) => failure,
+        };
+
+        assert!(matches!(
+            failure.target_state(),
+            RestoreTargetState::Observed(_)
+        ));
+        let log = fs::read(&log_path).unwrap();
+        assert!(
+            !log.windows(b"KILL_EXECUTED\n".len())
+                .any(|bytes| bytes == b"KILL_EXECUTED\n"),
+            "scenario {scenario} allowed cleanup to kill without full identity: {}",
+            String::from_utf8_lossy(&log)
+        );
+        if !proof_can_be_constructed {
+            assert!(
+                !log.windows(b"ARG=if-shell\n".len())
+                    .any(|bytes| bytes == b"ARG=if-shell\n"),
+                "scenario {scenario} dispatched cleanup without a proof: {}",
+                String::from_utf8_lossy(&log)
+            );
+        }
+    }
+}
+
+#[test]
+fn post_claim_endpoint_process_replacement_prevents_the_next_mutation() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let plan = single_pane_plan(
+        temp.path(),
+        TmuxSelector::SocketPath(OsString::from("replaced-endpoint.sock")),
+    );
+    let mut original_process = ChildProcessGuard::sleeping();
+    let replacement_process = ChildProcessGuard::sleeping();
+    let (log_path, _guards) = install_owned_target_tmux(temp.path(), original_process.process_id());
+    let mut adapter = TmuxRestoreAdapter::new();
+    let mut owned = adapter
+        .claim(plan.destination(), plan.target_shell())
+        .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+    original_process.terminate();
+    unsafe {
+        std::env::set_var(
+            "FAKE_SERVER_PID",
+            replacement_process.process_id().to_string(),
+        )
+    };
+    let before_mutation = fs::read(&log_path).unwrap();
+
+    let result = owned.create_topology(&plan);
+
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read(&log_path).unwrap(),
+        before_mutation,
+        "a target command was dispatched after the owned OS process changed"
+    );
+}
+
+#[test]
+fn rollback_keeps_each_exact_selector_and_uses_no_start_clients() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (selector, selector_arguments) in [
+        (
+            TmuxSelector::SocketName(OsString::from("rollback-name")),
+            b"ARG=-L\nARG=rollback-name\n".as_slice(),
+        ),
+        (
+            TmuxSelector::SocketPath(OsString::from("./rollback.sock")),
+            b"ARG=-S\nARG=./rollback.sock\n".as_slice(),
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = single_pane_plan(temp.path(), selector);
+        let process = ChildProcessGuard::sleeping();
+        let (log_path, _guards) = install_owned_target_tmux(temp.path(), process.process_id());
+        let mut adapter = TmuxRestoreAdapter::new();
+        let owned = adapter
+            .claim(plan.destination(), plan.target_shell())
+            .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+
+        assert_eq!(owned.rollback(), RollbackOutcome::Removed);
+
+        let log = fs::read(&log_path).unwrap();
+        let starts = log
+            .windows(b"BEGIN\n".len())
+            .enumerate()
+            .filter_map(|(index, bytes)| (bytes == b"BEGIN\n").then_some(index))
+            .collect::<Vec<_>>();
+        assert!(starts.len() >= 4, "{}", String::from_utf8_lossy(&log));
+        for (index, start) in starts.iter().copied().enumerate() {
+            let end = starts.get(index + 1).copied().unwrap_or(log.len());
+            let command = &log[start..end];
+            assert!(
+                command
+                    .windows(selector_arguments.len())
+                    .any(|bytes| bytes == selector_arguments),
+                "rollback command lost its selector: {}",
+                String::from_utf8_lossy(command)
+            );
+            if index == 0 {
+                assert!(!command.windows(7).any(|bytes| bytes == b"ARG=-N\n"));
+            } else {
+                assert!(command.windows(7).any(|bytes| bytes == b"ARG=-N\n"));
+            }
+        }
+    }
+}
+
+#[test]
+fn claim_rejects_preexisting_name_and_path_servers_without_changing_their_identity_or_state() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let _tmux_tmpdir = EnvironmentGuard::set("TMUX_TMPDIR", temp.path());
     let session_directory = create_directory(temp.path(), "planned-session");
     let pane_directory = create_directory(temp.path(), "planned-pane");
     let existing_directory = create_directory(temp.path(), "preexisting-session");
-    let socket = temp.path().join("race-target.sock");
     let snapshot = snapshot(
         &temp.path().join("source.sock"),
         vec![session(
@@ -499,29 +982,33 @@ fn claim_rejects_a_preexisting_target_and_leaves_it_unchanged() {
             )],
         )],
     );
-    let plan = plan_restore(
-        &snapshot,
-        Some(target_selector(&socket)),
-        &PlanningEnvironment::new(temp.path()),
-    )
-    .unwrap();
+    for selector in [
+        TmuxSelector::SocketName(OsString::from("preexisting-name")),
+        TmuxSelector::SocketPath(temp.path().join("preexisting.sock").into_os_string()),
+    ] {
+        let plan = plan_restore(
+            &snapshot,
+            Some(selector.clone()),
+            &PlanningEnvironment::new(temp.path()),
+        )
+        .unwrap();
+        let server = SelectedServerGuard::start_preexisting(selector, &existing_directory);
+        let before = server.fingerprint();
+        let mut executor = RestoreExecutor::new(TmuxRestoreAdapter::new());
 
-    let server = IsolatedServerGuard::start_preexisting(&socket, &existing_directory);
-    let before = server.fingerprint();
-    let mut executor = RestoreExecutor::new(TmuxRestoreAdapter::new());
+        let result = executor.execute(plan);
 
-    let result = executor.execute(plan);
-
-    assert_eq!(result.status(), RestoreRunStatus::Fatal);
-    assert_eq!(
-        result.target_state(),
-        &RestoreTargetState::Observed(TargetDisposition::Unknown)
-    );
-    assert!(matches!(
-        result.failure(),
-        Some(RestoreExecutionFailure::TargetClaimFailed { .. })
-    ));
-    assert_eq!(server.fingerprint(), before);
+        assert_eq!(result.status(), RestoreRunStatus::Fatal);
+        assert_eq!(
+            result.target_state(),
+            &RestoreTargetState::Observed(TargetDisposition::Unknown)
+        );
+        assert!(matches!(
+            result.failure(),
+            Some(RestoreExecutionFailure::TargetClaimFailed { .. })
+        ));
+        assert_eq!(server.fingerprint(), before);
+    }
 }
 
 #[test]

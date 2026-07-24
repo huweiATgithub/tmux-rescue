@@ -5,7 +5,7 @@ use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -372,25 +372,32 @@ impl<P: PaneProcessProbe + 'static> RestoreTargetCapability for TmuxRestoreAdapt
         destination: &RestoreDestination,
         shell: &TargetShell,
     ) -> Result<Box<dyn OwnedRestoreTarget>, TargetClaimFailure> {
-        if self.process_probe.is_none() {
-            return Err(TargetClaimFailure::new(
-                "this restore adapter has already claimed a target",
-            ));
-        }
+        let process_probe = self.process_probe.take().ok_or_else(|| {
+            TargetClaimFailure::new("this restore adapter has already claimed a target")
+        })?;
         let token = random_owner_token()?;
         let config = TemporaryClaimConfig::create(&token)?;
-        let output = start_capable_target_command(destination)
+        let child = start_capable_target_command(destination)
             .args(["-f"])
             .arg(config.path())
             .arg("start-server")
             .env_remove("TMUX")
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|error| {
                 TargetClaimFailure::new(format!("tmux start-server is unavailable: {error}"))
             })?;
         let unconfirmed = UnconfirmedClaim {
             destination: destination.clone(),
             token,
+        };
+        let output = match child.wait_with_output() {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(unconfirmed
+                    .into_failure(format!("waiting for tmux start-server failed: {error}")));
+            }
         };
         if !output.status.success() {
             return Err(unconfirmed.into_failure(format!(
@@ -400,10 +407,6 @@ impl<P: PaneProcessProbe + 'static> RestoreTargetCapability for TmuxRestoreAdapt
         }
 
         let server = unconfirmed.confirm()?;
-        let process_probe = self
-            .process_probe
-            .take()
-            .expect("adapter reuse was rejected before target creation");
         Ok(Box::new(TmuxOwnedTarget {
             server,
             shell: shell.clone(),
@@ -419,6 +422,7 @@ struct UnconfirmedClaim {
 }
 
 enum UnconfirmedCleanup {
+    NotAuthorized(String),
     CommandSucceeded,
     CommandFailed(String),
 }
@@ -429,44 +433,100 @@ impl UnconfirmedCleanup {
     }
 }
 
+#[derive(Clone)]
+struct MatchedServerIdentity {
+    server: OwnedServer,
+    sessions: u32,
+}
+
+struct FailedClaimCleanupProof {
+    server: OwnedServer,
+}
+
+impl MatchedServerIdentity {
+    fn observe(destination: &RestoreDestination, expected_token: &str) -> Result<Self, String> {
+        let first = read_server_observation(destination)?;
+        let process = OwnedProcessIdentity::capture(first.process_id)?;
+        let token = read_owner_token(destination)?;
+        if token != expected_token {
+            return Err("target ownership token does not match this claim attempt".to_owned());
+        }
+        let confirmed = read_server_observation(destination)?;
+        if confirmed.process_id != first.process_id || confirmed.start_time != first.start_time {
+            return Err("target server identity changed during claim observation".to_owned());
+        }
+        process.ensure_same_live()?;
+        Ok(Self {
+            server: OwnedServer {
+                destination: destination.clone(),
+                token,
+                process,
+                start_time: confirmed.start_time,
+            },
+            sessions: confirmed.sessions,
+        })
+    }
+
+    fn cleanup_proof(&self) -> Result<FailedClaimCleanupProof, String> {
+        if self.sessions != 0 {
+            return Err("the matched target has sessions and cannot be cleaned up".to_owned());
+        }
+        Ok(FailedClaimCleanupProof {
+            server: self.server.clone(),
+        })
+    }
+}
+
+impl FailedClaimCleanupProof {
+    fn remove_if_still_owned(&self) -> Result<(), String> {
+        self.server.ensure_cleanup_identity()?;
+        self.server
+            .run_cleanup_guarded(&[os("kill-server")], "remove unconfirmed restore target")?;
+        Ok(())
+    }
+}
+
 impl UnconfirmedClaim {
     fn confirm(self) -> Result<OwnedServer, TargetClaimFailure> {
-        let verification = read_server_observation(&self.destination).and_then(|server| {
-            let observed_token = read_owner_token(&self.destination)?;
-            if observed_token != self.token || server.sessions != 0 {
-                return Err("target ownership was not established after start-server".to_owned());
-            }
-            Ok(server)
-        });
-        match verification {
-            Ok(server) => {
-                let process = match OwnedProcessIdentity::capture(server.process_id) {
-                    Ok(process) => process,
-                    Err(reason) => {
-                        return Err(self.into_failure(format!(
-                            "target process identity was unavailable after start-server: {reason}"
-                        )));
-                    }
-                };
-                Ok(OwnedServer {
-                    process,
-                    destination: self.destination,
-                    token: self.token,
-                    start_time: server.start_time,
-                })
-            }
-            Err(reason) => Err(self.into_failure(reason)),
+        let matched = match MatchedServerIdentity::observe(&self.destination, &self.token) {
+            Ok(matched) => matched,
+            Err(reason) => return Err(self.into_failure(reason)),
+        };
+        if matched.sessions != 0 {
+            return Err(self.into_failure_with_observation(
+                "target ownership was not established after start-server",
+                Some(matched),
+            ));
         }
+        Ok(matched.server)
     }
 
     fn into_failure(self, reason: impl Into<String>) -> TargetClaimFailure {
-        let owned_process = self.observed_owned_process();
-        let cleanup_attempt = match self.remove_if_still_owned() {
-            Ok(()) => UnconfirmedCleanup::CommandSucceeded,
-            Err(failure) => UnconfirmedCleanup::CommandFailed(safe_text(failure.as_bytes())),
+        let matched = MatchedServerIdentity::observe(&self.destination, &self.token).ok();
+        self.into_failure_with_observation(reason, matched)
+    }
+
+    fn into_failure_with_observation(
+        self,
+        reason: impl Into<String>,
+        matched: Option<MatchedServerIdentity>,
+    ) -> TargetClaimFailure {
+        let cleanup_attempt = match matched
+            .as_ref()
+            .ok_or_else(|| "complete matching cleanup evidence was unavailable".to_owned())
+            .and_then(MatchedServerIdentity::cleanup_proof)
+        {
+            Ok(proof) => match proof.remove_if_still_owned() {
+                Ok(()) => UnconfirmedCleanup::CommandSucceeded,
+                Err(failure) => UnconfirmedCleanup::CommandFailed(safe_text(failure.as_bytes())),
+            },
+            Err(reason) => UnconfirmedCleanup::NotAuthorized(reason),
         };
-        let disposition = self.observe_cleanup_disposition(owned_process, &cleanup_attempt);
+        let disposition = self.observe_cleanup_disposition(matched.as_ref(), &cleanup_attempt);
         let cleanup = match (disposition, &cleanup_attempt) {
+            (disposition, UnconfirmedCleanup::NotAuthorized(failure)) => format!(
+                "unconfirmed-target cleanup was not authorized: {failure}; final disposition: {disposition:?}"
+            ),
             (TargetDisposition::Removed, UnconfirmedCleanup::CommandSucceeded) => {
                 "unconfirmed target was observably removed".to_owned()
             }
@@ -486,63 +546,34 @@ impl UnconfirmedClaim {
         )
     }
 
-    fn observed_owned_process(&self) -> Option<OwnedProcessIdentity> {
-        let server = read_server_observation(&self.destination).ok()?;
-        let token = read_owner_token(&self.destination).ok()?;
-        (token == self.token)
-            .then(|| OwnedProcessIdentity::capture(server.process_id).ok())
-            .flatten()
-    }
-
-    fn remove_if_still_owned(&self) -> Result<(), String> {
-        let marker = format!("TMUX_RESCUE_UNCONFIRMED_NOT_OWNED_{}", self.token);
-        let condition = ["#{==:#{@tmux_rescue_owner},", &self.token, "}"].concat();
-        let output = run_target_stdout(
-            &self.destination,
-            &[
-                os("if-shell"),
-                os("-F"),
-                os(condition),
-                tmux_command(&[os("kill-server")]),
-                tmux_command(&[os("display-message"), os("-p"), os(&marker)]),
-            ],
-            "remove unconfirmed restore target",
-        )?;
-        if output == format!("{marker}\n").as_bytes() {
-            return Err("ownership token did not match; target was left untouched".to_owned());
-        }
-        Ok(())
-    }
-
     fn observe_cleanup_disposition(
         &self,
-        owned_process: Option<OwnedProcessIdentity>,
+        matched: Option<&MatchedServerIdentity>,
         cleanup: &UnconfirmedCleanup,
     ) -> TargetDisposition {
+        if matches!(cleanup, UnconfirmedCleanup::NotAuthorized(_)) {
+            return self.current_cleanup_disposition(matched, cleanup);
+        }
         for _ in 0..ROLLBACK_OBSERVATION_ATTEMPTS {
-            let disposition = self.current_cleanup_disposition(owned_process, cleanup);
+            let disposition = self.current_cleanup_disposition(matched, cleanup);
             if disposition == TargetDisposition::Removed {
                 return disposition;
             }
             thread::sleep(ROLLBACK_OBSERVATION_INTERVAL);
         }
-        self.current_cleanup_disposition(owned_process, cleanup)
+        self.current_cleanup_disposition(matched, cleanup)
     }
 
     fn current_cleanup_disposition(
         &self,
-        owned_process: Option<OwnedProcessIdentity>,
+        matched: Option<&MatchedServerIdentity>,
         cleanup: &UnconfirmedCleanup,
     ) -> TargetDisposition {
-        match read_owner_token(&self.destination) {
-            Ok(token) if token == self.token => TargetDisposition::Retained,
-            Ok(_) => TargetDisposition::Unknown,
-            Err(_) => match owned_process {
-                Some(identity) => identity.disposition_when_endpoint_is_absent(true),
-                None if cleanup.permits_absent_endpoint_as_removal() => TargetDisposition::Removed,
-                None => TargetDisposition::Unknown,
-            },
-        }
+        matched.map_or(TargetDisposition::Unknown, |matched| {
+            matched
+                .server
+                .observe_disposition(cleanup.permits_absent_endpoint_as_removal())
+        })
     }
 }
 
@@ -1115,14 +1146,36 @@ impl OwnedServer {
         ["#{&&:", &token, ",#{&&:", &process, ",", &start, "}}"].concat()
     }
 
+    fn cleanup_condition(&self) -> String {
+        ["#{&&:", &self.condition(), ",#{==:#{server_sessions},0}}"].concat()
+    }
+
     fn run_guarded(&self, command: &[OsString], operation: &str) -> Result<Vec<u8>, String> {
+        self.run_with_condition(&self.condition(), command, operation)
+    }
+
+    fn run_cleanup_guarded(
+        &self,
+        command: &[OsString],
+        operation: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.run_with_condition(&self.cleanup_condition(), command, operation)
+    }
+
+    fn run_with_condition(
+        &self,
+        condition: &str,
+        command: &[OsString],
+        operation: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.process.ensure_same_live()?;
         let marker = format!("TMUX_RESCUE_OWNERSHIP_LOST_{}", self.token);
         let output = run_target_stdout(
             &self.destination,
             &[
                 os("if-shell"),
                 os("-F"),
-                os(self.condition()),
+                os(condition),
                 tmux_command(command),
                 tmux_command(&[os("display-message"), os("-p"), os(&marker)]),
             ],
@@ -1151,6 +1204,9 @@ impl OwnedServer {
         commands: &[Vec<OsString>],
         operation: &str,
     ) -> Result<(), ConditionalFailure> {
+        self.process
+            .ensure_same_live()
+            .map_err(ConditionalFailure::Failed)?;
         let marker = format!("TMUX_RESCUE_INPUT_BLOCKED_{}", self.token);
         let output = run_target_stdout(
             &self.destination,
@@ -1199,21 +1255,45 @@ impl OwnedServer {
     }
 
     fn observe_disposition(&self, removed_if_absent: bool) -> TargetDisposition {
-        match self.matches_live_server() {
-            Ok(true) => TargetDisposition::Retained,
-            Ok(false) => TargetDisposition::Unknown,
-            Err(_) => self
-                .process
-                .disposition_when_endpoint_is_absent(removed_if_absent),
+        let observation = match read_server_observation(&self.destination) {
+            Ok(observation) => observation,
+            Err(_) => {
+                return self
+                    .process
+                    .disposition_when_endpoint_is_absent(removed_if_absent);
+            }
+        };
+        let token = match read_owner_token(&self.destination) {
+            Ok(token) => token,
+            Err(_) => return TargetDisposition::Unknown,
+        };
+        if token == self.token
+            && observation.process_id == self.process.process_id
+            && observation.start_time == self.start_time
+            && matches!(
+                observe_owned_process(self.process),
+                OwnedProcessState::SameLiveProcess
+            )
+        {
+            TargetDisposition::Retained
+        } else {
+            TargetDisposition::Unknown
         }
     }
 
-    fn matches_live_server(&self) -> Result<bool, String> {
+    fn ensure_cleanup_identity(&self) -> Result<(), String> {
         let observation = read_server_observation(&self.destination)?;
         let token = read_owner_token(&self.destination)?;
-        Ok(token == self.token
-            && observation.process_id == self.process.process_id
-            && observation.start_time == self.start_time)
+        if token != self.token
+            || observation.process_id != self.process.process_id
+            || observation.start_time != self.start_time
+        {
+            return Err("unconfirmed target identity changed before cleanup".to_owned());
+        }
+        if observation.sessions != 0 {
+            return Err("unconfirmed target acquired sessions before cleanup".to_owned());
+        }
+        self.process.ensure_same_live()
     }
 }
 
@@ -1246,6 +1326,20 @@ impl OwnedProcessIdentity {
             }
             OwnedProcessState::GoneOrReused => TargetDisposition::Missing,
             OwnedProcessState::Indeterminate => TargetDisposition::Unknown,
+        }
+    }
+
+    fn ensure_same_live(self) -> Result<(), String> {
+        match observe_owned_process(self) {
+            OwnedProcessState::SameLiveProcess => Ok(()),
+            OwnedProcessState::GoneOrReused => Err(format!(
+                "owned server process {} is gone or has been replaced",
+                self.process_id
+            )),
+            OwnedProcessState::Indeterminate => Err(format!(
+                "owned server process {} could not be verified",
+                self.process_id
+            )),
         }
     }
 }
