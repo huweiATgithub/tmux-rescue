@@ -129,7 +129,7 @@ impl InspectView {
             count_noun(self.contents.panes, "pane", "panes"),
         )
         .unwrap();
-        write!(output, "Programs    ").unwrap();
+        write!(output, "Programs     ").unwrap();
         for (position, program) in self.programs.iter().enumerate() {
             if position > 0 {
                 output.push_str(" · ");
@@ -613,6 +613,71 @@ mod tests {
         })
     }
 
+    fn topology_fixture() -> Value {
+        json!({
+            "captured_at": "2026-07-24T05:31:32.581307924+08:00",
+            "source": encoded("/tmp/tmux-1000/default"),
+            "consistency": {"kind": "stable"},
+            "sessions": [
+                {
+                    "name": "MetaNC",
+                    "working_directory": encoded("/home/huwei/projects/MetaNC"),
+                    "windows": [
+                        {
+                            "source_index": 0,
+                            "name": "node",
+                            "panes": [
+                                {
+                                    "source_index": 0,
+                                    "working_directory": encoded("/home/huwei/projects/MetaNC"),
+                                    "recovery": {
+                                        "kind": "automatic",
+                                        "recovery": {
+                                            "kind": "codex",
+                                            "session_id": "019f7ac5-a55c-7e70-8b31-872ae70c9a94",
+                                        },
+                                    },
+                                },
+                                {
+                                    "source_index": 1,
+                                    "working_directory": encoded("/home/huwei/projects/MetaNC"),
+                                    "recovery": {"kind": "idle"},
+                                },
+                            ],
+                        },
+                        {
+                            "source_index": 1,
+                            "name": "zsh",
+                            "panes": [{
+                                "source_index": 0,
+                                "working_directory": encoded(
+                                    "/home/huwei/projects/MetaNC/.worktrees/inspect",
+                                ),
+                                "recovery": {
+                                    "kind": "unavailable",
+                                    "failure": "foreground process disappeared",
+                                },
+                            }],
+                        },
+                    ],
+                },
+                {
+                    "name": "notes",
+                    "working_directory": encoded("/home/huwei/notes"),
+                    "windows": [{
+                        "source_index": 4,
+                        "name": "shell",
+                        "panes": [{
+                            "source_index": 2,
+                            "working_directory": encoded("/home/huwei/notes"),
+                            "recovery": {"kind": "idle"},
+                        }],
+                    }],
+                },
+            ],
+        })
+    }
+
     #[test]
     fn encodes_lossless_values_without_terminal_controls() {
         assert_eq!(display_bytes(b"/tmp/plain"), "/tmp/plain");
@@ -675,5 +740,68 @@ mod tests {
         assert!(output.contains("[0] manual"));
         assert!(!output.contains("Automatic"));
         assert!(!output.contains("Manual"));
+    }
+
+    #[test]
+    fn renders_complete_plain_snapshot_tree() {
+        let (_directory, loaded) = load_fixture(topology_fixture());
+        let expected = format!(
+            concat!(
+                "Snapshot     explicit\n",
+                "Captured     2026-07-24T05:31:32.581307924+08:00\n",
+                "Source       /tmp/tmux-1000/default\n",
+                "Consistency  ● stable topology\n",
+                "File         {}\n",
+                "\n",
+                "Contents     2 sessions · 3 windows · 4 panes\n",
+                "Programs     1 Codex · 2 shells · 1 not captured\n",
+                "\n",
+                "◆ MetaNC · 2 windows · 3 panes\n",
+                "  cwd /home/huwei/projects/MetaNC\n",
+                "├─ [0] node\n",
+                "│  ├─ [0] Codex\n",
+                "│  │      session 019f7ac5-a55c-7e70-8b31-872ae70c9a94\n",
+                "│  │      cwd = session\n",
+                "│  └─ [1] shell\n",
+                "│         cwd = session\n",
+                "└─ [1] zsh\n",
+                "   └─ [0] ! program not captured\n",
+                "          reason foreground process disappeared\n",
+                "          cwd /home/huwei/projects/MetaNC/.worktrees/inspect\n",
+                "\n",
+                "◆ notes · 1 window · 1 pane\n",
+                "  cwd /home/huwei/notes\n",
+                "└─ [4] shell\n",
+                "   └─ [2] shell\n",
+                "          cwd = session\n",
+            ),
+            loaded.path().display(),
+        );
+
+        assert_eq!(
+            render(
+                &loaded,
+                &crate::cli::SnapshotSelection::Explicit(loaded.path().to_owned()),
+                Palette::plain(),
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn unstable_warning_keeps_the_complete_tree() {
+        let mut fixture = topology_fixture();
+        fixture["consistency"] = json!({"kind": "unstable", "attempts": 3});
+        let (_directory, loaded) = load_fixture(fixture);
+
+        let output = render(
+            &loaded,
+            &crate::cli::SnapshotSelection::Latest,
+            Palette::plain(),
+        );
+
+        assert!(output.contains("Consistency  ▲ unstable topology after 3 attempts\n"));
+        assert!(output.contains("◆ notes · 1 window · 1 pane"));
+        assert!(output.ends_with("   └─ [2] shell\n          cwd = session\n"));
     }
 }
