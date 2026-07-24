@@ -455,10 +455,17 @@ case " $* " in
     ;;
   *' if-shell '*)
     if [ "$FAKE_TMUX_SCENARIO" = 'token_changed_before_guard' ]; then
-      printf 'TMUX_RESCUE_OWNERSHIP_LOST_%s\n' "$(cat "$FAKE_TMUX_STATE")"
-      exit 0
+      expected_owner=$(cat "$FAKE_TMUX_STATE")
+      printf 'replacement-owner\n' > "$FAKE_TMUX_STATE"
+      case " $* " in
+        *'#{==:#{@tmux_rescue_owner},'"$expected_owner"'}'*)
+          printf 'TMUX_RESCUE_OWNERSHIP_LOST_%s\n' "$expected_owner"
+          exit 0
+          ;;
+      esac
     fi
     : > "$FAKE_TMUX_REMOVED"
+    printf 'KILL_EXECUTED\n' >> "$FAKE_TMUX_LOG"
     kill "$FAKE_SERVER_PID" 2>/dev/null || true
     exit 0
     ;;
@@ -1055,7 +1062,7 @@ fn owner_token_change_before_guarded_command_blocks_mutation() {
         .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
     let _scenario = EnvironmentGuard::set("FAKE_TMUX_SCENARIO", "token_changed_before_guard");
 
-    assert!(matches!(owned.rollback(), RollbackOutcome::Failed(_)));
+    let outcome = owned.rollback();
     let log = fs::read(&log_path).unwrap();
     assert!(
         !log.windows(b"KILL_EXECUTED\n".len())
@@ -1063,6 +1070,7 @@ fn owner_token_change_before_guarded_command_blocks_mutation() {
         "the guarded command ran after the owner token changed: {}",
         String::from_utf8_lossy(&log)
     );
+    assert!(matches!(outcome, RollbackOutcome::Failed(_)));
 }
 
 #[test]
