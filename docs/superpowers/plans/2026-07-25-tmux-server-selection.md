@@ -124,7 +124,7 @@
 
 This is intentionally one vertical slice. Removing `TmuxServerIdentity` or changing `plan_restore` without adapting the binary leaves an uncompilable intermediate commit; a temporary compatibility layer would add exactly the duplicate target meaning this design removes.
 
-- [ ] **Step 1: Rewrite restore-plan tests around `RestoreDestination`**
+- [x] **Step 1: Rewrite restore-plan tests around `RestoreDestination`**
 
   Replace path-vacancy fixtures with selector fixtures and assert:
 
@@ -137,7 +137,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Delete planning tests whose only behavior was probing an existing/refused socket. Do not replace them with a deleted-`--target` compatibility test.
 
-- [ ] **Step 2: Rewrite fake-executor tests so claim is the first target action**
+- [x] **Step 2: Rewrite fake-executor tests so claim is the first target action**
 
   Change the fake `RestoreEnvironment` to expose only shell/home/directory/executable facts. Change the fake target capability so its first action is:
 
@@ -152,13 +152,13 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
   - claim failure produces no topology or recovery call;
   - successful claim still gates topology, recovery, and rollback.
 
-- [ ] **Step 3: Add failing parser and dispatch tests**
+- [x] **Step 3: Add failing parser and dispatch tests**
 
   Cover no selector, one `-L`, and one `-S` before both `snapshot` and `restore`. Assert rejection for mixed selectors in both orders, repeated `-L`, repeated `-S`, selectors after either supported subcommand, selectors with `inspect`, and missing selector arguments.
 
   Pass a Unix non-UTF-8 `OsString` through `Cli::try_parse_from` and assert byte equality in the refined request. Preserve selector-free inspect tests. Do not add a test focused on removal of `--target`.
 
-- [ ] **Step 4: Add failing source and target command tests**
+- [x] **Step 4: Add failing source and target command tests**
 
   Source tests must prove:
 
@@ -172,7 +172,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Do not assert tmux-rescue behavior for `TMUX_TMPDIR`, UID directories, canonicalization, or relative-path resolution.
 
-- [ ] **Step 5: Run every changed suite and confirm RED**
+- [x] **Step 5: Run every changed suite and confirm RED**
 
   Run:
 
@@ -187,7 +187,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Expected failures: the root parser has no selectors, source commands cannot retain an explicit selector, planning still probes an absolute target path, rendering still reports vacancy, and execution still rechecks before claim.
 
-- [ ] **Step 6: Replace the path/vacancy model with a refined destination**
+- [x] **Step 6: Replace the path/vacancy model with a refined destination**
 
   In `src/restore.rs`, add:
 
@@ -230,7 +230,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   `RestoreExecutor` calls `claim` directly. Preserve the existing owned-target, topology, recovery, rollback, result, and pane-outcome contracts.
 
-- [ ] **Step 7: Parse root selectors into command-specific requests**
+- [x] **Step 7: Parse root selectors into command-specific requests**
 
   Use a private Clap-derived `RawCli` with non-global root fields:
 
@@ -260,7 +260,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Change `CliRunner::snapshot` to accept `SnapshotRequest`. Delete `RestoreTarget`, `RestoreTargetParser`, and absolute-path validation. Dispatch only forwards already-refined requests.
 
-- [ ] **Step 8: Retain selectors through source and target command builders**
+- [x] **Step 8: Retain selectors through source and target command builders**
 
   Refine source discovery through:
 
@@ -283,7 +283,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Both append through `TmuxSelector::append_to`; only the no-start builder adds `-N`. Keep target working directory and selector-relevant environment stable. Remove `socket_path` from ownership observations and all expected-path comparisons.
 
-- [ ] **Step 9: Wire the binary without a write-capable plan-only dependency**
+- [x] **Step 9: Wire the binary without a write-capable plan-only dependency**
 
   Pass `SnapshotRequest.selector` to source discovery and `RestoreRequest.selector` to `plan_restore`. Snapshot loading remains independent: no path loads global `latest`, while a path loads that immutable snapshot.
 
@@ -291,7 +291,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Put target construction behind an internal injected factory closure. Add a binary unit test whose factory records construction and fails if invoked in plan-only mode. Add a `--run` ordering test that records plan flush before factory construction. The system entry point supplies `TmuxRestoreAdapter::new`; only its run branch invokes the factory.
 
-- [ ] **Step 10: Run all affected targets and an all-target compile gate**
+- [x] **Step 10: Run all affected targets and an all-target compile gate**
 
   Run:
 
@@ -308,7 +308,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Inspect `rg -n -- '--target' src tests`; active code and tests must have no match, but do not add a removal-specific test.
 
-- [ ] **Step 11: Commit the compiling vertical slice**
+- [x] **Step 11: Commit the compiling vertical slice**
 
   ```bash
   git add src/cli.rs src/main.rs src/restore.rs src/tmux.rs tests/cli.rs tests/restore_plan.rs tests/restore_execute.rs tests/tmux_source.rs tests/tmux_target.rs
