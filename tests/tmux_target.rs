@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tmux_rescue::{
@@ -1254,6 +1254,14 @@ fn endpoint_replacement_before_recovery_input_dispatches_no_tmux_command() {
     owned
         .create_topology(&plan)
         .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    let original_server_pid = String::from_utf8(selected_tmux_stdout(
+        &selector,
+        &["display-message", "-p", "#{pid}"],
+    ))
+    .unwrap()
+    .trim()
+    .parse::<u32>()
+    .unwrap();
     require_success(
         "stop original owned server",
         selected_tmux(&selector, true)
@@ -1261,6 +1269,18 @@ fn endpoint_replacement_before_recovery_input_dispatches_no_tmux_command() {
             .output()
             .unwrap(),
     );
+    let original_process = PathBuf::from(format!("/proc/{original_server_pid}"));
+    let process_exit_deadline = Instant::now() + Duration::from_secs(2);
+    while original_process.exists() && Instant::now() < process_exit_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !original_process.exists(),
+        "original owned server process did not exit before replacement"
+    );
+    if socket.exists() {
+        fs::remove_file(&socket).unwrap();
+    }
     let _replacement = SelectedServerGuard::start_preexisting(selector, temp.path());
     let mut recovery = owned.begin_recovery();
     let (log_path, _proxy) = install_logging_tmux_proxy(temp.path());
