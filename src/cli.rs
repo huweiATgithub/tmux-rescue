@@ -15,7 +15,7 @@ use tmux_rescue::{
     TmuxRestoreAdapter, TmuxServerIdentity, TopologyReadPhase, capture_snapshot, plan_restore,
 };
 
-use crate::inspect::{Palette, render};
+use crate::inspect::{Palette, is_unicode_display_control, render};
 
 pub const EXIT_SUCCESS: u8 = 0;
 pub const EXIT_FAILURE: u8 = 1;
@@ -687,7 +687,7 @@ fn safe_text(value: &str) -> String {
     const MAX_CLI_DIAGNOSTIC_BYTES: usize = 4 * 1024;
     let mut output = String::new();
     for character in value.chars() {
-        let fragment = if character.is_control() {
+        let fragment = if character.is_control() || is_unicode_display_control(character) {
             character.escape_default().to_string()
         } else {
             character.to_string()
@@ -1019,6 +1019,42 @@ mod tests {
             String::from_utf8(stderr).unwrap(),
             "\x1b[31merror:\x1b[0m write CLI output: closed stdout\n"
         );
+    }
+
+    #[test]
+    fn inspect_failure_escapes_unicode_display_controls_on_stderr() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory
+            .path()
+            .join("before\u{202e}middle\u{2028}after\u{2029}.json");
+        let request = InspectRequest {
+            selection: SnapshotSelection::Explicit(snapshot),
+            color: ColorMode::Never,
+            icons: IconMode::Unicode,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut runner = SystemCliRunner::with_color_support(
+            &mut stdout,
+            &mut stderr,
+            TerminalColorSupport::new(false, false),
+        );
+
+        assert_eq!(runner.inspect(request), EXIT_FAILURE);
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        for character in ['\u{2028}', '\u{2029}', '\u{202e}'] {
+            assert!(
+                !stderr.contains(character),
+                "raw {character:?} in fatal stderr: {stderr:?}"
+            );
+        }
+        for escaped in ["\\u{2028}", "\\u{2029}", "\\u{202e}"] {
+            assert!(
+                stderr.contains(escaped),
+                "missing {escaped:?} in fatal stderr: {stderr:?}"
+            );
+        }
     }
 
     #[test]

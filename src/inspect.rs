@@ -238,7 +238,7 @@ impl InspectView {
             if position > 0 {
                 output.push_str(" · ");
             }
-            write!(output, "{} {}", program.count, program.visible_label()).unwrap();
+            write!(output, "{} {}", program.count, program.visible_label).unwrap();
         }
         output.push_str("\n\n");
 
@@ -283,13 +283,40 @@ impl Contents {
 
 #[derive(Debug, Eq, PartialEq)]
 struct ProgramEntry {
-    identity: String,
+    visible_label: String,
     count: usize,
 }
 
 impl ProgramEntry {
     fn from_sessions(sessions: &[SessionView]) -> Vec<Self> {
+        let identities = ProgramIdentityCount::from_sessions(sessions);
         let mut programs: Vec<Self> = Vec::new();
+        let mut indexes: HashMap<&str, usize> = HashMap::new();
+        for identity in &identities {
+            let visible_label = identity.visible_label();
+            if let Some(index) = indexes.get(visible_label).copied() {
+                programs[index].count += identity.count;
+            } else {
+                indexes.insert(visible_label, programs.len());
+                programs.push(Self {
+                    visible_label: visible_label.to_owned(),
+                    count: identity.count,
+                });
+            }
+        }
+        programs
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ProgramIdentityCount {
+    identity: String,
+    count: usize,
+}
+
+impl ProgramIdentityCount {
+    fn from_sessions(sessions: &[SessionView]) -> Vec<Self> {
+        let mut identities: Vec<Self> = Vec::new();
         let mut indexes: HashMap<&str, usize> = HashMap::new();
         for pane in sessions
             .iter()
@@ -298,16 +325,16 @@ impl ProgramEntry {
         {
             let identity = pane.fact.program_identity();
             if let Some(index) = indexes.get(identity).copied() {
-                programs[index].count += 1;
+                identities[index].count += 1;
             } else {
-                indexes.insert(identity, programs.len());
-                programs.push(Self {
+                indexes.insert(identity, identities.len());
+                identities.push(Self {
                     identity: identity.to_owned(),
                     count: 1,
                 });
             }
         }
-        programs
+        identities
     }
 
     fn visible_label(&self) -> &str {
@@ -629,7 +656,7 @@ fn push_display_character(display: &mut String, character: char) {
     }
 }
 
-fn is_unicode_display_control(character: char) -> bool {
+pub(crate) fn is_unicode_display_control(character: char) -> bool {
     matches!(
         u32::from(character),
         0x061c | 0x200e..=0x200f | 0x2028..=0x202e | 0x2066..=0x206f
@@ -706,6 +733,32 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let loaded = StateStore::load_explicit_path(&path).unwrap();
         (directory, loaded)
+    }
+
+    fn styled_spans(output: &str) -> Vec<(&str, &str)> {
+        let mut spans = Vec::new();
+        let mut rest = output;
+        while let Some((plain_prefix, after_open)) = rest.split_once("\x1b[") {
+            assert!(
+                !plain_prefix.contains('\x1b'),
+                "unexpected ANSI escape in {plain_prefix:?}"
+            );
+            let (style, after_style) = after_open
+                .split_once('m')
+                .expect("ANSI style has a terminating m");
+            assert_ne!(style, "0", "unexpected standalone ANSI reset");
+            let (text, after_reset) = after_style
+                .split_once("\x1b[0m")
+                .expect("ANSI-styled span has an immediate reset");
+            assert!(
+                !text.contains('\x1b'),
+                "nested ANSI escape in styled span {text:?}"
+            );
+            spans.push((style, text));
+            rest = after_reset;
+        }
+        assert!(!rest.contains('\x1b'), "unexpected trailing ANSI escape");
+        spans
     }
 
     fn mapped_recovery_fixture() -> Value {
@@ -956,16 +1009,66 @@ mod tests {
         assert_eq!(
             programs.first(),
             Some(&ProgramEntry {
-                identity: "program-0000".to_owned(),
+                visible_label: "program-0000".to_owned(),
                 count: 2,
             })
         );
         assert_eq!(
             programs.last(),
             Some(&ProgramEntry {
-                identity: "program-4095".to_owned(),
+                visible_label: "program-4095".to_owned(),
                 count: 2,
             })
+        );
+    }
+
+    #[test]
+    fn coalesces_colliding_visible_program_labels() {
+        let fixture = json!({
+            "captured_at": "2026-07-24T00:00:00Z",
+            "source": encoded("/tmp/source"),
+            "consistency": {"kind": "stable"},
+            "sessions": [{
+                "name": "work",
+                "working_directory": encoded("/workspace"),
+                "windows": [{
+                    "source_index": 0,
+                    "name": "shells",
+                    "panes": [
+                        {
+                            "source_index": 0,
+                            "working_directory": encoded("/workspace"),
+                            "recovery": {"kind": "idle"},
+                        },
+                        {
+                            "source_index": 1,
+                            "working_directory": encoded("/workspace"),
+                            "recovery": {"kind": "idle"},
+                        },
+                        {
+                            "source_index": 2,
+                            "working_directory": encoded("/workspace"),
+                            "recovery": {
+                                "kind": "manual",
+                                "command": command("/usr/bin/shells", &["shells"]),
+                            },
+                        },
+                    ],
+                }],
+            }],
+        });
+        let (_directory, loaded) = load_fixture(fixture);
+
+        let output = render(
+            &loaded,
+            &crate::cli::SnapshotSelection::Latest,
+            Palette::plain(),
+            IconMode::Unicode,
+        );
+
+        assert!(
+            output.contains("Programs     3 shells\n"),
+            "visible program labels did not coalesce:\n{output}"
         );
     }
 
@@ -1001,6 +1104,10 @@ mod tests {
         }
         assert!(output.contains("◆ automatic"));
         assert!(output.contains("[0] manual"));
+        assert!(output.contains(concat!(
+            "Programs     1 shell · 1 Codex · 1 Claude Code · 1 mdbook · ",
+            "1 book · 1 tmux-rescue · 1 not captured\n",
+        )));
         assert!(!output.contains("Automatic"));
         assert!(!output.contains("Manual"));
     }
@@ -1109,25 +1216,28 @@ mod tests {
         let plain = render(&loaded, &selection, Palette::plain(), IconMode::Unicode);
         let colored = render(&loaded, &selection, Palette::colored(), IconMode::Unicode);
 
-        for expected in [
-            "Snapshot     \x1b[1mexplicit\x1b[0m\n",
-            "Consistency  \x1b[32m●\x1b[0m stable topology\n",
-            "\x1b[36m◆\x1b[0m \x1b[1mMetaNC\x1b[0m · 2 windows · 3 panes\n",
-            "├─ [0] \x1b[1mnode\x1b[0m\n",
-            "│  ├─ (0) \x1b[1mCodex\x1b[0m\n",
-            "│  └─ (1) \x1b[1mshell\x1b[0m\n",
-            "\x1b[33m!\x1b[0m \x1b[1mprogram not captured\x1b[0m\n",
-        ] {
-            assert!(
-                colored.contains(expected),
-                "missing styled token {expected:?} in:\n{colored}"
-            );
-        }
-        assert!(colored.contains("Programs     1 Codex · 2 shells · 1 not captured\n\n\x1b[36m◆"));
-        assert!(colored.contains("reason foreground process disappeared\n"));
-        assert!(!colored.contains("\x1b[31m"));
-        assert!(!colored.contains("\x1b[36m├"));
-        assert!(!colored.contains("\x1b[33mreason"));
+        assert_eq!(
+            styled_spans(&colored),
+            vec![
+                ("1", "explicit"),
+                ("32", "●"),
+                ("36", "◆"),
+                ("1", "MetaNC"),
+                ("1", "node"),
+                ("1", "Codex"),
+                ("36", "◆"),
+                ("1", "shell"),
+                ("36", "◆"),
+                ("1", "zsh"),
+                ("33", "!"),
+                ("1", "program not captured"),
+                ("36", "◆"),
+                ("1", "notes"),
+                ("1", "shell"),
+                ("1", "shell"),
+                ("36", "◆"),
+            ]
+        );
 
         let mut stripped = anstream::StripStream::new(Vec::new());
         stripped.write_all(colored.as_bytes()).unwrap();
@@ -1142,10 +1252,29 @@ mod tests {
             Palette::colored(),
             IconMode::Unicode,
         );
-        assert!(unstable.contains(concat!(
-            "Consistency  \x1b[33m▲\x1b[0m ",
-            "\x1b[1munstable topology after 3 attempts\x1b[0m\n",
-        )));
+        assert_eq!(
+            styled_spans(&unstable),
+            vec![
+                ("1", "latest"),
+                ("33", "▲"),
+                ("1", "unstable topology after 3 attempts"),
+                ("36", "◆"),
+                ("1", "MetaNC"),
+                ("1", "node"),
+                ("1", "Codex"),
+                ("36", "◆"),
+                ("1", "shell"),
+                ("36", "◆"),
+                ("1", "zsh"),
+                ("33", "!"),
+                ("1", "program not captured"),
+                ("36", "◆"),
+                ("1", "notes"),
+                ("1", "shell"),
+                ("1", "shell"),
+                ("36", "◆"),
+            ]
+        );
     }
 
     #[test]

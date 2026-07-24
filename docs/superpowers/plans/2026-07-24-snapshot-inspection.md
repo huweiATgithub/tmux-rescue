@@ -87,7 +87,8 @@ assert!(Cli::try_parse_from([
 
 Also parse `never`, accept `--color` before or after `SNAPSHOT`, reject a second positional path, and keep the existing snapshot/restore rejections.
 
-Run: `cargo test --bin tmux-rescue cli::tests::parses_the_exact_command_surface --locked`  
+Run: `cargo test --bin tmux-rescue cli::tests::parses_the_exact_command_surface --locked`
+
 Expected: failure because `Command::Inspect`, `InspectRequest`, `SnapshotSelection`, and `ColorMode` do not exist.
 
 - [ ] **Step 2: Implement typed parsing and request refinement**
@@ -140,14 +141,16 @@ Inspect {
 
 `dispatch` must immediately refine `snapshot.into()` and call `runner.inspect(request)`.
 
-Run: `cargo test --bin tmux-rescue cli::tests::parses_the_exact_command_surface --locked`  
+Run: `cargo test --bin tmux-rescue cli::tests::parses_the_exact_command_surface --locked`
+
 Expected: pass.
 
 - [ ] **Step 3: Add and satisfy a focused dispatch test**
 
 Extend `RecordingRunner` with `inspect_requests: Vec<InspectRequest>` and `inspect_code`. Assert that dispatching `inspect /state/one.json --color never` records exactly one explicit request and returns `inspect_code` without loading a file.
 
-Run: `cargo test --bin tmux-rescue cli::tests::dispatches_without_owning_orchestration --locked`  
+Run: `cargo test --bin tmux-rescue cli::tests::dispatches_without_owning_orchestration --locked`
+
 Expected: pass after extending the trait and all match arms exhaustively.
 
 - [ ] **Step 4: Commit the parsed command boundary**
@@ -182,10 +185,12 @@ termtree = "1.0"
 
 Register `mod inspect;` only in `src/main.rs`; do not export it from `src/lib.rs`. Resolve the lockfile with:
 
-Run: `cargo check --locked`  
+Run: `cargo check --locked`
+
 Expected: lockfile failure because `termtree` is not yet locked.
 
-Run: `cargo check`  
+Run: `cargo check`
+
 Expected: dependency resolution succeeds and records `termtree` 1.0.x.
 
 - [ ] **Step 2: Write failing lossless display-encoding tests**
@@ -215,7 +220,8 @@ assert_eq!(
 
 The empty-slice case is a helper boundary test; validated `CapturedCommand::argv()` itself is never empty.
 
-Run: `cargo test --bin tmux-rescue inspect::tests::encodes_lossless_values_without_terminal_controls --locked`  
+Run: `cargo test --bin tmux-rescue inspect::tests::encodes_lossless_values_without_terminal_controls --locked`
+
 Expected: compile failure because `src/inspect.rs` has no implementation.
 
 - [ ] **Step 3: Implement the terminal-safe encoded value type**
@@ -235,7 +241,8 @@ impl DisplayValue {
 
 Walk maximal valid UTF-8 prefixes with `std::str::from_utf8`. For valid characters, preserve printable Unicode, emit `\\`, `\"`, `\n`, `\r`, and `\t`, and render every other terminal control, Unicode bidirectional control, and line or paragraph separator as `\xNN` when it is one byte or `\u{hex}` otherwise. For each invalid byte in `Utf8Error::error_len()` (or the remaining suffix when it is `None`), emit lowercase `\xNN`. Determine argument quoting from the original bytes so invalid UTF-8, Unicode whitespace, and Unicode display controls cannot be mistaken for safe bare arguments. Apply the same refined display type to validated timestamps, snapshot names, and failure reasons before they reach styling or tree construction.
 
-Run: `cargo test --bin tmux-rescue inspect::tests::encodes_lossless_values_without_terminal_controls --locked`  
+Run: `cargo test --bin tmux-rescue inspect::tests::encodes_lossless_values_without_terminal_controls --locked`
+
 Expected: pass.
 
 - [ ] **Step 4: Write failing typed-view mapping tests**
@@ -249,7 +256,8 @@ Load one validated fixture containing, in order, idle, Codex, Claude Code, mdBoo
 - a different and a non-UTF-8 pane path remains complete;
 - the generated labels contain neither `Automatic` nor `Manual`, while user data named `automatic` and arguments containing `manual` remain unchanged.
 
-Run: `cargo test --bin tmux-rescue inspect::tests::maps_recovery_variants_to_user_facts --locked`  
+Run: `cargo test --bin tmux-rescue inspect::tests::maps_recovery_variants_to_user_facts --locked`
+
 Expected: failure because `InspectView::from_loaded` is absent.
 
 - [ ] **Step 5: Implement private fact mapping and ordered aggregation**
@@ -270,7 +278,8 @@ match pane.recovery() {
 
 Keep first-seen order in a `Vec<ProgramEntry>` and use a `HashMap<&str, usize>` from encoded visible identity to its vector index; do not sort or linearly rescan prior identities. Command identities come from `Path::file_name()` on the captured executable, falling back to the complete encoded executable. Coalesce identical rendered identities, including an idle `shell` and a command executable whose basename is literally `shell`. Inflect only the visible `shell` identity when its total is not one.
 
-Run: `cargo test --bin tmux-rescue inspect::tests::maps_recovery_variants_to_user_facts --locked`  
+Run: `cargo test --bin tmux-rescue inspect::tests::maps_recovery_variants_to_user_facts --locked`
+
 Expected: pass.
 
 - [ ] **Step 6: Commit encoded display facts**
@@ -326,7 +335,8 @@ Programs     1 Codex · 2 shells · 1 not captured
 
 Adjust the fixture itself, not the asserted grammar, so the program and topology counts agree exactly. The test must also assert that the explicit relative `File` value was not canonicalized.
 
-Run: `cargo test --bin tmux-rescue inspect::tests::renders_complete_plain_snapshot_tree --locked`  
+Run: `cargo test --bin tmux-rescue inspect::tests::renders_complete_plain_snapshot_tree --locked`
+
 Expected: failure because the renderer has no header/tree formatting.
 
 - [ ] **Step 2: Implement header, summaries, and termtree geometry**
@@ -346,7 +356,8 @@ const TREE_GLYPHS: termtree::GlyphPalette = termtree::GlyphPalette {
 
 Build each window as a child, each pane as its child, and set multiline mode on pane nodes so `termtree` supplies every continuation connector. Keep the extra five-space detail indentation inside each pane’s display string so continuation text aligns with the approved exact sample. Render session cwd as the second line of the root string. Use a single helper for `session(s)`, `window(s)`, and `pane(s)` so count grammar cannot diverge.
 
-Run: `cargo test --bin tmux-rescue inspect::tests::renders_complete_plain_snapshot_tree --locked`  
+Run: `cargo test --bin tmux-rescue inspect::tests::renders_complete_plain_snapshot_tree --locked`
+
 Expected: pass with the exact approved connectors and whitespace.
 
 - [ ] **Step 3: Add and satisfy an exact unstable-output regression**
@@ -359,7 +370,8 @@ Consistency  ▲ unstable topology after 3 attempts
 
 and that the final pane and final session are both still present. The output remains a complete document; do not return or branch away after formatting the warning.
 
-Run: `cargo test --bin tmux-rescue inspect::tests::unstable_warning_keeps_the_complete_tree --locked`  
+Run: `cargo test --bin tmux-rescue inspect::tests::unstable_warning_keeps_the_complete_tree --locked`
+
 Expected: pass after representing consistency as a display fact rather than an error.
 
 - [ ] **Step 4: Cover timestamp, path, aggregation, and hostile-value edges**
@@ -374,7 +386,8 @@ Add exact-output tests for:
 - user names/arguments containing `automatic`, `manual`, and the bytes `ESC [ 31 m` without producing an actual escape byte;
 - byte-equal and byte-different cwd values whose human-readable prefixes are similar.
 
-Run: `cargo test --bin tmux-rescue inspect::tests --locked`  
+Run: `cargo test --bin tmux-rescue inspect::tests --locked`
+
 Expected: all plain renderer tests pass.
 
 - [ ] **Step 5: Commit the plain tree**
@@ -412,7 +425,8 @@ Render the stable and unstable fixtures with `Palette::colored()` and assert har
 
 Assert no ANSI sequence touches a connector, count, index, path, UUID, executable, reason, `stable topology` phrase, or summary entry. Pass the colored bytes through `anstream::StripStream<Vec<u8>>` and assert exact equality with `Palette::plain()` output.
 
-Run: `cargo test --bin tmux-rescue inspect::tests::forced_color_styles_only_approved_tokens --locked`  
+Run: `cargo test --bin tmux-rescue inspect::tests::forced_color_styles_only_approved_tokens --locked`
+
 Expected: failure because `Palette::colored()` is not yet applied.
 
 - [ ] **Step 2: Implement token-local styling with `anstyle`**
@@ -429,7 +443,8 @@ const RED: anstyle::Style = anstyle::AnsiColor::Red.on_default();
 
 `Palette::paint(style, text)` must return the original text for plain output and `style + text + style.render_reset()` for colored output. Apply styles only after every untrusted value has become a `DisplayValue`. Expose a small `Palette::fatal_prefix()` for `src/cli.rs`; do not duplicate red ANSI literals there.
 
-Run: `cargo test --bin tmux-rescue inspect::tests::forced_color_styles_only_approved_tokens --locked`  
+Run: `cargo test --bin tmux-rescue inspect::tests::forced_color_styles_only_approved_tokens --locked`
+
 Expected: pass, including stripped equality.
 
 - [ ] **Step 3: Add failing color-resolution and fatal-prefix tests**
@@ -447,7 +462,8 @@ assert!(!ColorMode::Never.enabled(true));
 
 Use buffer sinks and forced support values to assert stdout and stderr are independent. A failed inspect with colored stderr must begin `\x1b[31merror:\x1b[0m `; plain stderr begins `error: `. Existing snapshot and restore failures must remain plain.
 
-Run: `cargo test --bin tmux-rescue cli::tests::inspect_color_policy_resolves_per_stream --locked`  
+Run: `cargo test --bin tmux-rescue cli::tests::inspect_color_policy_resolves_per_stream --locked`
+
 Expected: failure because the runner has no color support.
 
 - [ ] **Step 4: Measure real stream support with `anstream`**
@@ -465,7 +481,8 @@ let mut runner = SystemCliRunner::with_color_support(
 
 Do not evaluate environment variables directly or cache a process-global color decision in the renderer; `anstream` owns `NO_COLOR`, `CLICOLOR`, terminal, CI, and platform detection. `ColorMode::Always` still emits styles when the measured automatic choice is `Never`, while `Never` emits none when it is `Always`.
 
-Run: `cargo test --bin tmux-rescue cli::tests::inspect_color_policy_resolves_per_stream --locked`  
+Run: `cargo test --bin tmux-rescue cli::tests::inspect_color_policy_resolves_per_stream --locked`
+
 Expected: pass.
 
 - [ ] **Step 5: Commit palette and color policy**
@@ -505,7 +522,8 @@ let output = binary()
 
 Assert exit `0`, empty stderr, exact header/tree facts on stdout, and no complaint about HOME, tmux, processes, a target, or preflight.
 
-Run: `cargo test --test cli explicit_inspect_bypasses_state_root_and_live_systems --locked`  
+Run: `cargo test --test cli explicit_inspect_bypasses_state_root_and_live_systems --locked`
+
 Expected: failure because `SystemCliRunner::inspect` does not load or render.
 
 - [ ] **Step 2: Implement selection, rendering, and one-document output**
@@ -524,7 +542,8 @@ let loaded = match &request.selection {
 
 Build the complete `String` before the first stdout write, then `write_all` and `flush`. Return `EXIT_SUCCESS` for either consistency variant. In `SystemCliRunner::inspect`, resolve the stdout palette before calling `run_inspect`; on error, resolve the stderr palette and write only its `fatal_prefix()` plus the existing `safe_text` message. Keep `report_failure` unchanged for snapshot/restore.
 
-Run: `cargo test --test cli explicit_inspect_bypasses_state_root_and_live_systems --locked`  
+Run: `cargo test --test cli explicit_inspect_bypasses_state_root_and_live_systems --locked`
+
 Expected: pass.
 
 - [ ] **Step 3: Add latest, unstable, and unavailable integration tests**
@@ -536,7 +555,8 @@ Create `$XDG_STATE_HOME/tmux-rescue/snapshots/<name>.json` and a relative `lates
 - an unstable latest snapshot exits `0`, stdout contains the yellow-free warning in `--color never` and its final pane/session, and stderr is empty;
 - an unavailable pane is followed by the next pane in stdout and does not alter exit status.
 
-Run: `cargo test --test cli inspect --locked`  
+Run: `cargo test --test cli inspect --locked`
+
 Expected: pass.
 
 - [ ] **Step 4: Add fatal load/validation and output-failure tests**
@@ -545,7 +565,8 @@ At binary level, cover a missing explicit file, missing latest pointer, escaping
 
 At unit level, pass a `Write` implementation that always returns `BrokenPipe` into `run_inspect`; assert it returns `CliError("write CLI output: ...")`. Then exercise `SystemCliRunner::inspect` with a writable stderr to assert exit `1` and best-effort error reporting.
 
-Run: `cargo test --test cli --locked`  
+Run: `cargo test --test cli --locked`
+
 Expected: all inspection integration cases pass.
 
 - [ ] **Step 5: Add compiled-binary color-policy tests**
@@ -560,7 +581,8 @@ Because `Command::output` redirects streams, assert:
 - stripping the `always` stdout equals the `never` stdout exactly;
 - an invalid explicit snapshot with `--color always` colors only the fatal `error:` prefix on stderr and leaves stdout empty.
 
-Run: `cargo test --test cli inspect_color --locked`  
+Run: `cargo test --test cli inspect_color --locked`
+
 Expected: pass.
 
 - [ ] **Step 6: Commit CLI orchestration and integration coverage**
@@ -614,7 +636,8 @@ State exit `0` for stable, unstable, and unavailable-pane snapshots; exit `1` wi
 
 - [ ] **Step 4: Verify documentation and commit**
 
-Run: `mdbook build docs`  
+Run: `mdbook build docs`
+
 Expected: successful book build with no broken local references.
 
 ```bash
@@ -670,7 +693,8 @@ Inspect `git diff main...HEAD` and mechanically check:
 - unstable and unavailable fixtures reach the final tree node with exit `0`;
 - every changed line traces to inspection, documentation, or its direct dependency/test support.
 
-Run: `rg -n "TODO|TBD|FIXME|placeholder" src/inspect.rs src/cli.rs tests/cli.rs README.md docs/src/DESIGN.md docs/src/ARCHITECTURE.md`  
+Run: `rg -n "TODO|TBD|FIXME|placeholder" src/inspect.rs src/cli.rs tests/cli.rs README.md docs/src/DESIGN.md docs/src/ARCHITECTURE.md`
+
 Expected: no newly introduced unresolved marker.
 
 - [ ] **Step 5: Request a code review and address only evidence-backed findings**
