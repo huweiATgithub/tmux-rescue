@@ -226,7 +226,7 @@ git commit -m "feat: render compact snapshot trees"
 - Modify: `docs/src/DESIGN.md`
 - Modify: `docs/src/ARCHITECTURE.md`
 
-- [ ] **Step 1: Add a failing compiled-binary Nerd-mode test**
+- [ ] **Step 1: Add compiled-binary Nerd-mode coverage**
 
 Add an integration test that runs an explicit stable fixture with
 `--color never --icons nerd` and asserts exact output ending in:
@@ -245,7 +245,8 @@ continued-rendering proof.
 
 Run: `cargo test --locked --test cli inspect`
 
-Expected: failure until the compiled CLI surface and expected grammar agree.
+Expected: pass against the behavior completed in Task 2. Its red phase is
+already recorded by the renderer tests; this step verifies the binary wiring.
 
 - [ ] **Step 2: Make integration coverage pass**
 
