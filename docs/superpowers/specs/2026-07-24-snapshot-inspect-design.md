@@ -15,7 +15,7 @@ terminology such as `Automatic` or `Manual`.
 ## Command Surface
 
 ```text
-tmux-rescue inspect [SNAPSHOT] [--color <auto|always|never>]
+tmux-rescue inspect [SNAPSHOT] [--color <auto|always|never>] [--icons <unicode|nerd>]
 ```
 
 - With no `SNAPSHOT`, inspection uses the existing global `latest` selection
@@ -23,6 +23,8 @@ tmux-rescue inspect [SNAPSHOT] [--color <auto|always|never>]
 - With `SNAPSHOT`, inspection uses the existing explicit-path loader and does
   not require a state-root environment.
 - `--color` defaults to `auto`.
+- `--icons` defaults to `unicode`; `nerd` selects the approved Nerd Font
+  labels when the terminal uses a Nerd Font Mono face.
 - Inspection never contacts tmux, inspects processes, plans a restore, or
   performs preflight against the current machine.
 
@@ -43,9 +45,10 @@ Failures that prevent a document from being produced leave standard output
 empty and report the error on standard error. Inspection emits no progress
 messages.
 
-The default view is Unicode and never truncates stored values. Long values may
-wrap naturally in the terminal. An ASCII mode, paging, filtering, alternate
-views, and machine-readable output are not part of this feature.
+The default view uses portable Unicode tree geometry and never truncates stored
+values. Long values may wrap naturally in the terminal. An ASCII mode, paging,
+filtering, alternate views, and machine-readable output are not part of this
+feature.
 
 ## Visualization
 
@@ -58,26 +61,52 @@ Source       /tmp/tmux-1000/default
 Consistency  ● stable topology
 File         /home/huwei/.local/state/tmux-rescue/snapshots/<full-name>.json
 
-Contents     6 sessions · 15 windows · 15 panes
-Programs     11 Codex · 3 shells · 1 tmux-rescue
+Contents     1 session · 3 windows · 4 panes
+Programs     2 Codex · 1 shell · 1 not captured
 
-◆ MetaNC · 3 windows · 3 panes
+◆ MetaNC · 3 windows · 4 panes
   cwd /home/huwei/projects/MetaNC
-├─ [0] node
-│  └─ [0] Codex
-│          session 019f7ac5-a55c-7e70-8b31-872ae70c9a94
-│          cwd = session
-├─ [1] zsh
-│  └─ [0] shell
-│          cwd = session
-└─ [2] zsh
-   └─ [0] ! program not captured
-           reason foreground process disappeared
-           cwd /home/huwei/projects/MetaNC/.worktrees/ci-dag-readme
+├─ [0] node › (0) Codex
+│     session 019f7ac5-a55c-7e70-8b31-872ae70c9a94
+│     cwd = ◆
+├─ [1] zsh › (0) shell
+│     cwd = ◆
+└─ [2] editor
+   ├─ (0) Codex
+   │     session 019f929e-a470-7073-8833-7815026944dd
+   │     cwd = ◆
+   └─ (1) ! program not captured
+         reason foreground process disappeared
+         cwd /home/huwei/projects/MetaNC/.worktrees/ci-dag-readme
 ```
 
-The sample is shown without ANSI escapes. Color applies only to the semantic
-tokens defined below.
+The sample is the default `--icons unicode` form and is shown without ANSI
+escapes. Color applies only to the semantic tokens defined below.
+
+With `--icons nerd`, the same content uses the selected Nerd Font glyphs:
+
+```text
+◆ MetaNC · 3 windows · 4 panes
+   /home/huwei/projects/MetaNC
+├─  0 node ›  0 Codex
+│     session 019f7ac5-a55c-7e70-8b31-872ae70c9a94
+│      = ◆
+├─  1 zsh ›  0 shell
+│      = ◆
+└─  2 editor
+   ├─  0 Codex
+   │     session 019f929e-a470-7073-8833-7815026944dd
+   │      = ◆
+   └─  1 ! program not captured
+         reason foreground process disappeared
+          /home/huwei/projects/MetaNC/.worktrees/ci-dag-readme
+```
+
+The selected labels are:
+
+- window: `` (`nf-cod-window`, U+EB7F);
+- pane: `` (`nf-cod-terminal_tmux`, U+EBC8); and
+- working directory: `` (`nf-cod-folder_opened`, U+EAF7).
 
 ### Header
 
@@ -129,7 +158,7 @@ Each session root contains:
 - its window and pane counts; and
 - its full recorded working directory.
 
-Each window node contains its source index and name. Each pane node contains
+Each window label contains its source index and name. Each pane label contains
 its source index and the captured program fact:
 
 - `Codex`, followed by `session <id>`;
@@ -138,10 +167,34 @@ its source index and the captured program fact:
 - `shell`; or
 - `! program not captured`, followed by `reason <failure>`.
 
+Exactly-one-pane windows use one breadcrumb node:
+
+```text
+window-label window-name › pane-label pane-fact
+```
+
+This removes a redundant level without hiding either source index. A window
+with two or more panes retains separate window and child-pane nodes so the
+split relationship remains visible. The compaction rule depends only on the
+validated pane count and is identical in both icon modes.
+
+The default `unicode` mode labels a window as `[N]` and a pane as `(N)`. Nerd
+mode labels them as ` N` and ` N`. Both forms preserve the actual source
+index; the pane index is not assumed to be zero when a one-pane window is
+compacted. The `›` separator is renderer-owned syntax and has one space on each
+side.
+
 Every pane also shows its recorded working directory. When its path bytes are
-exactly equal to the containing session's path bytes, the renderer writes
-`cwd = session`; this is display compression, not cwd inheritance. A differing
-pane path is always shown in full.
+exactly equal to the containing session's path bytes, the renderer references
+the containing session root: `cwd = ◆` in Unicode mode and ` = ◆` in Nerd
+mode. This is an equality statement, not cwd inheritance. A differing pane path
+is always shown in full. Nerd mode writes the session and pane cwd label as
+``; Unicode mode writes `cwd`.
+
+Nerd mode is explicit because terminal output cannot reliably detect whether
+a compatible font is active. It requires a Nerd Font Mono face so every chosen
+private-use glyph occupies one cell. The default Unicode form remains aligned
+without a patched font.
 
 The renderer never generates or color-codes `Automatic`, `Manual`, or
 equivalent recovery-planner classifications. Codex, Claude Code, recognized
@@ -167,6 +220,9 @@ The selected snapshot, session names, window names, pane program or command,
 and explicit warning phrase use bold default foreground. Other labels, values,
 paths, identifiers, counts, indexes, reasons, and connectors use normal default
 foreground.
+
+The ``, ``, and `` Nerd Font glyphs use the terminal's default foreground.
+Their purpose is structural distinction, not another semantic color channel.
 
 Only the listed marker or prefix receives its color. For example, the dot is
 green while `stable topology` remains normal foreground. This limits contrast
@@ -217,13 +273,15 @@ A private inspection-rendering module has one external interface conceptually
 equivalent to:
 
 ```text
-render(LoadedSnapshot, SnapshotSelection, Palette) -> String
+render(LoadedSnapshot, SnapshotSelection, Palette, IconMode) -> String
 ```
 
 Its implementation owns private user-facing view types, aggregate counts,
-value encoding, cwd compression, tree construction, and styling. The small
-interface keeps raw JSON, restore planning, terminal geometry, and internal
-pane-recovery variants out of callers.
+value encoding, cwd compression, compact window shape, tree construction, and
+styling. A private rendering-symbol set is selected once from the parsed icon
+mode; downstream rendering receives that set rather than repeatedly checking
+CLI strings. The small interface keeps raw JSON, restore planning, terminal
+geometry, and internal pane-recovery variants out of callers.
 
 The data flow is:
 
@@ -236,10 +294,10 @@ latest or explicit path
     -> stdout
 ```
 
-The CLI request carries a parsed `SnapshotSelection` and color policy rather
-than rediscovering those facts during rendering. Only `LoadedSnapshot` may
-enter view construction; raw or merely deserialized snapshot values cannot be
-rendered.
+The CLI request carries a parsed `SnapshotSelection`, color policy, and icon
+mode rather than rediscovering those facts during rendering. Only
+`LoadedSnapshot` may enter view construction; raw or merely deserialized
+snapshot values cannot be rendered.
 
 ## Libraries
 
@@ -300,11 +358,15 @@ and does not need presentation details.
 ## Verification
 
 CLI parsing tests cover default latest selection, explicit paths, every color
-mode, and invalid color values.
+mode, both icon modes, and invalid color and icon values.
 
 Plain exact-output tests cover:
 
 - multiple sessions, windows, and panes;
+- compact one-pane windows and expanded multi-pane windows;
+- distinct window and pane source-index labels in both icon modes;
+- preserved nonzero pane source indexes in compact breadcrumbs;
+- session cwd equality references and differing pane paths in both modes;
 - every pane fact variant;
 - full snapshot timestamps and paths;
 - stable and unstable topology;
@@ -319,6 +381,9 @@ Plain exact-output tests cover:
 Styled exact-output tests verify that only approved tokens are colored and that
 every style is reset immediately. Stripping ANSI from forced-color output must
 produce byte-for-byte identical output to `--color never`.
+
+Integration tests also cover `--icons nerd` and verify the exact selected code
+points. No test or production branch attempts font detection.
 
 Integration tests cover latest and explicit loading, invalid snapshots, empty
 stdout on failure, exit statuses, and absence of tmux/process/preflight access.
@@ -336,5 +401,6 @@ locked test suite, documentation generation, and Cargo packaging.
 - Filtering, sorting, collapsing, or alternate recovery-first views.
 - Terminal-width-dependent layout, truncation, paging, or an interactive TUI.
 - ASCII connector mode.
+- Automatic terminal-font or Nerd Font detection.
 - Reconstructing unstable-capture events that were not persisted.
 - Changing the snapshot schema or recovery behavior.
