@@ -3,7 +3,7 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand, builder::TypedValueParser, error::ErrorKind};
+use clap::{Parser, Subcommand, ValueEnum, builder::TypedValueParser, error::ErrorKind};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -30,10 +30,26 @@ pub struct Cli {
     pub command: Command,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Capture the tmux server selected by the invoking tmux context.
     Snapshot,
+    /// Validate and display a captured tmux workspace.
+    Inspect {
+        /// Immutable snapshot path. The global latest snapshot is used when omitted.
+        snapshot: Option<PathBuf>,
+        /// When to use terminal color.
+        #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+        color: ColorMode,
+    },
     /// Validate and print a restore plan, then optionally execute it.
     Restore {
         /// Immutable snapshot path. The global latest snapshot is used when omitted.
@@ -87,14 +103,40 @@ pub struct RestoreRequest {
     pub run: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnapshotSelection {
+    Latest,
+    Explicit(PathBuf),
+}
+
+impl From<Option<PathBuf>> for SnapshotSelection {
+    fn from(path: Option<PathBuf>) -> Self {
+        match path {
+            Some(path) => Self::Explicit(path),
+            None => Self::Latest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectRequest {
+    pub selection: SnapshotSelection,
+    pub color: ColorMode,
+}
+
 pub trait CliRunner {
     fn snapshot(&mut self) -> u8;
+    fn inspect(&mut self, request: InspectRequest) -> u8;
     fn restore(&mut self, request: RestoreRequest) -> u8;
 }
 
 pub fn dispatch(cli: Cli, runner: &mut impl CliRunner) -> u8 {
     match cli.command {
         Command::Snapshot => runner.snapshot(),
+        Command::Inspect { snapshot, color } => runner.inspect(InspectRequest {
+            selection: snapshot.into(),
+            color,
+        }),
         Command::Restore {
             snapshot,
             target,
@@ -129,6 +171,10 @@ impl<W: Write, E: Write> CliRunner for SystemCliRunner<'_, W, E> {
             Ok(code) => code,
             Err(error) => self.report_failure(error),
         }
+    }
+
+    fn inspect(&mut self, _request: InspectRequest) -> u8 {
+        EXIT_FAILURE
     }
 
     fn restore(&mut self, request: RestoreRequest) -> u8 {
@@ -569,8 +615,10 @@ mod tests {
     #[derive(Default)]
     struct RecordingRunner {
         snapshot_calls: usize,
+        inspect_requests: Vec<InspectRequest>,
         restore_requests: Vec<RestoreRequest>,
         snapshot_code: u8,
+        inspect_code: u8,
         restore_code: u8,
     }
 
@@ -578,6 +626,11 @@ mod tests {
         fn snapshot(&mut self) -> u8 {
             self.snapshot_calls += 1;
             self.snapshot_code
+        }
+
+        fn inspect(&mut self, request: InspectRequest) -> u8 {
+            self.inspect_requests.push(request);
+            self.inspect_code
         }
 
         fn restore(&mut self, request: RestoreRequest) -> u8 {
@@ -598,7 +651,14 @@ mod tests {
                 target,
                 run,
             } => (snapshot, target, run),
-            Command::Snapshot => panic!("expected restore command"),
+            Command::Snapshot | Command::Inspect { .. } => panic!("expected restore command"),
+        }
+    }
+
+    fn inspect_command(cli: Cli) -> (Option<PathBuf>, ColorMode) {
+        match cli.command {
+            Command::Inspect { snapshot, color } => (snapshot, color),
+            Command::Snapshot | Command::Restore { .. } => panic!("expected inspect command"),
         }
     }
 
@@ -619,6 +679,43 @@ mod tests {
         assert!(Cli::try_parse_from(["tmux-rescue", "snapshot", "unexpected"]).is_err());
         assert!(Cli::try_parse_from(["tmux-rescue", "snapshot", "--run"]).is_err());
         assert!(Cli::try_parse_from(["tmux-rescue", "restore", "--json"]).is_err());
+
+        assert_eq!(
+            inspect_command(parse(&["tmux-rescue", "inspect"])),
+            (None, ColorMode::Auto)
+        );
+        assert_eq!(
+            inspect_command(parse(&[
+                "tmux-rescue",
+                "inspect",
+                "relative/snapshot.json",
+                "--color",
+                "always",
+            ])),
+            (
+                Some(PathBuf::from("relative/snapshot.json")),
+                ColorMode::Always,
+            )
+        );
+        assert_eq!(
+            inspect_command(parse(&[
+                "tmux-rescue",
+                "inspect",
+                "--color",
+                "never",
+                "relative/snapshot.json",
+            ])),
+            (
+                Some(PathBuf::from("relative/snapshot.json")),
+                ColorMode::Never,
+            )
+        );
+        assert!(
+            Cli::try_parse_from(["tmux-rescue", "inspect", "--color", "sometimes"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["tmux-rescue", "inspect", "one.json", "two.json"]).is_err()
+        );
 
         let (snapshot, target, run) = restore_command(parse(&[
             "tmux-rescue",
@@ -651,6 +748,30 @@ mod tests {
             EXIT_FAILURE
         );
         assert_eq!(runner.snapshot_calls, 1);
+
+        runner.inspect_code = EXIT_SUCCESS;
+        assert_eq!(
+            dispatch(
+                parse(&[
+                    "tmux-rescue",
+                    "inspect",
+                    "relative/snapshot.json",
+                    "--color",
+                    "never",
+                ]),
+                &mut runner,
+            ),
+            EXIT_SUCCESS
+        );
+        assert_eq!(
+            runner.inspect_requests,
+            [InspectRequest {
+                selection: SnapshotSelection::Explicit(PathBuf::from(
+                    "relative/snapshot.json"
+                )),
+                color: ColorMode::Never,
+            }]
+        );
 
         assert_eq!(
             dispatch(
