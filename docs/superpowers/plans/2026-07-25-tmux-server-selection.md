@@ -466,15 +466,15 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 - Modify: `docs/src/DESIGN.md`
 - Modify: `docs/src/ARCHITECTURE.md`
 
-- [ ] **Step 1: Update README from the user workflow down**
+- [x] **Step 1: Update README from the user workflow down**
 
   Show ambient, `-L`, and `-S` snapshot examples and root-level restore examples. State that all captures share one archive and one global `latest`, snapshot choice and destination choice are independent, plan-only does not contact the destination, the exact selector is printed, and `--run` attempts ownership without mutating an existing server.
 
-- [ ] **Step 2: Update the design overview**
+- [x] **Step 2: Update the design overview**
 
   In `docs/src/DESIGN.md`, describe the command grammar, opaque pass-through, ambient-versus-explicit source flow, one global stream, independent restore selection, generated source-path fallback, plan-only non-contact/non-write behavior, and ownership claim before topology.
 
-- [ ] **Step 3: Update the architecture contract**
+- [x] **Step 3: Update the architecture contract**
 
   In `docs/src/ARCHITECTURE.md`:
 
@@ -489,7 +489,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Keep `docs/src/TOOL-RECOVERIES.md`, `docs/src/SUMMARY.md`, and historical plans unchanged.
 
-- [ ] **Step 4: Check documentation terms and build the book**
+- [x] **Step 4: Check documentation terms and build the book**
 
   Run:
 
@@ -500,7 +500,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Expected `rg` result: no matches in active source, tests, README, DESIGN, or ARCHITECTURE.
 
-- [ ] **Step 5: Run all repository gates**
+- [x] **Step 5: Run all repository gates**
 
   Run:
 
@@ -517,7 +517,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Run the deployable Mermaid asset guard from `.github/workflows/docs.yml` verbatim after the book build.
 
-- [ ] **Step 6: Inspect the final diff for scope and contract completeness**
+- [x] **Step 6: Inspect the final diff for scope and contract completeness**
 
   Run:
 
@@ -530,7 +530,7 @@ This is intentionally one vertical slice. Removing `TmuxServerIdentity` or chang
 
   Confirm every changed line serves server selection, global-stream evidence, the fixture readiness repair, or required documentation synchronization.
 
-- [ ] **Step 7: Commit documentation and any verification-only fixes**
+- [x] **Step 7: Commit documentation and any verification-only fixes**
 
   ```bash
   git add README.md docs/src/DESIGN.md docs/src/ARCHITECTURE.md
