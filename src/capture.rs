@@ -692,10 +692,11 @@ fn build_result_with_serialization_limit(
         consistency,
         sessions,
     };
-    let mut encoded = serde_json::to_vec(&raw)
+    let mut persisted = raw
+        .serialize_for_persistence()
         .map_err(|error| SnapshotValidationError::InvalidJson(error.to_string()))
         .map_err(CaptureError::InvalidCandidate)?;
-    if encoded.len() > serialization_limit {
+    if persisted.byte_count() > serialization_limit {
         let affected = strip_prompt_enrichment(&mut raw.sessions);
         if !affected.is_empty() {
             events.extend(affected.into_iter().map(|pane| {
@@ -705,14 +706,15 @@ fn build_result_with_serialization_limit(
                     failure: CodexPromptCaptureFailure::snapshot_size_budget_exceeded(),
                 }
             }));
-            encoded = serde_json::to_vec(&raw)
+            persisted = raw
+                .serialize_for_persistence()
                 .map_err(|error| SnapshotValidationError::InvalidJson(error.to_string()))
                 .map_err(CaptureError::InvalidCandidate)?;
         }
-        if encoded.len() > serialization_limit {
+        if persisted.byte_count() > serialization_limit {
             return Err(CaptureError::InvalidCandidate(
                 SnapshotValidationError::SnapshotTooLarge {
-                    actual: encoded.len(),
+                    actual: persisted.byte_count(),
                     maximum: serialization_limit,
                 },
             ));
@@ -813,27 +815,37 @@ mod tests {
 
     #[test]
     fn snapshot_budget_pressure_drops_prompt_enrichment_without_discarding_codex_recovery() {
-        let prompt_free_size = serde_json::to_vec(&raw_snapshot(candidate([None, None])))
-            .unwrap()
-            .len();
+        let first_prompt = "x".repeat(1024);
+        let second_prompt = "y".repeat(1024);
+        let prompt_bearing = raw_snapshot(candidate([
+            Some(first_prompt.as_str()),
+            Some(second_prompt.as_str()),
+        ]));
+        let compact_prompt_bearing_size = serde_json::to_vec(&prompt_bearing).unwrap().len();
+        let pretty_prompt_bearing_size = serde_json::to_vec_pretty(&prompt_bearing).unwrap().len();
+        let prompt_free_pretty_size =
+            serde_json::to_vec_pretty(&raw_snapshot(candidate([None, None])))
+                .unwrap()
+                .len();
+        let serialization_limit = compact_prompt_bearing_size + 1;
         assert!(
-            serde_json::to_vec(&raw_snapshot(candidate([
-                Some("first private draft"),
-                Some("second private draft"),
-            ])))
-            .unwrap()
-            .len()
-                > prompt_free_size
+            compact_prompt_bearing_size < serialization_limit
+                && serialization_limit < pretty_prompt_bearing_size,
+            "fixture limit must fall strictly between compact and persisted prompt-bearing sizes"
+        );
+        assert!(
+            prompt_free_pretty_size <= serialization_limit,
+            "the persisted prompt-free snapshot must fit the fixture limit"
         );
 
         let result = build_result_with_serialization_limit(
             CaptureTime::parse_rfc3339("2026-07-23T00:00:00Z").unwrap(),
             SnapshotSource::try_from_bytes(b"/tmp/source.sock".to_vec()).unwrap(),
             RawCaptureConsistency::Stable {},
-            candidate([Some("first private draft"), Some("second private draft")]),
+            candidate([Some(first_prompt.as_str()), Some(second_prompt.as_str())]),
             7,
             Vec::new(),
-            prompt_free_size,
+            serialization_limit,
         )
         .unwrap();
 
@@ -885,7 +897,7 @@ mod tests {
             candidate([None, None]),
             1,
             Vec::new(),
-            prompt_free_size - 1,
+            prompt_free_pretty_size - 1,
         )
         .unwrap_err();
         assert!(matches!(
@@ -893,7 +905,7 @@ mod tests {
             CaptureError::InvalidCandidate(SnapshotValidationError::SnapshotTooLarge {
                 actual,
                 maximum,
-            }) if actual == prompt_free_size && maximum == prompt_free_size - 1
+            }) if actual == prompt_free_pretty_size && maximum == prompt_free_pretty_size - 1
         ));
     }
 }

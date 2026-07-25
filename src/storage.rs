@@ -114,14 +114,14 @@ impl StateStore {
             return SnapshotPublication::NotPublished(error.into());
         }
 
-        let bytes = match snapshot.to_json_pretty() {
-            Ok(bytes) if bytes.len() <= MAX_SNAPSHOT_BYTES => bytes,
-            Ok(bytes) => {
+        let persisted = match snapshot.serialize_for_persistence() {
+            Ok(persisted) if persisted.byte_count() <= MAX_SNAPSHOT_BYTES => persisted,
+            Ok(persisted) => {
                 return SnapshotPublication::NotPublished(PublicationFailure::new(
                     "serialize snapshot",
                     format!(
                         "serialized snapshot is {} bytes; the maximum is {MAX_SNAPSHOT_BYTES}",
-                        bytes.len()
+                        persisted.byte_count()
                     ),
                 ));
             }
@@ -137,9 +137,12 @@ impl StateStore {
         let file_name = key.file_name();
         let final_path = snapshots.join(&file_name);
         let temporary_path = snapshots.join(format!(".snapshot-{}.tmp", key.suffix));
-        if let Err(error) =
-            commit_immutable_snapshot(file_system, &temporary_path, &final_path, &bytes)
-        {
+        if let Err(error) = commit_immutable_snapshot(
+            file_system,
+            &temporary_path,
+            &final_path,
+            persisted.as_slice(),
+        ) {
             return SnapshotPublication::NotPublished(error.into());
         }
 

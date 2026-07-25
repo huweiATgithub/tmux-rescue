@@ -197,6 +197,34 @@ pub struct RawSnapshot {
     pub sessions: Vec<RawSessionSnapshot>,
 }
 
+pub(crate) struct PersistedSnapshotBytes(Vec<u8>);
+
+impl PersistedSnapshotBytes {
+    fn serialize(raw: &RawSnapshot) -> Result<Self, serde_json::Error> {
+        serde_json::to_vec_pretty(raw).map(Self)
+    }
+
+    pub(crate) fn byte_count(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl RawSnapshot {
+    pub(crate) fn serialize_for_persistence(
+        &self,
+    ) -> Result<PersistedSnapshotBytes, serde_json::Error> {
+        PersistedSnapshotBytes::serialize(self)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureTime {
     value: OffsetDateTime,
@@ -645,11 +673,12 @@ impl ValidatedSnapshot {
     }
 
     pub(crate) fn from_capture_raw(raw: RawSnapshot) -> Result<Self, SnapshotValidationError> {
-        let encoded = serde_json::to_vec(&raw)
+        let persisted = raw
+            .serialize_for_persistence()
             .map_err(|error| SnapshotValidationError::InvalidJson(error.to_string()))?;
-        if encoded.len() > MAX_SNAPSHOT_BYTES {
+        if persisted.byte_count() > MAX_SNAPSHOT_BYTES {
             return Err(SnapshotValidationError::SnapshotTooLarge {
-                actual: encoded.len(),
+                actual: persisted.byte_count(),
                 maximum: MAX_SNAPSHOT_BYTES,
             });
         }
@@ -657,7 +686,14 @@ impl ValidatedSnapshot {
     }
 
     pub fn to_json_pretty(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec_pretty(&RawSnapshot::from(self))
+        self.serialize_for_persistence()
+            .map(PersistedSnapshotBytes::into_vec)
+    }
+
+    pub(crate) fn serialize_for_persistence(
+        &self,
+    ) -> Result<PersistedSnapshotBytes, serde_json::Error> {
+        RawSnapshot::from(self).serialize_for_persistence()
     }
 
     pub fn captured_at(&self) -> &CaptureTime {
@@ -1159,9 +1195,9 @@ mod tests {
     }
 
     #[test]
-    fn capture_refinement_enforces_the_aggregate_snapshot_limit() {
+    fn capture_refinement_enforces_the_persisted_snapshot_limit() {
         let large_argument = "x".repeat(MAX_OS_VALUE_BYTES);
-        let raw = RawSnapshot {
+        let mut raw = RawSnapshot {
             captured_at: "2026-07-23T00:00:00Z".to_owned(),
             source: encoded("/tmp/source.sock".to_owned()),
             consistency: RawCaptureConsistency::Stable {},
@@ -1178,7 +1214,8 @@ mod tests {
                             command: RawCapturedCommand {
                                 executable: encoded("/usr/bin/tool".to_owned()),
                                 argv: std::iter::once(encoded("tool".to_owned()))
-                                    .chain((0..17).map(|_| encoded(large_argument.clone())))
+                                    .chain((0..15).map(|_| encoded(large_argument.clone())))
+                                    .chain(std::iter::once(encoded(String::new())))
                                     .collect(),
                             },
                         },
@@ -1186,10 +1223,27 @@ mod tests {
                 }],
             }],
         };
+        let compact_size_before_padding = serde_json::to_vec(&raw).unwrap().len();
+        let padding_size = MAX_SNAPSHOT_BYTES
+            .checked_sub(compact_size_before_padding)
+            .expect("fixture without its final argument must fit the compact limit");
+        assert!((1..=MAX_OS_VALUE_BYTES).contains(&padding_size));
+        let RawPaneRecovery::Manual { command } = &mut raw.sessions[0].windows[0].panes[0].recovery
+        else {
+            unreachable!()
+        };
+        command.argv.last_mut().unwrap().value = "y".repeat(padding_size);
+
+        assert_eq!(serde_json::to_vec(&raw).unwrap().len(), MAX_SNAPSHOT_BYTES);
+        let persisted_size = serde_json::to_vec_pretty(&raw).unwrap().len();
+        assert!(persisted_size > MAX_SNAPSHOT_BYTES);
 
         assert!(matches!(
             ValidatedSnapshot::from_capture_raw(raw),
-            Err(SnapshotValidationError::SnapshotTooLarge { .. })
+            Err(SnapshotValidationError::SnapshotTooLarge {
+                actual,
+                maximum: MAX_SNAPSHOT_BYTES,
+            }) if actual == persisted_size
         ));
     }
 }
