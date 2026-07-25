@@ -13,15 +13,16 @@ use thiserror::Error;
 
 use crate::{
     AutomaticPaneObservation, AutomaticRecoveryExpectation, CaptureFailure, CaptureSource,
-    CaptureSourceFailure, CodexPromptCaptureFailure, GuardedPaneFailure, GuardedPaneOperation,
-    GuardedPaneResult, LinuxProcessInspector, LosslessOsString, OwnedRestoreTarget,
-    PaneInitialProcess, PaneProcessAnchor, PaneProcessObservation, PaneProcessProbe, PaneRecovery,
-    RecordedAbsolutePath, RecoveryRestoreTarget, RestoreDestination, RestorePlan,
-    RestoreTargetCapability, RestoreTargetState, RollbackFailure, RollbackFailureDisposition,
-    RollbackOutcome, SnapshotSource, SourcePaneCoordinate, TargetClaimFailure, TargetDisposition,
-    TargetShell, TmuxPaneId, TmuxSelector, TopologyFailure, TopologyObservation, TopologyPane,
-    TopologySession, TopologyWindow, VisiblePaneGrid, VisiblePaneMetadata, classify_pane,
-    parse_proc_stat,
+    CaptureSourceFailure, CapturedCodexPromptArea, CodexPromptCaptureFailure,
+    CodexPromptPasteFailure, CodexPromptPasteResult, CodexSessionId, GuardedPaneFailure,
+    GuardedPaneOperation, GuardedPaneResult, LinuxProcessInspector, LosslessOsString,
+    OwnedRestoreTarget, PaneInitialProcess, PaneProcessAnchor, PaneProcessObservation,
+    PaneProcessProbe, PaneRecovery, RecordedAbsolutePath, RecoveryRestoreTarget,
+    RestoreDestination, RestorePlan, RestoreTargetCapability, RestoreTargetState, RollbackFailure,
+    RollbackFailureDisposition, RollbackOutcome, SnapshotSource, SourcePaneCoordinate,
+    TargetClaimFailure, TargetDisposition, TargetShell, TmuxPaneId, TmuxSelector, TopologyFailure,
+    TopologyObservation, TopologyPane, TopologySession, TopologyWindow, VisiblePaneGrid,
+    VisiblePaneMetadata, classify_pane, parse_proc_stat,
 };
 
 const SOURCE_FIELDS: usize = 11;
@@ -1196,6 +1197,17 @@ impl<P: PaneProcessProbe + 'static> RecoveryRestoreTarget for TmuxOwnedTarget<P>
             };
         }
         latest
+    }
+
+    fn paste_codex_prompt_area(
+        &mut self,
+        _pane: &SourcePaneCoordinate,
+        _expected: &CodexSessionId,
+        _input: &CapturedCodexPromptArea,
+    ) -> CodexPromptPasteResult {
+        Err(CodexPromptPasteFailure::Failed(
+            "Codex prompt preparation is not available".to_owned(),
+        ))
     }
 
     fn observe_disposition(&mut self) -> TargetDisposition {

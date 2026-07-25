@@ -1522,6 +1522,15 @@ pub enum AutomaticPaneObservation {
     Failed(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodexPromptPasteFailure {
+    SessionMismatch,
+    PaneMissing,
+    Failed(String),
+}
+
+pub type CodexPromptPasteResult = Result<(), CodexPromptPasteFailure>;
+
 pub trait RestoreTargetCapability {
     fn claim(
         &mut self,
@@ -1550,6 +1559,13 @@ pub trait RecoveryRestoreTarget {
         expected: &AutomaticRecoveryExpectation,
     ) -> AutomaticPaneObservation;
 
+    fn paste_codex_prompt_area(
+        &mut self,
+        pane: &SourcePaneCoordinate,
+        expected: &CodexSessionId,
+        input: &CapturedCodexPromptArea,
+    ) -> CodexPromptPasteResult;
+
     fn observe_disposition(&mut self) -> TargetDisposition;
 }
 
@@ -1567,6 +1583,8 @@ pub enum AttentionReason {
 pub enum PaneRestoreOutcome {
     RestoredIdleShell,
     RecoveredAutomatically,
+    RecoveredAutomaticallyWithPromptPrepared,
+    RecoveredAutomaticallyWithPromptNeedsAttention(CodexPromptPasteFailure),
     PreparedManualHint,
     PreparedAutomaticFallbackHint(AutomaticFallbackReason),
     AutomaticLaunchFailedHintPrepared,
@@ -1747,7 +1765,7 @@ fn execute_pane(
             AttentionReason::CapturedRecoveryUnavailable(reason.clone()),
         ),
         PlannedPaneAction::LaunchAutomatic(launch) => {
-            execute_automatic(target, shell, pane, launch.input(), launch.expectation())
+            execute_automatic(target, shell, pane, launch)
         }
     }
 }
@@ -1756,25 +1774,36 @@ fn execute_automatic(
     target: &mut dyn RecoveryRestoreTarget,
     shell: &TargetShell,
     pane: &PlannedPane,
-    input: &LaunchableShellInput,
-    expected: &AutomaticRecoveryExpectation,
+    launch: &PlannedAutomaticLaunch,
 ) -> PaneRestoreOutcome {
     if let Err(failure) = target.guarded_pane_operation(
         &pane.coordinate,
         shell,
-        GuardedPaneOperation::LaunchAutomatic { input },
+        GuardedPaneOperation::LaunchAutomatic {
+            input: launch.input(),
+        },
     ) {
         return guard_failure(failure);
     }
 
-    match target.observe_automatic(&pane.coordinate, expected) {
-        AutomaticPaneObservation::Recovered => PaneRestoreOutcome::RecoveredAutomatically,
+    match target.observe_automatic(&pane.coordinate, launch.expectation()) {
+        AutomaticPaneObservation::Recovered => match launch.codex_prompt() {
+            None => PaneRestoreOutcome::RecoveredAutomatically,
+            Some((expected, input)) => {
+                match target.paste_codex_prompt_area(&pane.coordinate, expected, input) {
+                    Ok(()) => PaneRestoreOutcome::RecoveredAutomaticallyWithPromptPrepared,
+                    Err(failure) => {
+                        PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(failure)
+                    }
+                }
+            }
+        },
         AutomaticPaneObservation::ShellForeground => {
             let fallback = target.guarded_pane_operation(
                 &pane.coordinate,
                 shell,
                 GuardedPaneOperation::PasteLiteral {
-                    input: input.rendered(),
+                    input: launch.input().rendered(),
                 },
             );
             map_guarded_result(
@@ -1818,6 +1847,7 @@ fn pane_outcome_is_partial(outcome: &PaneRestoreOutcome) -> bool {
         outcome,
         PaneRestoreOutcome::PreparedAutomaticFallbackHint(_)
             | PaneRestoreOutcome::AutomaticLaunchFailedHintPrepared
+            | PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(_)
             | PaneRestoreOutcome::NeedsAttention(_)
     )
 }
