@@ -12,8 +12,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::{
-    AutomaticPaneObservation, AutomaticRecoveryExpectation, CaptureFailure, CaptureSource,
-    CaptureSourceFailure, CapturedCodexPromptArea, CodexPromptCaptureFailure,
+    AutomaticPaneObservation, AutomaticRecovery, AutomaticRecoveryExpectation, CaptureFailure,
+    CaptureSource, CaptureSourceFailure, CapturedCodexPromptArea, CodexPromptCaptureFailure,
     CodexPromptPasteFailure, CodexPromptPasteResult, CodexSessionId, GuardedPaneFailure,
     GuardedPaneOperation, GuardedPaneResult, LinuxProcessInspector, LosslessOsString,
     OwnedRestoreTarget, PaneInitialProcess, PaneProcessAnchor, PaneProcessObservation,
@@ -1037,20 +1037,24 @@ impl<P: PaneProcessProbe> TmuxOwnedTarget<P> {
             .map_err(|error| error.to_string())
     }
 
-    fn pane_condition(&self, pane: &RestoredPane) -> String {
+    fn running_pane_condition(&self, pane: &RestoredPane) -> String {
+        let live = "#{==:#{pane_dead},0}";
+        let process = ["#{==:#{pane_pid},", &pane.process_id.to_string(), "}"].concat();
+        let pane_condition = ["#{&&:", live, ",", &process, "}"].concat();
+        ["#{&&:", &self.server.condition(), ",", &pane_condition, "}"].concat()
+    }
+
+    fn shell_pane_condition(&self, pane: &RestoredPane) -> String {
         let shell_name = Path::new(self.shell.executable().as_os_str())
             .file_name()
             .and_then(OsStr::to_str)
             .expect("validated target shell basenames are ASCII");
-        let live = "#{==:#{pane_dead},0}";
-        let process = ["#{==:#{pane_pid},", &pane.process_id.to_string(), "}"].concat();
         let command = ["#{==:#{pane_current_command},", shell_name, "}"].concat();
-        let shell_condition = ["#{&&:", live, ",#{&&:", &process, ",", &command, "}}"].concat();
         [
             "#{&&:",
-            &self.server.condition(),
+            &self.running_pane_condition(pane),
             ",",
-            &shell_condition,
+            &command,
             "}",
         ]
         .concat()
@@ -1115,7 +1119,7 @@ impl<P: PaneProcessProbe + 'static> RecoveryRestoreTarget for TmuxOwnedTarget<P>
             }
         }
 
-        let condition = self.pane_condition(pane);
+        let condition = self.shell_pane_condition(pane);
         let result = match operation {
             GuardedPaneOperation::VerifyShell => self.server.run_conditional(
                 pane.target_id.as_str(),
@@ -1201,13 +1205,70 @@ impl<P: PaneProcessProbe + 'static> RecoveryRestoreTarget for TmuxOwnedTarget<P>
 
     fn paste_codex_prompt_area(
         &mut self,
-        _pane: &SourcePaneCoordinate,
-        _expected: &CodexSessionId,
-        _input: &CapturedCodexPromptArea,
+        coordinate: &SourcePaneCoordinate,
+        expected: &CodexSessionId,
+        input: &CapturedCodexPromptArea,
     ) -> CodexPromptPasteResult {
-        Err(CodexPromptPasteFailure::Failed(
-            "Codex prompt preparation is not available".to_owned(),
-        ))
+        let Some(pane) = self.panes.get(coordinate) else {
+            return Err(CodexPromptPasteFailure::PaneMissing);
+        };
+        let observation = match self.observe_pane(pane) {
+            Ok(observation) => observation,
+            Err(reason) => {
+                if !self.pane_still_exists(pane) {
+                    return Err(CodexPromptPasteFailure::PaneMissing);
+                }
+                return Err(CodexPromptPasteFailure::Failed(reason));
+            }
+        };
+        let PaneProcessObservation::Foreground(evidence) = observation else {
+            return match observation {
+                PaneProcessObservation::Idle => Err(CodexPromptPasteFailure::SessionMismatch),
+                PaneProcessObservation::Unavailable(failure) => Err(
+                    CodexPromptPasteFailure::Failed(failure.message().to_owned()),
+                ),
+                PaneProcessObservation::Foreground(_) => unreachable!(),
+            };
+        };
+        let classification = classify_pane(*evidence);
+        let PaneRecovery::Automatic(AutomaticRecovery::Codex { session_id, .. }) =
+            classification.recovery()
+        else {
+            return Err(CodexPromptPasteFailure::SessionMismatch);
+        };
+        if session_id != expected {
+            return Err(CodexPromptPasteFailure::SessionMismatch);
+        }
+
+        let buffer_name = format!(
+            "tmux-rescue-{}-{}",
+            self.server.token,
+            uuid::Uuid::new_v4().simple()
+        );
+        let condition = self.running_pane_condition(pane);
+        let commands = literal_paste_commands(
+            pane.target_id.as_str(),
+            input.text().as_str().as_bytes(),
+            &buffer_name,
+        );
+        match self.server.run_conditional_commands(
+            pane.target_id.as_str(),
+            &condition,
+            &commands,
+            "prepare Codex prompt input",
+        ) {
+            Ok(()) => Ok(()),
+            Err(ConditionalFailure::Blocked) => {
+                if !self.pane_still_exists(pane) {
+                    Err(CodexPromptPasteFailure::PaneMissing)
+                } else {
+                    Err(CodexPromptPasteFailure::Failed(
+                        "restore target or pane identity changed before prompt paste".to_owned(),
+                    ))
+                }
+            }
+            Err(ConditionalFailure::Failed(reason)) => Err(CodexPromptPasteFailure::Failed(reason)),
+        }
     }
 
     fn observe_disposition(&mut self) -> TargetDisposition {
@@ -1721,8 +1782,8 @@ mod tests {
     use crate::{RestoreDestination, RestoreTargetState, TargetDisposition, TmuxSelector};
 
     use super::{
-        OwnedProcessIdentity, OwnedProcessState, OwnedServer, TemporaryClaimConfig,
-        UnconfirmedClaim, automatic_launch_commands, literal_paste_commands,
+        OwnedProcessIdentity, OwnedProcessState, OwnedServer, RestoredPane, TemporaryClaimConfig,
+        TmuxOwnedTarget, UnconfirmedClaim, automatic_launch_commands, literal_paste_commands,
         observe_owned_process_with, os, read_server_observation,
     };
 
@@ -1760,8 +1821,9 @@ mod tests {
     }
 
     #[test]
-    fn literal_hint_is_a_bracketed_tmux_paste_without_enter() {
-        let commands = literal_paste_commands("%7", b"'touch' '/tmp/marker'", "rescue-buffer");
+    fn codex_prompt_paste_is_set_buffer_then_bracketed_paste_without_enter() {
+        let input = "draft line\nsecond line: \u{4f60}\u{597d}";
+        let commands = literal_paste_commands("%7", input.as_bytes(), "rescue-buffer");
 
         assert_eq!(
             commands,
@@ -1771,7 +1833,7 @@ mod tests {
                     os("-b"),
                     os("rescue-buffer"),
                     os("--"),
-                    os("'touch' '/tmp/marker'"),
+                    os(input),
                 ],
                 vec![
                     os("paste-buffer"),
@@ -1785,11 +1847,60 @@ mod tests {
                 ],
             ]
         );
+        assert_eq!(commands.len(), 2);
         assert!(
             commands
                 .iter()
                 .flatten()
                 .all(|argument| argument != "Enter")
+        );
+    }
+
+    struct GuardTestProbe;
+
+    impl crate::PaneProcessProbe for GuardTestProbe {
+        fn observe(
+            &self,
+            _pane: &crate::TopologyPane,
+        ) -> Result<crate::PaneProcessObservation, crate::ProcessInspectionFailure> {
+            unreachable!("guard construction does not inspect processes")
+        }
+    }
+
+    #[test]
+    fn running_pane_guard_omits_only_the_shell_current_command_clause() {
+        let target = TmuxOwnedTarget {
+            server: OwnedServer {
+                destination: destination(std::path::Path::new("/tmp/guard-test.sock")),
+                token: "owner-token".to_owned(),
+                process: OwnedProcessIdentity {
+                    process_id: 101,
+                    proc_start_time: 22,
+                },
+                start_time: 33,
+            },
+            shell: crate::TargetShell::try_from_bytes(b"/bin/sh".to_vec()).unwrap(),
+            panes: std::collections::HashMap::new(),
+            process_probe: GuardTestProbe,
+        };
+        let pane = RestoredPane {
+            target_id: crate::TmuxPaneId::try_from_bytes(b"%7".to_vec()).unwrap(),
+            process_id: 202,
+            tty: crate::LosslessOsString::try_from_bytes(b"/dev/pts/7".to_vec()).unwrap(),
+            working_directory: crate::RecordedAbsolutePath::try_from_bytes(b"/tmp".to_vec())
+                .unwrap(),
+        };
+
+        let running = target.running_pane_condition(&pane);
+        let shell = target.shell_pane_condition(&pane);
+
+        assert_eq!(
+            running,
+            "#{&&:#{&&:#{==:#{@tmux_rescue_owner},owner-token},#{&&:#{==:#{pid},101},#{==:#{start_time},33}}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},202}}}"
+        );
+        assert_eq!(
+            shell,
+            format!("#{{&&:{running},#{{==:#{{pane_current_command}},sh}}}}")
         );
     }
 
