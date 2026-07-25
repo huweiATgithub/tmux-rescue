@@ -35,7 +35,10 @@ The persisted automatic-recovery type is exactly:
 
 ```text
 AutomaticRecovery =
-  | Codex { session_id: CodexSessionId }
+  | Codex {
+      session_id: CodexSessionId,
+      prompt_area: Option<CapturedCodexPromptArea>
+    }
   | ClaudeCode { session_id: ClaudeSessionId }
   | MdBookServe { command: RecognizedMdBookServeCommand }
   | BookshelfServe { command: RecognizedBookshelfServeCommand }
@@ -43,9 +46,11 @@ AutomaticRecovery =
 
 The Codex and Claude variants derive their canonical resume argv from the
 validated session ID; no separately serialized command can disagree with that
-identity. The serve-command variants wrap a `CapturedCommand` only after their
-constructors prove the executable and argv rules in their sections. Raw JSON
-cannot construct any of these refined payloads directly.
+identity. The optional Codex prompt area is capture enrichment bound to that
+same variant, not command or identity evidence. The serve-command variants wrap
+a `CapturedCommand` only after their constructors prove the executable and argv
+rules in their sections. Raw JSON cannot construct any of these refined
+payloads directly.
 
 ## Shared Resolver Contract
 
@@ -123,10 +128,60 @@ unparseable required field prevent automatic recovery.
 resolver must not substitute it for `payload.id`, infer ownership from a
 generic app-server process, scan for the newest session, or use `--last`.
 
+### Visible Prompt Evidence
+
+After exact session resolution, an explicit snapshot may optionally read the
+current visible tmux grid. The parser is intentionally tied to the observed
+Codex `0.145.0` renderer and fails closed on other layouts. Its primary frozen
+fixture is a `132x40` pane with cursor `(9,37)` and this exact seven-row bottom
+suffix:
+
+```text
+» The test prompt for recovering.
+
+  Line 1.
+
+  Line 2.
+
+  gpt-5.6-sol ultra · ~/projects/tmux-rescue · main · Context 78% used · 258K window · Fast on · Approve for me · 2.55M used · Main…
+```
+
+Transcript rows above that suffix are not prompt input. The accepted composer
+rules are:
+
+- the pane is not in copy mode, the cursor leaves at least one empty row before
+  the one-line footer, and every row in that inset is empty;
+- the first prompt row begins with exactly `› ` or `» `; later nonempty rows
+  begin with exactly two ASCII spaces;
+- the cursor is at the rendered end of the last nonempty prompt row, or at the
+  two-cell textarea start on an empty trailing continuation;
+- the footer is either the configured one-line form above with an exact
+  `Context N% used` segment, a default ASCII `0..100% context left` form with
+  the supported shortcut/queue/plan hints, or the supported narrow collapsed
+  hint; and
+- the exact empty-composer text `Ask Codex to do anything` at the textarea
+  start means no captured prompt.
+
+The renderer-owned glyph and first space are removed from the first row; exactly
+two ASCII margin spaces are removed from nonempty continuation rows. Blank rows,
+visible soft-wrap boundaries, additional indentation, and a trailing empty
+prompt row are preserved. Visible text such as
+`[Pasted Content 12345 chars]` is stored literally; tmux-rescue does not resolve
+or reconstruct the hidden pasted content behind that placeholder.
+
+This is a visible-suffix contract, not a completeness claim. A draft beginning
+above the current grid may yield only its visible suffix. Hidden, scrolled-out,
+popup-covered, copy-mode, unsafe, oversized, changing, or otherwise unsupported
+input is omitted. Such a failure retains the exact automatic Codex session
+recovery and emits only a prompt-free skip reason.
+
 ### Recovery Payload
 
 ```text
-AutomaticRecovery::Codex { session_id: CodexSessionId }
+AutomaticRecovery::Codex {
+  session_id: CodexSessionId,
+  prompt_area: Option<CapturedCodexPromptArea>
+}
 
 derived argv = ["codex", "resume", <session-id>]
 ```
@@ -137,6 +192,18 @@ absolute executable.
 After launch, `RecoveredAutomatically` requires a pane-tied Codex session file
 whose parsed `payload.id` equals the requested `CodexSessionId`. A foreground
 Codex process without exact identity confirmation becomes `NeedsAttention`.
+
+If the payload also contains a prompt area, the normal post-launch observation
+must first recover that exact session. Prompt preparation then performs a second
+fresh pane-tied classification and again requires the same exact
+`CodexSessionId`; the earlier settle result is not reusable authorization. Only
+that match permits one literal `set-buffer` plus bracketed
+`paste-buffer -d -p -r` into the exact retained pane. It sends no Enter and does
+not retry. A different session, missing pane, ownership loss, endpoint change,
+or failed paste sends no prompt input where detectable and produces a
+recovered-but-partial needs-attention result. The prompt text remains plaintext
+inside the owner-only snapshot and is never included in inspection, plan,
+warning, or result text.
 
 ## Claude Code
 

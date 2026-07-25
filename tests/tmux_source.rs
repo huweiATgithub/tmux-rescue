@@ -5,6 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tmux_rescue::{
     CaptureSource, LinuxProcessInspector, PaneProcessObservation, SnapshotSource, TmuxAdapter,
@@ -12,6 +14,8 @@ use tmux_rescue::{
 };
 
 static SOURCE_COMMAND_TEST: Mutex<()> = Mutex::new(());
+
+const APPROVED_CODEX_FOOTER: &str = "  gpt-5.6-sol ultra · ~/projects/tmux-rescue · main · Context 78% used · 258K window · Fast on · Approve for me · 2.55M used · Main…";
 
 struct ProcessContextGuard {
     directory: PathBuf,
@@ -566,6 +570,90 @@ fn visible_grid_capture_uses_stable_metadata_and_never_joins_rows() {
             "source capture used forbidden argument {forbidden:?}: {log}"
         );
     }
+}
+
+#[test]
+fn real_visible_grid_capture_preserves_the_approved_codex_suffix() {
+    let _serial = SOURCE_COMMAND_TEST.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    fs::create_dir(&working).unwrap();
+    let socket = temp.path().join("visible-grid-source.sock");
+    let server = TemporaryTmuxServer::start(&socket, &working);
+    let renderer = temp.path().join("render-visible-grid");
+    fs::write(
+        &renderer,
+        format!(
+            "#!/bin/sh\nprintf '%s' '» The test prompt for recovering.\n\n  Line 1.\n\n  Line 2.\n\n{APPROVED_CODEX_FOOTER}'\nprintf '\\033[2A\\r\\033[9C'\nexec /bin/sleep 30\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&renderer, fs::Permissions::from_mode(0o700)).unwrap();
+    let pane_title = format!(
+        "codex-visible-grid-{}",
+        temp.path().file_name().unwrap().to_string_lossy()
+    );
+    server.run(&["resize-window", "-t", "work:0", "-x", "132", "-y", "7"]);
+    server.run(&["select-pane", "-t", "work:0.0", "-T", &pane_title]);
+    server.run(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        "work:0.0",
+        renderer.to_str().unwrap(),
+    ]);
+
+    let source =
+        SnapshotSource::try_from_bytes(socket.as_os_str().as_encoded_bytes().to_vec()).unwrap();
+    let mut adapter = TmuxAdapter::new(source, LinuxProcessInspector::new());
+    let topology = adapter.read_topology().unwrap();
+    let pane = &topology.sessions()[0].windows()[0].panes()[0];
+    let expected = [
+        "» The test prompt for recovering.",
+        "",
+        "  Line 1.",
+        "",
+        "  Line 2.",
+        "",
+        APPROVED_CODEX_FOOTER,
+    ];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let grid = loop {
+        let grid = adapter.read_visible_pane(pane).unwrap();
+        if grid.rows().iter().map(|row| row.as_str()).eq(expected) {
+            break grid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "isolated pane never rendered the approved suffix: {:?}",
+            grid.rows()
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    assert_eq!(grid.metadata().width().get(), 132);
+    assert_eq!(grid.metadata().height().get(), 7);
+    assert_eq!(grid.metadata().cursor().x(), 9);
+    assert_eq!(grid.metadata().cursor().y(), 4);
+    assert_eq!(
+        grid.rows()
+            .iter()
+            .map(|row| row.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let title = selected_tmux(&server.selector, None, true)
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            pane.pane_id().as_str(),
+            "#{pane_title}",
+        ])
+        .output()
+        .unwrap();
+    assert!(title.status.success());
+    assert_eq!(String::from_utf8(title.stdout).unwrap().trim(), pane_title);
 }
 
 #[test]

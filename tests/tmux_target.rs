@@ -28,6 +28,7 @@ use tmux_rescue::{
 static ISOLATED_TMUX_TEST: Mutex<()> = Mutex::new(());
 const CODEX_SESSION_A: &str = "018f8f15-2e24-7a8a-a5c0-bf32e04c45be";
 const CODEX_SESSION_B: &str = "a27834ae-6192-4287-a005-86063335c28e";
+const CODEX_PROMPT_TEXT: &str = "The test prompt for recovering.\n\nLine 1.\n\nLine 2.";
 
 fn encoded(value: &str) -> Value {
     json!({"encoding": "utf8", "value": value})
@@ -138,6 +139,7 @@ fn snapshot(source: &Path, sessions: Vec<Value>) -> ValidatedSnapshot {
 struct PlanningEnvironment {
     home: RecordedAbsolutePath,
     executables: HashMap<Vec<u8>, Vec<u8>>,
+    target_shell: PathBuf,
 }
 
 impl PlanningEnvironment {
@@ -146,7 +148,13 @@ impl PlanningEnvironment {
             home: RecordedAbsolutePath::try_from_bytes(home.as_os_str().as_bytes().to_vec())
                 .unwrap(),
             executables: HashMap::new(),
+            target_shell: PathBuf::from("/bin/sh"),
         }
+    }
+
+    fn with_target_shell(mut self, target_shell: &Path) -> Self {
+        self.target_shell = target_shell.to_owned();
+        self
     }
 
     fn with_executable(mut self, command: &Path) -> Self {
@@ -159,7 +167,7 @@ impl PlanningEnvironment {
 
 impl RestoreEnvironment for PlanningEnvironment {
     fn target_shell(&self) -> Result<TargetShell, RestoreEnvironmentFailure> {
-        TargetShell::try_from_bytes(b"/bin/sh".to_vec())
+        TargetShell::try_from_bytes(self.target_shell.as_os_str().as_bytes().to_vec())
             .map_err(|error| RestoreEnvironmentFailure::new(error.to_string()))
     }
 
@@ -2040,6 +2048,155 @@ fn fresh_codex_identity_is_checked_after_settle_observation() {
     assert!(commands.iter().flatten().all(|argument| {
         argument.as_slice() != b"Enter" && argument.as_slice() != b"send-keys"
     }));
+}
+
+#[test]
+fn multiline_codex_prompt_is_pasted_literally_without_submission_on_a_real_target() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("multiline-prompt-target.sock");
+    let selector = target_selector(&socket);
+    let session_directory = create_directory(temp.path(), "prompt-session");
+    let pane_directory = create_directory(temp.path(), "prompt-pane");
+    let snapshot = snapshot(
+        &temp.path().join("source.sock"),
+        vec![session(
+            "prompt-target",
+            &session_directory,
+            vec![window(
+                0,
+                "prompt target",
+                vec![idle_pane(0, &pane_directory)],
+            )],
+        )],
+    );
+    let environment =
+        PlanningEnvironment::new(temp.path()).with_target_shell(Path::new("/bin/bash"));
+    let plan = plan_restore(&snapshot, Some(selector.clone()), &environment).unwrap();
+    let (session_id, prompt) =
+        codex_prompt_fixture(temp.path(), CODEX_SESSION_A, CODEX_PROMPT_TEXT);
+    let (probe, observations) = ScriptedCodexProbe::new([CODEX_SESSION_A]);
+    let _server = IsolatedServerGuard::for_socket(&socket);
+    let mut adapter = TmuxRestoreAdapter::with_process_probe(probe);
+    let mut owned = adapter
+        .claim(plan.destination(), plan.target_shell())
+        .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+    owned
+        .create_topology(&plan)
+        .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    require_success(
+        "start a controlled bracketed-paste shell",
+        selected_tmux(&selector, true)
+            .args([
+                "send-keys",
+                "-t",
+                "prompt-target:0.0",
+                "exec /bin/bash --noprofile --norc -i",
+                "Enter",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let shell_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let current = selected_tmux_stdout(
+            &selector,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "prompt-target:0.0",
+                "#{pane_current_command}",
+            ],
+        );
+        if current == b"bash\n" {
+            break;
+        }
+        assert!(
+            Instant::now() < shell_deadline,
+            "controlled shell did not become bash: {}",
+            String::from_utf8_lossy(&current)
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    require_success(
+        "set a unique test prompt and clear the visible pane",
+        selected_tmux(&selector, true)
+            .args([
+                "send-keys",
+                "-t",
+                "prompt-target:0.0",
+                "PS1=$(printf 'tmux-rescue-paste-test\\044 '); printf '\\033[2J\\033[H'",
+                "Enter",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let prompt_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let captured = tmux_stdout(&socket, &["capture-pane", "-p", "-t", "prompt-target:0.0"]);
+        if captured
+            .windows(b"tmux-rescue-paste-test$".len())
+            .any(|window| window == b"tmux-rescue-paste-test$")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < prompt_deadline,
+            "controlled shell prompt was not rendered: {}",
+            String::from_utf8_lossy(&captured)
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let coordinate = plan.panes()[0].coordinate().clone();
+    let mut recovery = owned.begin_recovery();
+
+    let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(observations.load(Ordering::SeqCst), 1);
+    let paste_deadline = Instant::now() + Duration::from_secs(2);
+    let captured = loop {
+        let captured = String::from_utf8(tmux_stdout(
+            &socket,
+            &["capture-pane", "-p", "-t", "prompt-target:0.0"],
+        ))
+        .unwrap();
+        if captured.contains("Line 2.") {
+            break captured;
+        }
+        assert!(
+            Instant::now() < paste_deadline,
+            "multiline prompt was not rendered: {captured:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        captured.contains(&format!("tmux-rescue-paste-test$ {CODEX_PROMPT_TEXT}")),
+        "multiline prompt bytes or row boundaries changed: {captured:?}"
+    );
+    assert_eq!(
+        captured.matches("tmux-rescue-paste-test$").count(),
+        1,
+        "the multiline input was submitted: {captured:?}"
+    );
+    assert_eq!(
+        String::from_utf8(selected_tmux_stdout(
+            &selector,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "prompt-target:0.0",
+                "#{pane_current_command}",
+            ],
+        ))
+        .unwrap()
+        .trim(),
+        "bash"
+    );
 }
 
 #[test]
