@@ -301,6 +301,17 @@ mod tests {
     }
 
     #[test]
+    fn measures_rows_in_terminal_cells_instead_of_bytes() {
+        let pane_id = TmuxPaneId::try_from_bytes(b"%15".to_vec()).unwrap();
+        let two_cell_pane =
+            VisiblePaneMetadata::try_new(pane_id.clone(), 2, 1, 0, 0, false).unwrap();
+        let too_narrow_pane = VisiblePaneMetadata::try_new(pane_id, 1, 1, 0, 0, false).unwrap();
+
+        assert!(VisiblePaneGrid::try_from_tmux_capture(two_cell_pane, "界\n".into()).is_ok());
+        assert!(VisiblePaneGrid::try_from_tmux_capture(too_narrow_pane, "界\n".into()).is_err());
+    }
+
+    #[test]
     fn rejects_rows_wider_than_the_pane_in_terminal_cells() {
         let metadata = VisiblePaneMetadata::try_new(
             TmuxPaneId::try_from_bytes(b"%15".to_vec()).unwrap(),
