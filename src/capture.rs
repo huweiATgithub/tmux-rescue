@@ -309,6 +309,58 @@ impl CaptureSourceFailure {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexPromptCaptureFailure(CodexPromptCaptureFailureKind);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Task 4 wires these parser failures into capture orchestration.
+enum CodexPromptCaptureFailureKind {
+    ReadFailure(CaptureFailure),
+    UnsupportedLayout,
+    UnsafeText,
+    SizeOverflow,
+}
+
+impl CodexPromptCaptureFailure {
+    pub fn try_from_read_failure(
+        message: impl Into<String>,
+    ) -> Result<Self, SnapshotValidationError> {
+        CaptureFailure::try_new(message)
+            .map(CodexPromptCaptureFailureKind::ReadFailure)
+            .map(Self)
+    }
+
+    pub fn message(&self) -> &str {
+        match &self.0 {
+            CodexPromptCaptureFailureKind::ReadFailure(failure) => failure.message(),
+            CodexPromptCaptureFailureKind::UnsupportedLayout => {
+                "visible pane does not match the supported Codex 0.145.0 prompt layout"
+            }
+            CodexPromptCaptureFailureKind::UnsafeText => {
+                "visible Codex prompt text is not safe to capture"
+            }
+            CodexPromptCaptureFailureKind::SizeOverflow => {
+                "visible Codex prompt text exceeds the capture size limit"
+            }
+        }
+    }
+
+    #[allow(dead_code)] // Task 4 makes the private parser reachable in non-test builds.
+    pub(crate) fn unsupported_layout() -> Self {
+        Self(CodexPromptCaptureFailureKind::UnsupportedLayout)
+    }
+
+    #[allow(dead_code)] // Task 4 makes the private parser reachable in non-test builds.
+    pub(crate) fn unsafe_text() -> Self {
+        Self(CodexPromptCaptureFailureKind::UnsafeText)
+    }
+
+    #[allow(dead_code)] // Task 4 makes the private parser reachable in non-test builds.
+    pub(crate) fn size_overflow() -> Self {
+        Self(CodexPromptCaptureFailureKind::SizeOverflow)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TopologyReadPhase {
     Before,

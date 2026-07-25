@@ -1,6 +1,8 @@
 //! Reusable capture and restore core for tmux-rescue.
 
 mod capture;
+#[allow(dead_code)] // Task 4 wires the pure parser into capture orchestration.
+mod codex_prompt;
 mod model;
 mod process;
 mod recovery;
