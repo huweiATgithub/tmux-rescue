@@ -8,6 +8,7 @@ mod restore;
 mod selector;
 mod storage;
 mod tmux;
+mod visible_pane;
 
 pub use capture::*;
 pub use model::*;
@@ -17,3 +18,4 @@ pub use restore::*;
 pub use selector::*;
 pub use storage::*;
 pub use tmux::*;
+pub use visible_pane::*;

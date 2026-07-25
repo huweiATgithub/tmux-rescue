@@ -29,6 +29,7 @@ serde_json = "1"
 termtree = "1.0"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
