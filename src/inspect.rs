@@ -454,16 +454,22 @@ impl PaneView {
     fn from_snapshot(pane: &tmux_rescue::PaneSnapshot, session_cwd: &[u8]) -> Self {
         let fact = match pane.recovery() {
             PaneRecovery::Idle => PaneFact::Shell,
-            PaneRecovery::Automatic(AutomaticRecovery::Codex { session_id, .. }) => {
-                PaneFact::ToolSession {
-                    name: "Codex",
-                    session_id: session_id.as_uuid().to_string(),
-                }
-            }
+            PaneRecovery::Automatic(AutomaticRecovery::Codex {
+                session_id,
+                prompt_area,
+            }) => PaneFact::ToolSession {
+                name: "Codex",
+                session_id: session_id.as_uuid().to_string(),
+                pending_input: prompt_area.as_ref().map(|prompt_area| PendingInputCounts {
+                    visible_rows: prompt_area.text().visible_row_count(),
+                    bytes: prompt_area.text().byte_count(),
+                }),
+            },
             PaneRecovery::Automatic(AutomaticRecovery::ClaudeCode { session_id }) => {
                 PaneFact::ToolSession {
                     name: "Claude Code",
                     session_id: session_id.as_uuid().to_string(),
+                    pending_input: None,
                 }
             }
             PaneRecovery::Automatic(AutomaticRecovery::MdBookServe { command }) => {
@@ -538,6 +544,7 @@ enum PaneFact {
     ToolSession {
         name: &'static str,
         session_id: String,
+        pending_input: Option<PendingInputCounts>,
     },
     Command(CommandView),
     Unavailable {
@@ -562,7 +569,23 @@ impl PaneFact {
     fn details(&self) -> Vec<String> {
         match self {
             Self::Shell => Vec::new(),
-            Self::ToolSession { session_id, .. } => vec![format!("session {session_id}")],
+            Self::ToolSession {
+                session_id,
+                pending_input,
+                ..
+            } => {
+                let mut details = vec![format!("session {session_id}")];
+                if let Some(pending_input) = pending_input {
+                    details.push(format!(
+                        "pending input  {} {} · {} {}",
+                        pending_input.visible_rows,
+                        count_noun(pending_input.visible_rows, "visible row", "visible rows"),
+                        pending_input.bytes,
+                        count_noun(pending_input.bytes, "byte", "bytes"),
+                    ));
+                }
+                details
+            }
             Self::Command(command) => {
                 vec![format!("executable {}", command.executable.as_str())]
             }
@@ -578,6 +601,12 @@ impl PaneFact {
             Self::Unavailable { .. } => "not captured",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingInputCounts {
+    visible_rows: usize,
+    bytes: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -786,6 +815,9 @@ mod tests {
                                 "recovery": {
                                     "kind": "codex",
                                     "session_id": "019f7ac5-a55c-7e70-8b31-872ae70c9a94",
+                                    "prompt_area": {
+                                        "text": "The test prompt for recovering.\n\nLine 1.\n\nLine 2."
+                                    },
                                 },
                             },
                         },
@@ -869,6 +901,9 @@ mod tests {
                                         "recovery": {
                                             "kind": "codex",
                                             "session_id": "019f7ac5-a55c-7e70-8b31-872ae70c9a94",
+                                            "prompt_area": {
+                                                "text": "The test prompt for recovering.\n\nLine 1.\n\nLine 2."
+                                            },
                                         },
                                     },
                                 },
@@ -1086,6 +1121,7 @@ mod tests {
             "(0) shell",
             "(1) Codex\n",
             "session 019f7ac5-a55c-7e70-8b31-872ae70c9a94",
+            "pending input  5 visible rows · 49 bytes",
             "(2) Claude Code\n",
             "session 8f707f38-6fd3-4a11-a03f-853b03d47b0c",
             "(3) mdbook serve\n",
@@ -1131,6 +1167,7 @@ mod tests {
                 "├─ [0] node\n",
                 "│  ├─ (0) Codex\n",
                 "│  │     session 019f7ac5-a55c-7e70-8b31-872ae70c9a94\n",
+                "│  │     pending input  5 visible rows · 49 bytes\n",
                 "│  │     cwd = ◆\n",
                 "│  └─ (1) shell\n",
                 "│        cwd = ◆\n",
@@ -1175,6 +1212,7 @@ mod tests {
             "├─  0 node\n",
             "│  ├─  0 Codex\n",
             "│  │     session 019f7ac5-a55c-7e70-8b31-872ae70c9a94\n",
+            "│  │     pending input  5 visible rows · 49 bytes\n",
             "│  │      = ◆\n",
             "│  └─  1 shell\n",
             "│         = ◆\n",
@@ -1215,6 +1253,10 @@ mod tests {
         let selection = crate::cli::SnapshotSelection::Explicit(loaded.path().to_owned());
         let plain = render(&loaded, &selection, Palette::plain(), IconMode::Unicode);
         let colored = render(&loaded, &selection, Palette::colored(), IconMode::Unicode);
+
+        assert!(plain.contains("pending input  5 visible rows · 49 bytes"));
+        assert!(!plain.contains("The test prompt for recovering."));
+        assert!(!colored.contains("The test prompt for recovering."));
 
         assert_eq!(
             styled_spans(&colored),
@@ -1275,6 +1317,24 @@ mod tests {
                 ("36", "◆"),
             ]
         );
+    }
+
+    #[test]
+    fn renders_a_single_pending_input_row_with_the_singular_noun() {
+        let mut fixture = mapped_recovery_fixture();
+        fixture["sessions"][0]["windows"][0]["panes"][1]["recovery"]["recovery"]["prompt_area"]["text"] =
+            json!("single");
+        let (_directory, loaded) = load_fixture(fixture);
+
+        let output = render(
+            &loaded,
+            &crate::cli::SnapshotSelection::Explicit(loaded.path().to_owned()),
+            Palette::plain(),
+            IconMode::Unicode,
+        );
+
+        assert!(output.contains("pending input  1 visible row · 6 bytes"));
+        assert!(!output.contains("single"));
     }
 
     #[test]

@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::{
-    AutomaticRecoveryExpectation, CaptureFailure, LosslessOsString, PaneRecovery,
-    RecordedAbsolutePath, RecoveryCommand, SourcePaneCoordinate, TmuxSelector, ValidatedSnapshot,
-    derive_automatic_command,
+    AutomaticRecovery, AutomaticRecoveryExpectation, CaptureFailure, CapturedCodexPromptArea,
+    CodexSessionId, LosslessOsString, PaneRecovery, RecordedAbsolutePath, RecoveryCommand,
+    SourcePaneCoordinate, TmuxSelector, ValidatedSnapshot, derive_automatic_command,
 };
 
 pub const MAX_RENDERED_SHELL_INPUT_BYTES: usize = 16 * 1024;
@@ -392,15 +392,84 @@ pub enum AutomaticFallbackReason {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedAutomaticLaunch {
+    directory: ExistingRecordedDirectory,
+    input: LaunchableShellInput,
+    expected: AutomaticRecoveryExpectation,
+    codex_prompt: Option<PlannedCodexPromptPaste>,
+}
+
+impl PlannedAutomaticLaunch {
+    fn new(
+        directory: ExistingRecordedDirectory,
+        input: LaunchableShellInput,
+        automatic: &AutomaticRecovery,
+    ) -> Self {
+        let (expected, codex_prompt) = match automatic {
+            AutomaticRecovery::Codex {
+                session_id,
+                prompt_area,
+            } => (
+                AutomaticRecoveryExpectation::Codex(session_id.clone()),
+                prompt_area
+                    .clone()
+                    .map(|input| PlannedCodexPromptPaste { input }),
+            ),
+            AutomaticRecovery::ClaudeCode { session_id } => (
+                AutomaticRecoveryExpectation::ClaudeCode(session_id.clone()),
+                None,
+            ),
+            AutomaticRecovery::MdBookServe { command } => (
+                AutomaticRecoveryExpectation::MdBookServe(command.clone()),
+                None,
+            ),
+            AutomaticRecovery::BookshelfServe { command } => (
+                AutomaticRecoveryExpectation::BookshelfServe(command.clone()),
+                None,
+            ),
+        };
+        Self {
+            directory,
+            input,
+            expected,
+            codex_prompt,
+        }
+    }
+
+    pub fn directory(&self) -> &ExistingRecordedDirectory {
+        &self.directory
+    }
+
+    pub fn input(&self) -> &LaunchableShellInput {
+        &self.input
+    }
+
+    pub fn expectation(&self) -> &AutomaticRecoveryExpectation {
+        &self.expected
+    }
+
+    pub(crate) fn codex_prompt(&self) -> Option<(&CodexSessionId, &CapturedCodexPromptArea)> {
+        match (&self.expected, &self.codex_prompt) {
+            (
+                AutomaticRecoveryExpectation::Codex(session_id),
+                Some(PlannedCodexPromptPaste { input }),
+            ) => Some((session_id, input)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedCodexPromptPaste {
+    input: CapturedCodexPromptArea,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlannedPaneAction {
     LeaveIdle {
         directory: ResolvedDirectory,
     },
-    LaunchAutomatic {
-        directory: ExistingRecordedDirectory,
-        input: LaunchableShellInput,
-        expected: AutomaticRecoveryExpectation,
-    },
+    LaunchAutomatic(PlannedAutomaticLaunch),
     PasteManualHint {
         directory: ResolvedDirectory,
         input: RenderedShellInput,
@@ -423,7 +492,7 @@ impl PlannedPaneAction {
             | Self::PasteManualHint { directory, .. }
             | Self::PasteAutomaticFallback { directory, .. }
             | Self::NoInput { directory, .. } => directory.path(),
-            Self::LaunchAutomatic { directory, .. } => directory.path(),
+            Self::LaunchAutomatic(launch) => launch.directory().path(),
         }
     }
 }
@@ -561,17 +630,23 @@ impl RestorePlan {
             ));
             match &pane.action {
                 PlannedPaneAction::LeaveIdle { .. } => {}
-                PlannedPaneAction::LaunchAutomatic {
-                    input, expected, ..
-                } => {
+                PlannedPaneAction::LaunchAutomatic(launch) => {
                     output.push_str(&format!(
                         "    input {} [submit Enter separately]\n",
-                        display_rendered_input(input.rendered().as_bytes())
+                        display_rendered_input(launch.input().rendered().as_bytes())
                     ));
                     output.push_str(&format!(
                         "    expected {}\n",
-                        automatic_expectation_label(expected)
+                        automatic_expectation_label(launch.expectation())
                     ));
+                    if let Some((_session_id, prompt_area)) = launch.codex_prompt() {
+                        let visible_rows = prompt_area.text().visible_row_count();
+                        output.push_str(&format!(
+                            "    after recovery  paste {} {} without Enter\n",
+                            visible_rows,
+                            count_noun(visible_rows, "visible row", "visible rows"),
+                        ));
+                    }
                 }
                 PlannedPaneAction::PasteManualHint { input, .. } => {
                     output.push_str(&format!(
@@ -628,7 +703,7 @@ impl PlannedPaneAction {
     fn label(&self) -> &'static str {
         match self {
             Self::LeaveIdle { .. } => "leave idle shell",
-            Self::LaunchAutomatic { .. } => "launch automatic recovery",
+            Self::LaunchAutomatic(_) => "launch automatic recovery",
             Self::PasteManualHint { .. } => "paste manual hint",
             Self::PasteAutomaticFallback { .. } => "paste automatic fallback hint",
             Self::NoInput { .. } => "no input",
@@ -637,7 +712,7 @@ impl PlannedPaneAction {
 
     fn directory_origin_label(&self) -> &'static str {
         match self {
-            Self::LaunchAutomatic { .. } => "recorded",
+            Self::LaunchAutomatic(_) => "recorded",
             Self::LeaveIdle { directory }
             | Self::PasteManualHint { directory, .. }
             | Self::PasteAutomaticFallback { directory, .. }
@@ -792,14 +867,16 @@ fn plan_pane_action(
             }
             let executable = executable.expect("fallback handles missing executable");
             let input = render_launch_command(shell, &command, &executable, coordinate)?;
-            Ok(PlannedPaneAction::LaunchAutomatic {
-                directory: ExistingRecordedDirectory(directory.path),
-                input: LaunchableShellInput {
-                    rendered: input,
-                    executable,
-                },
-                expected: AutomaticRecoveryExpectation::from(automatic),
-            })
+            Ok(PlannedPaneAction::LaunchAutomatic(
+                PlannedAutomaticLaunch::new(
+                    ExistingRecordedDirectory(directory.path),
+                    LaunchableShellInput {
+                        rendered: input,
+                        executable,
+                    },
+                    automatic,
+                ),
+            ))
         }
     }
 }
@@ -1296,6 +1373,10 @@ fn automatic_fallback_label(reason: &AutomaticFallbackReason) -> &'static str {
     }
 }
 
+fn count_noun(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 { singular } else { plural }
+}
+
 fn automatic_expectation_label(expected: &AutomaticRecoveryExpectation) -> String {
     match expected {
         AutomaticRecoveryExpectation::Codex(session_id) => {
@@ -1665,9 +1746,9 @@ fn execute_pane(
         PlannedPaneAction::NoInput { reason, .. } => PaneRestoreOutcome::NeedsAttention(
             AttentionReason::CapturedRecoveryUnavailable(reason.clone()),
         ),
-        PlannedPaneAction::LaunchAutomatic {
-            input, expected, ..
-        } => execute_automatic(target, shell, pane, input, expected),
+        PlannedPaneAction::LaunchAutomatic(launch) => {
+            execute_automatic(target, shell, pane, launch.input(), launch.expectation())
+        }
     }
 }
 
