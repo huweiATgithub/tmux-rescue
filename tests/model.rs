@@ -139,10 +139,9 @@ fn rejects_whitespace_control_and_oversized_prompt_text() {
         if let Some(text) = value["sessions"][0]["windows"][0]["panes"][0]["recovery"]
             ["recovery"]["prompt_area"]["text"]
             .as_str()
+            && !text.is_empty()
         {
-            if !text.is_empty() {
-                assert!(!error.to_string().contains(text));
-            }
+            assert!(!error.to_string().contains(text));
         }
     }
 }
