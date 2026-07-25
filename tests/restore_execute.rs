@@ -532,7 +532,7 @@ fn guarded_input_automatic_launch_submits_a_separate_enter_and_confirms_identity
         &[b"codex"],
     );
     let expected = match plan.panes()[0].action() {
-        tmux_rescue::PlannedPaneAction::LaunchAutomatic { expected, .. } => expected.clone(),
+        tmux_rescue::PlannedPaneAction::LaunchAutomatic(launch) => launch.expectation().clone(),
         action => panic!("expected automatic launch, got {action:?}"),
     };
     let mut script = TargetScript::successful();
