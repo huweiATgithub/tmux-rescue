@@ -451,7 +451,7 @@ fn install_logging_tmux_proxy(temp: &Path) -> (PathBuf, Vec<EnvironmentGuard>) {
     let executable = bin.join("tmux");
     fs::write(
         &executable,
-        b"#!/bin/sh\nprintf 'COMMAND\n' >> \"$FAKE_TMUX_LOG\"\nexec \"$REAL_TMUX\" \"$@\"\n",
+        b"#!/bin/sh\nfor arg do printf '%s\\000' \"$arg\"; done >> \"$FAKE_TMUX_LOG\"\nexec \"$REAL_TMUX\" \"$@\"\n",
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -469,12 +469,17 @@ fn install_logging_tmux_proxy(temp: &Path) -> (PathBuf, Vec<EnvironmentGuard>) {
     (log, guards)
 }
 
+struct BlockedPromptProxyLogs {
+    input: PathBuf,
+    pane_probe: PathBuf,
+}
+
 fn install_blocked_prompt_proxy(
     temp: &Path,
     selector: &TmuxSelector,
     target_pane: &str,
     remove_pane: bool,
-) -> (PathBuf, Vec<EnvironmentGuard>) {
+) -> (BlockedPromptProxyLogs, Vec<EnvironmentGuard>) {
     let real_tmux = std::env::split_paths(std::env::var_os("PATH").as_deref().unwrap_or_default())
         .map(|directory| directory.join("tmux"))
         .find(|candidate| candidate.is_file())
@@ -491,9 +496,7 @@ fn install_blocked_prompt_proxy(
         br#"#!/bin/sh
 case " $* " in
   *' display-message '*)
-    if [ "$REMOVE_BLOCKED_PANE" = 1 ] && [ -e "$BLOCKED_PANE_REMOVED" ]; then
-      exit 1
-    fi
+    for arg do printf '%s\000' "$arg"; done >> "$PANE_PROBE_LOG"
     ;;
   *' if-shell '*)
     output=$("$REAL_TMUX" "$@")
@@ -503,7 +506,6 @@ case " $* " in
         if [ "$REMOVE_BLOCKED_PANE" = 1 ]; then
           "$REAL_TMUX" -u -N "$TEST_SELECTOR_FLAG" "$TEST_SELECTOR_VALUE" set-option -s exit-empty off >/dev/null || exit 97
           "$REAL_TMUX" -u -N "$TEST_SELECTOR_FLAG" "$TEST_SELECTOR_VALUE" kill-pane -t "$TEST_TARGET_PANE" >/dev/null || exit 98
-          : > "$BLOCKED_PANE_REMOVED"
         fi
         ;;
       *) printf 'INPUT_EXECUTED\n' >> "$PROMPT_PROXY_LOG" ;;
@@ -517,11 +519,15 @@ exec "$REAL_TMUX" "$@"
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-    let removed = temp.join("blocked-pane-removed");
-    let log = temp.join(if remove_pane {
+    let input_log = temp.join(if remove_pane {
         "remove-pane-proxy.log"
     } else {
         "retain-pane-proxy.log"
+    });
+    let pane_probe_log = temp.join(if remove_pane {
+        "remove-pane-probe.log"
+    } else {
+        "retain-pane-probe.log"
     });
     let old_path = std::env::var_os("PATH");
     let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
@@ -535,10 +541,64 @@ exec "$REAL_TMUX" "$@"
         EnvironmentGuard::set("TEST_SELECTOR_VALUE", selector.value()),
         EnvironmentGuard::set("TEST_TARGET_PANE", target_pane),
         EnvironmentGuard::set("REMOVE_BLOCKED_PANE", if remove_pane { "1" } else { "0" }),
-        EnvironmentGuard::set("BLOCKED_PANE_REMOVED", &removed),
-        EnvironmentGuard::set("PROMPT_PROXY_LOG", &log),
+        EnvironmentGuard::set("PROMPT_PROXY_LOG", &input_log),
+        EnvironmentGuard::set("PANE_PROBE_LOG", &pane_probe_log),
     ];
-    (log, guards)
+    (
+        BlockedPromptProxyLogs {
+            input: input_log,
+            pane_probe: pane_probe_log,
+        },
+        guards,
+    )
+}
+
+fn nul_framed_arguments(path: &Path) -> Vec<Vec<u8>> {
+    let bytes = fs::read(path).unwrap_or_default();
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    assert_eq!(bytes.last(), Some(&0));
+    bytes[..bytes.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+fn parse_tmux_command_list(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
+    let mut commands = vec![Vec::new()];
+    let mut cursor = 0;
+    while cursor < input.len() {
+        assert_eq!(input[cursor], b'"', "argument must start with a quote");
+        cursor += 1;
+        let mut argument = Vec::new();
+        while input.get(cursor) != Some(&b'"') {
+            assert_eq!(input.get(cursor), Some(&b'\\'));
+            let octal = input
+                .get(cursor + 1..cursor + 4)
+                .expect("quoted byte must have three octal digits");
+            assert!(octal.iter().all(|byte| matches!(byte, b'0'..=b'7')));
+            let value = octal
+                .iter()
+                .fold(0_u8, |value, digit| value * 8 + (digit - b'0'));
+            argument.push(value);
+            cursor += 4;
+        }
+        cursor += 1;
+        commands.last_mut().unwrap().push(argument);
+        if cursor == input.len() {
+            break;
+        }
+        if input[cursor..].starts_with(b" ; ") {
+            commands.push(Vec::new());
+            cursor += 3;
+        } else {
+            assert_eq!(input.get(cursor), Some(&b' '));
+            cursor += 1;
+        }
+    }
+    assert!(commands.iter().all(|command| !command.is_empty()));
+    commands
 }
 
 fn install_claim_evidence_tmux(
@@ -1694,7 +1754,7 @@ fn blocked_prompt_guard_reports_the_exact_identity_race_without_input() {
         &["display-message", "-p", "-t", "planned:0.0", "#{pane_id}"],
     ))
     .unwrap();
-    let (log_path, _proxy) =
+    let (logs, _proxy) =
         install_blocked_prompt_proxy(temp.path(), &selector, target_pane.trim_end(), false);
 
     let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
@@ -1707,9 +1767,23 @@ fn blocked_prompt_guard_reports_the_exact_identity_race_without_input() {
     );
     assert_eq!(observations.load(Ordering::SeqCst), 2);
     assert_eq!(
-        fs::read(&log_path).unwrap_or_default(),
+        fs::read(&logs.input).unwrap_or_default(),
         b"",
         "the blocked conditional executed prompt input"
+    );
+    assert_eq!(
+        nul_framed_arguments(&logs.pane_probe),
+        vec![
+            b"-u".to_vec(),
+            b"-N".to_vec(),
+            selector.flag().as_bytes().to_vec(),
+            selector.value().as_bytes().to_vec(),
+            b"display-message".to_vec(),
+            b"-p".to_vec(),
+            b"-t".to_vec(),
+            target_pane.trim_end().as_bytes().to_vec(),
+            b"#{pane_id}".to_vec(),
+        ]
     );
 }
 
@@ -1752,6 +1826,13 @@ fn pane_removed_after_blocked_prompt_guard_reports_pane_missing() {
     owned
         .create_topology(&plan)
         .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    require_success(
+        "create an unrelated keepalive pane",
+        selected_tmux(&selector, true)
+            .args(["split-window", "-d", "-t", "planned:0.0"])
+            .output()
+            .unwrap(),
+    );
     let coordinate = plan.panes()[0].coordinate().clone();
     let mut recovery = owned.begin_recovery();
     assert_eq!(
@@ -1763,7 +1844,7 @@ fn pane_removed_after_blocked_prompt_guard_reports_pane_missing() {
         &["display-message", "-p", "-t", "planned:0.0", "#{pane_id}"],
     ))
     .unwrap();
-    let (log_path, _proxy) =
+    let (logs, proxy) =
         install_blocked_prompt_proxy(temp.path(), &selector, target_pane.trim_end(), true);
 
     let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
@@ -1771,9 +1852,53 @@ fn pane_removed_after_blocked_prompt_guard_reports_pane_missing() {
     assert_eq!(result, Err(CodexPromptPasteFailure::PaneMissing));
     assert_eq!(observations.load(Ordering::SeqCst), 2);
     assert_eq!(
-        fs::read(&log_path).unwrap_or_default(),
+        fs::read(&logs.input).unwrap_or_default(),
         b"",
         "the blocked conditional executed prompt input"
+    );
+    assert_eq!(
+        nul_framed_arguments(&logs.pane_probe),
+        vec![
+            b"-u".to_vec(),
+            b"-N".to_vec(),
+            selector.flag().as_bytes().to_vec(),
+            selector.value().as_bytes().to_vec(),
+            b"display-message".to_vec(),
+            b"-p".to_vec(),
+            b"-t".to_vec(),
+            target_pane.trim_end().as_bytes().to_vec(),
+            b"#{pane_id}".to_vec(),
+        ]
+    );
+    drop(proxy);
+    let remaining_panes =
+        selected_tmux_stdout(&selector, &["list-panes", "-a", "-F", "#{pane_id}"]);
+    assert!(
+        remaining_panes
+            .split(|byte| *byte == b'\n')
+            .all(|pane_id| pane_id != target_pane.trim_end().as_bytes()),
+        "the exact isolated pane remained after successful kill-pane"
+    );
+    let exact_pane_probe = selected_tmux(&selector, true)
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            target_pane.trim_end(),
+            "#{pane_id}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        exact_pane_probe.status.success(),
+        "tmux rejected the explicit dead-pane probe instead of returning its blank result: {}",
+        String::from_utf8_lossy(&exact_pane_probe.stderr)
+    );
+    assert_eq!(
+        exact_pane_probe.stdout,
+        b"\n",
+        "the explicit dead-pane probe did not return tmux's blank identity: {}",
+        String::from_utf8_lossy(&exact_pane_probe.stdout)
     );
 }
 
@@ -1836,17 +1961,85 @@ fn fresh_codex_identity_is_checked_after_settle_observation() {
         recovery.observe_automatic(&coordinate, &expected),
         AutomaticPaneObservation::Recovered
     );
+    let target_pane = String::from_utf8(selected_tmux_stdout(
+        &selector,
+        &["display-message", "-p", "-t", "planned:0.0", "#{pane_id}"],
+    ))
+    .unwrap();
+    let target_pane = target_pane.trim_end();
     let (log_path, _proxy) = install_logging_tmux_proxy(temp.path());
 
     let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
 
     assert_eq!(result, Ok(()));
     assert_eq!(observations.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        fs::read(&log_path).unwrap_or_default(),
-        b"COMMAND\n",
-        "exactly one guarded prompt-paste client should be dispatched"
+    let arguments = nul_framed_arguments(&log_path);
+    assert_eq!(arguments.len(), 11, "expected one exact tmux client call");
+    assert_eq!(arguments[0], b"-u");
+    assert_eq!(arguments[1], b"-N");
+    assert_eq!(arguments[2], selector.flag().as_bytes());
+    assert_eq!(arguments[3], selector.value().as_bytes());
+    assert_eq!(arguments[4], b"if-shell");
+    assert_eq!(arguments[5], b"-F");
+    assert_eq!(arguments[6], b"-t");
+    assert_eq!(arguments[7], target_pane.as_bytes());
+
+    let blocked = parse_tmux_command_list(&arguments[10]);
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].len(), 3);
+    assert_eq!(blocked[0][0], b"display-message");
+    assert_eq!(blocked[0][1], b"-p");
+    let owner_token = blocked[0][2]
+        .strip_prefix(b"TMUX_RESCUE_INPUT_BLOCKED_")
+        .expect("blocked marker carries the owner token");
+    assert_eq!(owner_token.len(), 64);
+    assert!(owner_token.iter().all(u8::is_ascii_hexdigit));
+    let owner_condition = [b"#{==:#{@tmux_rescue_owner},".as_slice(), owner_token, b"}"].concat();
+    assert!(
+        arguments[8]
+            .windows(owner_condition.len())
+            .any(|bytes| bytes == owner_condition)
     );
+    assert!(
+        !arguments[8]
+            .windows(b"pane_current_command".len())
+            .any(|bytes| bytes == b"pane_current_command")
+    );
+
+    let commands = parse_tmux_command_list(&arguments[9]);
+    assert_eq!(commands.len(), 2, "prompt paste has exactly two commands");
+    let buffer_prefix = [b"tmux-rescue-".as_slice(), owner_token, b"-"].concat();
+    let buffer_name = &commands[0][2];
+    let unique_suffix = buffer_name
+        .strip_prefix(buffer_prefix.as_slice())
+        .expect("buffer name is scoped by the owner token");
+    assert_eq!(unique_suffix.len(), 32);
+    assert!(unique_suffix.iter().all(u8::is_ascii_hexdigit));
+    assert_eq!(
+        commands,
+        vec![
+            vec![
+                b"set-buffer".to_vec(),
+                b"-b".to_vec(),
+                buffer_name.clone(),
+                b"--".to_vec(),
+                prompt.text().as_str().as_bytes().to_vec(),
+            ],
+            vec![
+                b"paste-buffer".to_vec(),
+                b"-d".to_vec(),
+                b"-p".to_vec(),
+                b"-r".to_vec(),
+                b"-b".to_vec(),
+                buffer_name.clone(),
+                b"-t".to_vec(),
+                target_pane.as_bytes().to_vec(),
+            ],
+        ]
+    );
+    assert!(commands.iter().flatten().all(|argument| {
+        argument.as_slice() != b"Enter" && argument.as_slice() != b"send-keys"
+    }));
 }
 
 #[test]

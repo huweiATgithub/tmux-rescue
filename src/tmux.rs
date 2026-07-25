@@ -1061,7 +1061,7 @@ impl<P: PaneProcessProbe> TmuxOwnedTarget<P> {
     }
 
     fn pane_still_exists(&self, pane: &RestoredPane) -> bool {
-        run_target_stdout(
+        let Ok(output) = run_target_stdout(
             &self.server.destination,
             &[
                 os("display-message"),
@@ -1071,8 +1071,13 @@ impl<P: PaneProcessProbe> TmuxOwnedTarget<P> {
                 os("#{pane_id}"),
             ],
             "probe restored pane",
-        )
-        .is_ok()
+        ) else {
+            return false;
+        };
+        let Some(pane_id) = output.strip_suffix(b"\n") else {
+            return false;
+        };
+        TmuxPaneId::try_from_bytes(pane_id.to_vec()).is_ok_and(|pane_id| pane_id == pane.target_id)
     }
 }
 
