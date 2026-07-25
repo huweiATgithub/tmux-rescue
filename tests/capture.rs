@@ -515,20 +515,37 @@ fn prompt_failure_events_never_contain_prompt_text() {
 
     let result = capture_snapshot(&mut source, capture_time()).unwrap();
 
-    for event in result.events() {
-        let debug = format!("{event:?}");
-        assert!(!debug.contains(SENSITIVE_PROMPT), "prompt leaked: {debug}");
-        if let CaptureEvent::CodexPromptCaptureSkipped { failure, .. } = event {
-            assert!(!failure.message().contains(SENSITIVE_PROMPT));
+    let PaneRecovery::Automatic(AutomaticRecovery::Codex {
+        session_id,
+        prompt_area: None,
+    }) = result.snapshot().sessions()[0].windows()[0].panes()[0].recovery()
+    else {
+        panic!("expected prompt-free automatic Codex recovery");
+    };
+    assert_eq!(session_id.as_uuid().to_string(), CODEX_SESSION_ID);
+    let [event] = result.events() else {
+        panic!("expected exactly one prompt-capture skip event");
+    };
+    let CaptureEvent::CodexPromptCaptureSkipped {
+        attempt,
+        pane,
+        failure,
+    } = event
+    else {
+        panic!("expected a prompt-capture skip event");
+    };
+    assert_eq!(*attempt, 1);
+    assert_eq!(
+        pane,
+        &tmux_rescue::SourcePaneCoordinate {
+            session_name: "work".to_owned(),
+            window_index: 1,
+            pane_index: 0,
         }
-    }
-    assert!(matches!(
-        result.snapshot().sessions()[0].windows()[0].panes()[0].recovery(),
-        PaneRecovery::Automatic(AutomaticRecovery::Codex {
-            prompt_area: None,
-            ..
-        })
-    ));
+    );
+    let debug = format!("{event:?}");
+    assert!(!debug.contains(SENSITIVE_PROMPT), "prompt leaked: {debug}");
+    assert!(!failure.message().contains(SENSITIVE_PROMPT));
 }
 
 #[test]

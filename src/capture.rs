@@ -764,6 +764,9 @@ mod tests {
 
     use super::*;
 
+    const FIRST_CODEX_SESSION_ID: &str = "1d6381bf-01c5-4c4a-b725-8e376e5ad295";
+    const SECOND_CODEX_SESSION_ID: &str = "27ea5a6d-5b84-4770-998e-a1a8285b0e9a";
+
     fn encoded(value: &str) -> RawEncodedOsString {
         RawEncodedOsString {
             encoding: "utf8".to_owned(),
@@ -771,25 +774,30 @@ mod tests {
         }
     }
 
-    fn candidate(prompt: Option<&str>) -> Vec<RawSessionSnapshot> {
+    fn candidate(prompts: [Option<&str>; 2]) -> Vec<RawSessionSnapshot> {
         vec![RawSessionSnapshot {
             name: "work".to_owned(),
             working_directory: encoded("/tmp/work"),
             windows: vec![RawWindowSnapshot {
                 source_index: 0,
                 name: "editor".to_owned(),
-                panes: vec![RawPaneSnapshot {
-                    source_index: 0,
-                    working_directory: encoded("/tmp/work"),
-                    recovery: RawPaneRecovery::Automatic {
-                        recovery: RawAutomaticRecovery::Codex {
-                            session_id: "1d6381bf-01c5-4c4a-b725-8e376e5ad295".to_owned(),
-                            prompt_area: prompt.map(|text| RawCapturedCodexPromptArea {
-                                text: text.to_owned(),
-                            }),
+                panes: prompts
+                    .into_iter()
+                    .zip([FIRST_CODEX_SESSION_ID, SECOND_CODEX_SESSION_ID])
+                    .enumerate()
+                    .map(|(index, (prompt, session_id))| RawPaneSnapshot {
+                        source_index: u32::try_from(index).unwrap(),
+                        working_directory: encoded("/tmp/work"),
+                        recovery: RawPaneRecovery::Automatic {
+                            recovery: RawAutomaticRecovery::Codex {
+                                session_id: session_id.to_owned(),
+                                prompt_area: prompt.map(|text| RawCapturedCodexPromptArea {
+                                    text: text.to_owned(),
+                                }),
+                            },
                         },
-                    },
-                }],
+                    })
+                    .collect(),
             }],
         }]
     }
@@ -805,13 +813,16 @@ mod tests {
 
     #[test]
     fn snapshot_budget_pressure_drops_prompt_enrichment_without_discarding_codex_recovery() {
-        let prompt_free_size = serde_json::to_vec(&raw_snapshot(candidate(None)))
+        let prompt_free_size = serde_json::to_vec(&raw_snapshot(candidate([None, None])))
             .unwrap()
             .len();
         assert!(
-            serde_json::to_vec(&raw_snapshot(candidate(Some("private draft"))))
-                .unwrap()
-                .len()
+            serde_json::to_vec(&raw_snapshot(candidate([
+                Some("first private draft"),
+                Some("second private draft"),
+            ])))
+            .unwrap()
+            .len()
                 > prompt_free_size
         );
 
@@ -819,35 +830,59 @@ mod tests {
             CaptureTime::parse_rfc3339("2026-07-23T00:00:00Z").unwrap(),
             SnapshotSource::try_from_bytes(b"/tmp/source.sock".to_vec()).unwrap(),
             RawCaptureConsistency::Stable {},
-            candidate(Some("private draft")),
-            1,
+            candidate([Some("first private draft"), Some("second private draft")]),
+            7,
             Vec::new(),
             prompt_free_size,
         )
         .unwrap();
 
-        let PaneRecovery::Automatic(AutomaticRecovery::Codex {
-            session_id,
-            prompt_area: None,
-        }) = result.snapshot().sessions()[0].windows()[0].panes()[0].recovery()
-        else {
-            panic!("expected prompt-free automatic Codex recovery");
+        let panes = result.snapshot().sessions()[0].windows()[0].panes();
+        let [first_pane, second_pane] = panes else {
+            panic!("expected exactly two Codex panes");
         };
-        assert_eq!(
-            session_id.as_uuid().to_string(),
-            "1d6381bf-01c5-4c4a-b725-8e376e5ad295"
-        );
-        assert!(matches!(
-            result.events(),
-            [CaptureEvent::CodexPromptCaptureSkipped { failure, .. }]
-                if failure.message() == "snapshot size budget exceeded"
-        ));
+        for (pane, expected_session_id) in [
+            (first_pane, FIRST_CODEX_SESSION_ID),
+            (second_pane, SECOND_CODEX_SESSION_ID),
+        ] {
+            let PaneRecovery::Automatic(AutomaticRecovery::Codex {
+                session_id,
+                prompt_area: None,
+            }) = pane.recovery()
+            else {
+                panic!("expected prompt-free automatic Codex recovery");
+            };
+            assert_eq!(session_id.as_uuid().to_string(), expected_session_id);
+        }
+        let [first_event, second_event] = result.events() else {
+            panic!("expected one budget event for each prompt-bearing pane");
+        };
+        for (event, pane_index) in [(first_event, 0), (second_event, 1)] {
+            let CaptureEvent::CodexPromptCaptureSkipped {
+                attempt,
+                pane,
+                failure,
+            } = event
+            else {
+                panic!("expected a prompt-capture skip event");
+            };
+            assert_eq!(*attempt, 7);
+            assert_eq!(
+                pane,
+                &SourcePaneCoordinate {
+                    session_name: "work".to_owned(),
+                    window_index: 0,
+                    pane_index,
+                }
+            );
+            assert_eq!(failure.message(), "snapshot size budget exceeded");
+        }
 
         let error = build_result_with_serialization_limit(
             CaptureTime::parse_rfc3339("2026-07-23T00:00:00Z").unwrap(),
             SnapshotSource::try_from_bytes(b"/tmp/source.sock".to_vec()).unwrap(),
             RawCaptureConsistency::Stable {},
-            candidate(None),
+            candidate([None, None]),
             1,
             Vec::new(),
             prompt_free_size - 1,
