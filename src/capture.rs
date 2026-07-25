@@ -4,11 +4,13 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::{
-    CaptureFailure, CaptureTime, LosslessOsString, MAX_PANES_PER_WINDOW, MAX_SESSIONS,
-    MAX_TOPOLOGY_VALIDATION_ATTEMPTS, MAX_WINDOWS_PER_SESSION, PaneRecovery,
-    PaneTiedForegroundEvidence, RawCaptureConsistency, RawPaneRecovery, RawPaneSnapshot,
-    RawSessionSnapshot, RawSnapshot, RawWindowSnapshot, RecordedAbsolutePath, ResolverOutcome,
-    SnapshotSource, SnapshotValidationError, ValidatedSnapshot, classify_pane,
+    AutomaticRecovery, CaptureFailure, CaptureTime, LosslessOsString, MAX_PANES_PER_WINDOW,
+    MAX_SESSIONS, MAX_SNAPSHOT_BYTES, MAX_TOPOLOGY_VALIDATION_ATTEMPTS, MAX_WINDOWS_PER_SESSION,
+    PaneRecovery, PaneTiedForegroundEvidence, RawAutomaticRecovery, RawCaptureConsistency,
+    RawPaneRecovery, RawPaneSnapshot, RawSessionSnapshot, RawSnapshot, RawWindowSnapshot,
+    RecordedAbsolutePath, ResolverOutcome, SnapshotSource, SnapshotValidationError, TmuxPaneId,
+    ValidatedSnapshot, VisiblePaneGrid, classify_pane,
+    codex_prompt::{CodexPromptAreaObservation, capture_visible_codex_prompt},
     model::{validate_session_name, validate_window_name},
 };
 
@@ -75,6 +77,7 @@ pub enum PaneAnchorError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TopologyPane {
     source_index: u32,
+    pane_id: TmuxPaneId,
     working_directory: RecordedAbsolutePath,
     process_anchor: PaneProcessAnchor,
 }
@@ -82,11 +85,13 @@ pub struct TopologyPane {
 impl TopologyPane {
     pub fn new(
         source_index: u32,
+        pane_id: TmuxPaneId,
         working_directory: RecordedAbsolutePath,
         process_anchor: PaneProcessAnchor,
     ) -> Self {
         Self {
             source_index,
+            pane_id,
             working_directory,
             process_anchor,
         }
@@ -94,6 +99,10 @@ impl TopologyPane {
 
     pub fn source_index(&self) -> u32 {
         self.source_index
+    }
+
+    pub fn pane_id(&self) -> &TmuxPaneId {
+        &self.pane_id
     }
 
     pub fn working_directory(&self) -> &RecordedAbsolutePath {
@@ -264,7 +273,11 @@ impl TopologyObservation {
                             .map(|window| {
                                 (
                                     window.source_index,
-                                    window.panes.iter().map(|pane| pane.source_index).collect(),
+                                    window
+                                        .panes
+                                        .iter()
+                                        .map(|pane| (pane.source_index, pane.pane_id.clone()))
+                                        .collect(),
                                 )
                             })
                             .collect(),
@@ -275,7 +288,7 @@ impl TopologyObservation {
     }
 }
 
-type PaneFingerprint = Vec<u32>;
+type PaneFingerprint = Vec<(u32, TmuxPaneId)>;
 type WindowFingerprint = (u32, PaneFingerprint);
 type SessionFingerprint = (String, Vec<WindowFingerprint>);
 
@@ -293,6 +306,10 @@ pub trait CaptureSource {
     fn source(&self) -> &SnapshotSource;
     fn read_topology(&mut self) -> Result<TopologyObservation, CaptureSourceFailure>;
     fn inspect_pane(&mut self, pane: &TopologyPane) -> PaneProcessObservation;
+    fn read_visible_pane(
+        &mut self,
+        pane: &TopologyPane,
+    ) -> Result<VisiblePaneGrid, CodexPromptCaptureFailure>;
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -313,12 +330,12 @@ impl CaptureSourceFailure {
 pub struct CodexPromptCaptureFailure(CodexPromptCaptureFailureKind);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Task 4 wires these parser failures into capture orchestration.
 enum CodexPromptCaptureFailureKind {
     ReadFailure(CaptureFailure),
     UnsupportedLayout,
     UnsafeText,
     SizeOverflow,
+    SnapshotSizeBudgetExceeded,
 }
 
 impl CodexPromptCaptureFailure {
@@ -342,22 +359,26 @@ impl CodexPromptCaptureFailure {
             CodexPromptCaptureFailureKind::SizeOverflow => {
                 "visible Codex prompt text exceeds the capture size limit"
             }
+            CodexPromptCaptureFailureKind::SnapshotSizeBudgetExceeded => {
+                "snapshot size budget exceeded"
+            }
         }
     }
 
-    #[allow(dead_code)] // Task 4 makes the private parser reachable in non-test builds.
     pub(crate) fn unsupported_layout() -> Self {
         Self(CodexPromptCaptureFailureKind::UnsupportedLayout)
     }
 
-    #[allow(dead_code)] // Task 4 makes the private parser reachable in non-test builds.
     pub(crate) fn unsafe_text() -> Self {
         Self(CodexPromptCaptureFailureKind::UnsafeText)
     }
 
-    #[allow(dead_code)] // Task 4 makes the private parser reachable in non-test builds.
     pub(crate) fn size_overflow() -> Self {
         Self(CodexPromptCaptureFailureKind::SizeOverflow)
+    }
+
+    fn snapshot_size_budget_exceeded() -> Self {
+        Self(CodexPromptCaptureFailureKind::SnapshotSizeBudgetExceeded)
     }
 }
 
@@ -393,6 +414,11 @@ pub enum CaptureEvent {
         attempt: usize,
         pane: SourcePaneCoordinate,
         outcome: ResolverOutcome,
+    },
+    CodexPromptCaptureSkipped {
+        attempt: usize,
+        pane: SourcePaneCoordinate,
+        failure: CodexPromptCaptureFailure,
     },
     UnstableCandidateSaved {
         attempts: usize,
@@ -548,25 +574,20 @@ fn capture_candidate(
                                 PaneProcessObservation::Unavailable(failure) => {
                                     events.push(CaptureEvent::PaneRecoveryUnavailable {
                                         attempt,
-                                        pane: coordinate,
+                                        pane: coordinate.clone(),
                                         failure: failure.clone(),
                                     });
                                     PaneRecovery::Unavailable(failure)
                                 }
                                 PaneProcessObservation::Foreground(evidence) => {
-                                    let classification = classify_pane(*evidence);
-                                    if matches!(
-                                        classification.resolver_outcome(),
-                                        ResolverOutcome::InsufficientEvidence(_)
-                                            | ResolverOutcome::ConflictingEvidence(_)
-                                    ) {
-                                        events.push(CaptureEvent::ResolverDowngraded {
-                                            attempt,
-                                            pane: coordinate,
-                                            outcome: classification.resolver_outcome().clone(),
-                                        });
-                                    }
-                                    classification.into_recovery()
+                                    capture_foreground_recovery(
+                                        source,
+                                        pane,
+                                        *evidence,
+                                        &coordinate,
+                                        attempt,
+                                        events,
+                                    )
                                 }
                             };
                             RawPaneSnapshot {
@@ -582,6 +603,61 @@ fn capture_candidate(
         .collect()
 }
 
+fn capture_foreground_recovery(
+    source: &mut impl CaptureSource,
+    pane: &TopologyPane,
+    evidence: PaneTiedForegroundEvidence,
+    coordinate: &SourcePaneCoordinate,
+    attempt: usize,
+    events: &mut Vec<CaptureEvent>,
+) -> PaneRecovery {
+    let classification = classify_pane(evidence);
+    if matches!(
+        classification.resolver_outcome(),
+        ResolverOutcome::InsufficientEvidence(_) | ResolverOutcome::ConflictingEvidence(_)
+    ) {
+        events.push(CaptureEvent::ResolverDowngraded {
+            attempt,
+            pane: coordinate.clone(),
+            outcome: classification.resolver_outcome().clone(),
+        });
+    }
+    match classification.into_recovery() {
+        PaneRecovery::Automatic(AutomaticRecovery::Codex {
+            session_id,
+            prompt_area: None,
+        }) => {
+            let prompt_area = match source.read_visible_pane(pane) {
+                Ok(grid) => match capture_visible_codex_prompt(&grid) {
+                    CodexPromptAreaObservation::Absent => None,
+                    CodexPromptAreaObservation::Captured(prompt_area) => Some(prompt_area),
+                    CodexPromptAreaObservation::Skipped(failure) => {
+                        events.push(CaptureEvent::CodexPromptCaptureSkipped {
+                            attempt,
+                            pane: coordinate.clone(),
+                            failure,
+                        });
+                        None
+                    }
+                },
+                Err(failure) => {
+                    events.push(CaptureEvent::CodexPromptCaptureSkipped {
+                        attempt,
+                        pane: coordinate.clone(),
+                        failure,
+                    });
+                    None
+                }
+            };
+            PaneRecovery::Automatic(AutomaticRecovery::Codex {
+                session_id,
+                prompt_area,
+            })
+        }
+        recovery => recovery,
+    }
+}
+
 fn build_result(
     captured_at: CaptureTime,
     source: SnapshotSource,
@@ -590,16 +666,199 @@ fn build_result(
     attempts: usize,
     events: Vec<CaptureEvent>,
 ) -> Result<CaptureResult, CaptureError> {
-    let snapshot = ValidatedSnapshot::from_capture_raw(RawSnapshot {
+    build_result_with_serialization_limit(
+        captured_at,
+        source,
+        consistency,
+        sessions,
+        attempts,
+        events,
+        MAX_SNAPSHOT_BYTES,
+    )
+}
+
+fn build_result_with_serialization_limit(
+    captured_at: CaptureTime,
+    source: SnapshotSource,
+    consistency: RawCaptureConsistency,
+    sessions: Vec<RawSessionSnapshot>,
+    attempts: usize,
+    mut events: Vec<CaptureEvent>,
+    serialization_limit: usize,
+) -> Result<CaptureResult, CaptureError> {
+    let mut raw = RawSnapshot {
         captured_at: captured_at.encoded().to_owned(),
         source: source.path().to_raw(),
         consistency,
         sessions,
-    })
-    .map_err(CaptureError::InvalidCandidate)?;
+    };
+    let mut encoded = serde_json::to_vec(&raw)
+        .map_err(|error| SnapshotValidationError::InvalidJson(error.to_string()))
+        .map_err(CaptureError::InvalidCandidate)?;
+    if encoded.len() > serialization_limit {
+        let affected = strip_prompt_enrichment(&mut raw.sessions);
+        if !affected.is_empty() {
+            events.extend(affected.into_iter().map(|pane| {
+                CaptureEvent::CodexPromptCaptureSkipped {
+                    attempt: attempts,
+                    pane,
+                    failure: CodexPromptCaptureFailure::snapshot_size_budget_exceeded(),
+                }
+            }));
+            encoded = serde_json::to_vec(&raw)
+                .map_err(|error| SnapshotValidationError::InvalidJson(error.to_string()))
+                .map_err(CaptureError::InvalidCandidate)?;
+        }
+        if encoded.len() > serialization_limit {
+            return Err(CaptureError::InvalidCandidate(
+                SnapshotValidationError::SnapshotTooLarge {
+                    actual: encoded.len(),
+                    maximum: serialization_limit,
+                },
+            ));
+        }
+    }
+    let snapshot =
+        ValidatedSnapshot::from_capture_raw(raw).map_err(CaptureError::InvalidCandidate)?;
     Ok(CaptureResult {
         snapshot,
         attempts,
         events,
     })
+}
+
+fn strip_prompt_enrichment(sessions: &mut [RawSessionSnapshot]) -> Vec<SourcePaneCoordinate> {
+    let mut affected = Vec::new();
+    for session in sessions {
+        for window in &mut session.windows {
+            for pane in &mut window.panes {
+                let RawPaneRecovery::Automatic {
+                    recovery:
+                        RawAutomaticRecovery::Codex {
+                            prompt_area,
+                            session_id: _,
+                        },
+                } = &mut pane.recovery
+                else {
+                    continue;
+                };
+                if prompt_area.take().is_some() {
+                    affected.push(SourcePaneCoordinate {
+                        session_name: session.name.clone(),
+                        window_index: window.source_index,
+                        pane_index: pane.source_index,
+                    });
+                }
+            }
+        }
+    }
+    affected
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        AutomaticRecovery, RawAutomaticRecovery, RawCapturedCodexPromptArea, RawEncodedOsString,
+        SnapshotValidationError,
+    };
+
+    use super::*;
+
+    fn encoded(value: &str) -> RawEncodedOsString {
+        RawEncodedOsString {
+            encoding: "utf8".to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    fn candidate(prompt: Option<&str>) -> Vec<RawSessionSnapshot> {
+        vec![RawSessionSnapshot {
+            name: "work".to_owned(),
+            working_directory: encoded("/tmp/work"),
+            windows: vec![RawWindowSnapshot {
+                source_index: 0,
+                name: "editor".to_owned(),
+                panes: vec![RawPaneSnapshot {
+                    source_index: 0,
+                    working_directory: encoded("/tmp/work"),
+                    recovery: RawPaneRecovery::Automatic {
+                        recovery: RawAutomaticRecovery::Codex {
+                            session_id: "1d6381bf-01c5-4c4a-b725-8e376e5ad295".to_owned(),
+                            prompt_area: prompt.map(|text| RawCapturedCodexPromptArea {
+                                text: text.to_owned(),
+                            }),
+                        },
+                    },
+                }],
+            }],
+        }]
+    }
+
+    fn raw_snapshot(sessions: Vec<RawSessionSnapshot>) -> RawSnapshot {
+        RawSnapshot {
+            captured_at: "2026-07-23T00:00:00Z".to_owned(),
+            source: encoded("/tmp/source.sock"),
+            consistency: RawCaptureConsistency::Stable {},
+            sessions,
+        }
+    }
+
+    #[test]
+    fn snapshot_budget_pressure_drops_prompt_enrichment_without_discarding_codex_recovery() {
+        let prompt_free_size = serde_json::to_vec(&raw_snapshot(candidate(None)))
+            .unwrap()
+            .len();
+        assert!(
+            serde_json::to_vec(&raw_snapshot(candidate(Some("private draft"))))
+                .unwrap()
+                .len()
+                > prompt_free_size
+        );
+
+        let result = build_result_with_serialization_limit(
+            CaptureTime::parse_rfc3339("2026-07-23T00:00:00Z").unwrap(),
+            SnapshotSource::try_from_bytes(b"/tmp/source.sock".to_vec()).unwrap(),
+            RawCaptureConsistency::Stable {},
+            candidate(Some("private draft")),
+            1,
+            Vec::new(),
+            prompt_free_size,
+        )
+        .unwrap();
+
+        let PaneRecovery::Automatic(AutomaticRecovery::Codex {
+            session_id,
+            prompt_area: None,
+        }) = result.snapshot().sessions()[0].windows()[0].panes()[0].recovery()
+        else {
+            panic!("expected prompt-free automatic Codex recovery");
+        };
+        assert_eq!(
+            session_id.as_uuid().to_string(),
+            "1d6381bf-01c5-4c4a-b725-8e376e5ad295"
+        );
+        assert!(matches!(
+            result.events(),
+            [CaptureEvent::CodexPromptCaptureSkipped { failure, .. }]
+                if failure.message() == "snapshot size budget exceeded"
+        ));
+
+        let error = build_result_with_serialization_limit(
+            CaptureTime::parse_rfc3339("2026-07-23T00:00:00Z").unwrap(),
+            SnapshotSource::try_from_bytes(b"/tmp/source.sock".to_vec()).unwrap(),
+            RawCaptureConsistency::Stable {},
+            candidate(None),
+            1,
+            Vec::new(),
+            prompt_free_size - 1,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CaptureError::InvalidCandidate(SnapshotValidationError::SnapshotTooLarge {
+                actual,
+                maximum,
+            }) if actual == prompt_free_size && maximum == prompt_free_size - 1
+        ));
+    }
 }

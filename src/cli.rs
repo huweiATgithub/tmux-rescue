@@ -502,6 +502,18 @@ fn write_capture_events(stderr: &mut impl Write, events: &[CaptureEvent]) -> Res
                 pane.pane_index,
                 safe_text(&format!("{outcome:?}"))
             ),
+            CaptureEvent::CodexPromptCaptureSkipped {
+                attempt,
+                pane,
+                failure,
+            } => writeln!(
+                stderr,
+                "warning: capture attempt {attempt} pane {}:{}:{} Codex prompt capture skipped: {}",
+                pane.session_name,
+                pane.window_index,
+                pane.pane_index,
+                safe_text(failure.message())
+            ),
             CaptureEvent::UnstableCandidateSaved { attempts } => writeln!(
                 stderr,
                 "warning: topology remained unstable after {attempts} attempts; publishing the latest complete candidate"
@@ -1382,5 +1394,29 @@ mod tests {
         let stderr = String::from_utf8(stderr).unwrap();
         assert!(stderr.contains("pane work:3:7"));
         assert!(stderr.contains("automatic launch failed"));
+    }
+
+    #[test]
+    fn prompt_capture_failures_are_coordinate_scoped_and_prompt_free() {
+        let mut stderr = Vec::new();
+        let event = CaptureEvent::CodexPromptCaptureSkipped {
+            attempt: 1,
+            pane: SourcePaneCoordinate {
+                session_name: "work".to_owned(),
+                window_index: 0,
+                pane_index: 0,
+            },
+            failure: tmux_rescue::CodexPromptCaptureFailure::try_from_read_failure(
+                "pane metadata changed",
+            )
+            .unwrap(),
+        };
+
+        write_capture_events(&mut stderr, &[event]).unwrap();
+
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "warning: capture attempt 1 pane work:0:0 Codex prompt capture skipped: pane metadata changed\n"
+        );
     }
 }

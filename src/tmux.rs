@@ -13,17 +13,18 @@ use thiserror::Error;
 
 use crate::{
     AutomaticPaneObservation, AutomaticRecoveryExpectation, CaptureFailure, CaptureSource,
-    CaptureSourceFailure, GuardedPaneFailure, GuardedPaneOperation, GuardedPaneResult,
-    LinuxProcessInspector, LosslessOsString, OwnedRestoreTarget, PaneInitialProcess,
-    PaneProcessAnchor, PaneProcessObservation, PaneProcessProbe, PaneRecovery,
+    CaptureSourceFailure, CodexPromptCaptureFailure, GuardedPaneFailure, GuardedPaneOperation,
+    GuardedPaneResult, LinuxProcessInspector, LosslessOsString, OwnedRestoreTarget,
+    PaneInitialProcess, PaneProcessAnchor, PaneProcessObservation, PaneProcessProbe, PaneRecovery,
     RecordedAbsolutePath, RecoveryRestoreTarget, RestoreDestination, RestorePlan,
     RestoreTargetCapability, RestoreTargetState, RollbackFailure, RollbackFailureDisposition,
     RollbackOutcome, SnapshotSource, SourcePaneCoordinate, TargetClaimFailure, TargetDisposition,
-    TargetShell, TmuxSelector, TopologyFailure, TopologyObservation, TopologyPane, TopologySession,
-    TopologyWindow, classify_pane, parse_proc_stat,
+    TargetShell, TmuxPaneId, TmuxSelector, TopologyFailure, TopologyObservation, TopologyPane,
+    TopologySession, TopologyWindow, VisiblePaneGrid, VisiblePaneMetadata, classify_pane,
+    parse_proc_stat,
 };
 
-const SOURCE_FIELDS: usize = 10;
+const SOURCE_FIELDS: usize = 11;
 const SOURCE_FORMAT: &str = concat!(
     "#{n:session_name}:#{session_name}",
     "#{n:window_index}:#{window_index}",
@@ -35,6 +36,16 @@ const SOURCE_FORMAT: &str = concat!(
     "#{n:pane_tty}:#{pane_tty}",
     "#{n:pane_start_command}:#{pane_start_command}",
     "#{n:default-shell}:#{default-shell}",
+    "#{n:pane_id}:#{pane_id}",
+);
+const VISIBLE_PANE_METADATA_FIELDS: usize = 6;
+const VISIBLE_PANE_METADATA_FORMAT: &str = concat!(
+    "#{n:pane_id}:#{pane_id}",
+    "#{n:pane_width}:#{pane_width}",
+    "#{n:pane_height}:#{pane_height}",
+    "#{n:cursor_x}:#{cursor_x}",
+    "#{n:cursor_y}:#{cursor_y}",
+    "#{n:pane_in_mode}:#{pane_in_mode}",
 );
 
 pub struct TmuxAdapter<P = LinuxProcessInspector> {
@@ -106,6 +117,13 @@ impl<P: PaneProcessProbe> CaptureSource for TmuxAdapter<P> {
             ),
         }
     }
+
+    fn read_visible_pane(
+        &mut self,
+        pane: &TopologyPane,
+    ) -> Result<VisiblePaneGrid, CodexPromptCaptureFailure> {
+        self.read_source_visible_pane(pane)
+    }
 }
 
 impl<P> TmuxAdapter<P> {
@@ -117,6 +135,43 @@ impl<P> TmuxAdapter<P> {
         let stdout = require_success("read tmux source topology", output)?;
         let records = parse_length_prefixed_records(&stdout, SOURCE_FIELDS)?;
         topology_from_records(records)
+    }
+
+    fn read_source_visible_pane(
+        &self,
+        pane: &TopologyPane,
+    ) -> Result<VisiblePaneGrid, CodexPromptCaptureFailure> {
+        let read_metadata = || {
+            let output = source_client_command(Some(&self.selector))
+                .args([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    pane.pane_id().as_str(),
+                    VISIBLE_PANE_METADATA_FORMAT,
+                ])
+                .output()
+                .map_err(|error| TmuxAdapterError::CommandUnavailable(error.to_string()))?;
+            let stdout = require_success("read visible tmux pane metadata", output)?;
+            parse_visible_pane_metadata(&stdout)
+        };
+        let before = read_metadata().map_err(codex_prompt_capture_failure)?;
+        let output = source_client_command(Some(&self.selector))
+            .args(["capture-pane", "-p", "-t", pane.pane_id().as_str()])
+            .output()
+            .map_err(|error| TmuxAdapterError::CommandUnavailable(error.to_string()))
+            .and_then(|output| require_success("capture visible tmux pane", output))
+            .map_err(codex_prompt_capture_failure)?;
+        let after = read_metadata().map_err(codex_prompt_capture_failure)?;
+        if before.pane_id() != pane.pane_id() || before != after {
+            return Err(
+                CodexPromptCaptureFailure::try_from_read_failure("pane metadata changed")
+                    .expect("static visible-pane failure satisfies diagnostic invariants"),
+            );
+        }
+        VisiblePaneGrid::try_from_tmux_capture(before, output).map_err(|error| {
+            codex_prompt_capture_failure(TmuxAdapterError::MalformedOutput(error.to_string()))
+        })
     }
 }
 
@@ -158,12 +213,15 @@ fn topology_from_records(
             pane_tty,
             pane_start_command,
             default_shell,
+            pane_id,
         ]: [Vec<u8>; SOURCE_FIELDS] = fields.try_into().map_err(|_| {
             TmuxAdapterError::MalformedOutput("wrong source field count".to_owned())
         })?;
         let session_name = parse_utf8(session_name, "session name")?;
         let window_index = parse_u32(window_index, "window index")?;
         let pane_index = parse_u32(pane_index, "pane index")?;
+        let pane_id = TmuxPaneId::try_from_bytes(pane_id)
+            .map_err(|error| TmuxAdapterError::MalformedOutput(error.to_string()))?;
         let session_path = RecordedAbsolutePath::try_from_bytes(session_path)
             .map_err(|error| TmuxAdapterError::MalformedOutput(error.to_string()))?;
         let window_name = parse_utf8(window_name, "window name")?;
@@ -182,6 +240,7 @@ fn topology_from_records(
         };
         let pane = TopologyPane::new(
             pane_index,
+            pane_id,
             pane_path,
             PaneProcessAnchor::try_new(pane_pid, pane_tty, initial_process)
                 .map_err(|error| TmuxAdapterError::MalformedOutput(error.to_string()))?,
@@ -307,6 +366,47 @@ fn parse_u32(value: Vec<u8>, field: &str) -> Result<u32, TmuxAdapterError> {
     value
         .parse()
         .map_err(|_| TmuxAdapterError::MalformedOutput(format!("{field} is not a u32")))
+}
+
+fn parse_u16(value: Vec<u8>, field: &str) -> Result<u16, TmuxAdapterError> {
+    let value = parse_utf8(value, field)?;
+    value
+        .parse()
+        .map_err(|_| TmuxAdapterError::MalformedOutput(format!("{field} is not a u16")))
+}
+
+fn parse_visible_pane_metadata(output: &[u8]) -> Result<VisiblePaneMetadata, TmuxAdapterError> {
+    let mut records = parse_length_prefixed_records(output, VISIBLE_PANE_METADATA_FIELDS)?;
+    if records.len() != 1 {
+        return Err(TmuxAdapterError::MalformedOutput(
+            "visible pane metadata did not contain exactly one record".to_owned(),
+        ));
+    }
+    let [pane_id, width, height, cursor_x, cursor_y, in_mode]: [Vec<u8>;
+        VISIBLE_PANE_METADATA_FIELDS] = records.remove(0).try_into().map_err(|_| {
+        TmuxAdapterError::MalformedOutput(
+            "visible pane metadata had the wrong field count".to_owned(),
+        )
+    })?;
+    let in_mode = match in_mode.as_slice() {
+        b"0" => false,
+        b"1" => true,
+        _ => {
+            return Err(TmuxAdapterError::MalformedOutput(
+                "pane mode is not canonical ASCII 0 or 1".to_owned(),
+            ));
+        }
+    };
+    VisiblePaneMetadata::try_new(
+        TmuxPaneId::try_from_bytes(pane_id)
+            .map_err(|error| TmuxAdapterError::MalformedOutput(error.to_string()))?,
+        parse_u16(width, "pane width")?,
+        parse_u16(height, "pane height")?,
+        parse_u16(cursor_x, "cursor x")?,
+        parse_u16(cursor_y, "cursor y")?,
+        in_mode,
+    )
+    .map_err(|error| TmuxAdapterError::MalformedOutput(error.to_string()))
 }
 
 fn require_success(operation: &str, output: Output) -> Result<Vec<u8>, TmuxAdapterError> {
@@ -632,7 +732,7 @@ struct TmuxOwnedTarget<P> {
 }
 
 struct RestoredPane {
-    target_id: String,
+    target_id: TmuxPaneId,
     process_id: u32,
     tty: LosslessOsString,
     working_directory: RecordedAbsolutePath,
@@ -645,7 +745,7 @@ struct CreatedPane {
     window_id: String,
     window_index: u32,
     window_name: String,
-    pane_id: String,
+    pane_id: TmuxPaneId,
     process_id: u32,
     tty: LosslessOsString,
     current_directory: RecordedAbsolutePath,
@@ -736,7 +836,7 @@ impl<P: PaneProcessProbe + 'static> OwnedRestoreTarget for TmuxOwnedTarget<P> {
                 os("respawn-pane"),
                 os("-k"),
                 os("-t"),
-                os(&created.pane_id),
+                os(created.pane_id.as_str()),
                 os("-c"),
                 first_directory.as_os_str().to_owned(),
             ];
@@ -850,13 +950,13 @@ impl<P: PaneProcessProbe + 'static> OwnedRestoreTarget for TmuxOwnedTarget<P> {
 }
 
 impl<P: PaneProcessProbe> TmuxOwnedTarget<P> {
-    fn read_pane(&self, pane_id: &str) -> Result<CreatedPane, String> {
+    fn read_pane(&self, pane_id: &TmuxPaneId) -> Result<CreatedPane, String> {
         let output = self.server.run_guarded(
             &[
                 os("display-message"),
                 os("-p"),
                 os("-t"),
-                os(pane_id),
+                os(pane_id.as_str()),
                 os(CREATED_PANE_FORMAT),
             ],
             "read restored pane identity",
@@ -901,7 +1001,7 @@ impl<P: PaneProcessProbe> TmuxOwnedTarget<P> {
         {
             return Err(format!(
                 "tmux created pane {} with topology or directory state that differs from the plan",
-                pane.pane_id
+                pane.pane_id.as_str()
             ));
         }
         self.panes.insert(
@@ -922,6 +1022,7 @@ impl<P: PaneProcessProbe> TmuxOwnedTarget<P> {
                 .map_err(|error| error.to_string())?;
         let topology = TopologyPane::new(
             0,
+            pane.target_id.clone(),
             pane.working_directory.clone(),
             PaneProcessAnchor::try_new(
                 pane.process_id,
@@ -961,7 +1062,7 @@ impl<P: PaneProcessProbe> TmuxOwnedTarget<P> {
                 os("display-message"),
                 os("-p"),
                 os("-t"),
-                os(&pane.target_id),
+                os(pane.target_id.as_str()),
                 os("#{pane_id}"),
             ],
             "probe restored pane",
@@ -1016,7 +1117,7 @@ impl<P: PaneProcessProbe + 'static> RecoveryRestoreTarget for TmuxOwnedTarget<P>
         let condition = self.pane_condition(pane);
         let result = match operation {
             GuardedPaneOperation::VerifyShell => self.server.run_conditional(
-                &pane.target_id,
+                pane.target_id.as_str(),
                 &condition,
                 &[
                     os("display-message"),
@@ -1028,9 +1129,9 @@ impl<P: PaneProcessProbe + 'static> RecoveryRestoreTarget for TmuxOwnedTarget<P>
             GuardedPaneOperation::PasteLiteral { input } => {
                 let buffer_name = format!("tmux-rescue-{}", self.server.token);
                 let commands =
-                    literal_paste_commands(&pane.target_id, input.as_bytes(), &buffer_name);
+                    literal_paste_commands(pane.target_id.as_str(), input.as_bytes(), &buffer_name);
                 self.server.run_conditional_commands(
-                    &pane.target_id,
+                    pane.target_id.as_str(),
                     &condition,
                     &commands,
                     "send guarded pane input",
@@ -1039,12 +1140,12 @@ impl<P: PaneProcessProbe + 'static> RecoveryRestoreTarget for TmuxOwnedTarget<P>
             GuardedPaneOperation::LaunchAutomatic { input } => {
                 let buffer_name = format!("tmux-rescue-{}", self.server.token);
                 let commands = automatic_launch_commands(
-                    &pane.target_id,
+                    pane.target_id.as_str(),
                     input.rendered().as_bytes(),
                     &buffer_name,
                 );
                 self.server.run_conditional_commands(
-                    &pane.target_id,
+                    pane.target_id.as_str(),
                     &condition,
                     &commands,
                     "send guarded pane input",
@@ -1446,7 +1547,7 @@ fn parse_created_pane(output: &[u8]) -> Result<CreatedPane, String> {
         window_id: parse_tmux_id(window_id, b'@', "window ID")?,
         window_index: parse_u32(window_index, "window index").map_err(|error| error.to_string())?,
         window_name: parse_utf8(window_name, "window name").map_err(|error| error.to_string())?,
-        pane_id: parse_tmux_id(pane_id, b'%', "pane ID")?,
+        pane_id: TmuxPaneId::try_from_bytes(pane_id).map_err(|error| error.to_string())?,
         process_id: parse_u32(process_id, "pane process ID").map_err(|error| error.to_string())?,
         tty: LosslessOsString::try_from_bytes(tty).map_err(|error| error.to_string())?,
         current_directory: RecordedAbsolutePath::try_from_bytes(current_directory)
@@ -1564,6 +1665,11 @@ fn os(value: impl AsRef<OsStr>) -> OsString {
 fn capture_source_failure(error: TmuxAdapterError) -> CaptureSourceFailure {
     CaptureSourceFailure::try_new(safe_text(error.to_string().as_bytes()))
         .expect("escaped tmux diagnostics satisfy capture-source failure invariants")
+}
+
+fn codex_prompt_capture_failure(error: TmuxAdapterError) -> CodexPromptCaptureFailure {
+    CodexPromptCaptureFailure::try_from_read_failure(safe_text(error.to_string().as_bytes()))
+        .expect("escaped tmux diagnostics satisfy prompt-capture failure invariants")
 }
 
 fn safe_text(bytes: &[u8]) -> String {
