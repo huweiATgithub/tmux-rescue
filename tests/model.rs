@@ -1,7 +1,8 @@
 use serde_json::{Value, json};
 use tmux_rescue::{
-    AutomaticRecovery, MAX_DIAGNOSTIC_BYTES, MAX_OS_VALUE_BYTES, MAX_SESSIONS,
-    MAX_TOPOLOGY_VALIDATION_ATTEMPTS, PaneRecovery, SnapshotValidationError, ValidatedSnapshot,
+    AutomaticRecovery, MAX_CODEX_PROMPT_BYTES, MAX_DIAGNOSTIC_BYTES, MAX_OS_VALUE_BYTES,
+    MAX_SESSIONS, MAX_TOPOLOGY_VALIDATION_ATTEMPTS, PaneRecovery, SnapshotValidationError,
+    ValidatedSnapshot,
 };
 
 fn encoded(value: &str) -> Value {
@@ -48,6 +49,116 @@ fn valid_snapshot() -> Value {
 
 fn parse(value: &Value) -> Result<ValidatedSnapshot, SnapshotValidationError> {
     ValidatedSnapshot::from_json(&serde_json::to_vec(value).unwrap())
+}
+
+fn codex_automatic(prompt_area: Value) -> Value {
+    json!({
+        "kind": "automatic",
+        "recovery": {
+            "kind": "codex",
+            "session_id": "018f8f15-2e24-7a8a-a5c0-bf32e04c45be",
+            "prompt_area": prompt_area
+        }
+    })
+}
+
+#[test]
+fn validates_and_round_trips_a_codex_visible_prompt_area() {
+    let prompt_text = "The test prompt for recovering.\n\nLine 1.\n\nLine 2.";
+    let mut value = valid_snapshot();
+    value["sessions"][0]["windows"][0]["panes"][0]["recovery"] = codex_automatic(json!({
+        "text": prompt_text
+    }));
+
+    let snapshot = parse(&value).unwrap();
+    let PaneRecovery::Automatic(AutomaticRecovery::Codex {
+        prompt_area: Some(prompt_area),
+        ..
+    }) = snapshot.sessions()[0].windows()[0].panes()[0].recovery()
+    else {
+        panic!("expected a Codex recovery with a visible prompt area");
+    };
+    assert_eq!(prompt_area.text().as_str(), prompt_text);
+    assert_eq!(prompt_area.text().visible_row_count(), 5);
+    assert_eq!(prompt_area.text().byte_count(), 49);
+
+    let serialized: Value = serde_json::from_slice(&snapshot.to_json_pretty().unwrap()).unwrap();
+    assert_eq!(serialized, value);
+}
+
+#[test]
+fn older_codex_snapshots_default_prompt_area_to_none_and_omit_it_on_write() {
+    let mut value = valid_snapshot();
+    value["sessions"][0]["windows"][0]["panes"][0]["recovery"] = json!({
+        "kind": "automatic",
+        "recovery": {
+            "kind": "codex",
+            "session_id": "018f8f15-2e24-7a8a-a5c0-bf32e04c45be"
+        }
+    });
+
+    let snapshot = parse(&value).unwrap();
+    assert!(matches!(
+        snapshot.sessions()[0].windows()[0].panes()[0].recovery(),
+        PaneRecovery::Automatic(AutomaticRecovery::Codex {
+            prompt_area: None,
+            ..
+        })
+    ));
+
+    let serialized: Value = serde_json::from_slice(&snapshot.to_json_pretty().unwrap()).unwrap();
+    assert!(
+        serialized["sessions"][0]["windows"][0]["panes"][0]["recovery"]["recovery"]
+            .get("prompt_area")
+            .is_none()
+    );
+}
+
+#[test]
+fn rejects_whitespace_control_and_oversized_prompt_text() {
+    let rejected = [
+        String::new(),
+        "\u{2003}\u{2002}".to_owned(),
+        "line\rbreak".to_owned(),
+        "nul\0byte".to_owned(),
+        "escape\u{1b}sequence".to_owned(),
+        "c1\u{0085}control".to_owned(),
+        "x".repeat(MAX_CODEX_PROMPT_BYTES + 1),
+    ];
+
+    for text in rejected {
+        let mut value = valid_snapshot();
+        value["sessions"][0]["windows"][0]["panes"][0]["recovery"] =
+            codex_automatic(json!({"text": text}));
+
+        let error = parse(&value).unwrap_err();
+        assert!(matches!(
+            error,
+            SnapshotValidationError::InvalidCodexPromptText { .. }
+        ));
+        if let Some(text) = value["sessions"][0]["windows"][0]["panes"][0]["recovery"]
+            ["recovery"]["prompt_area"]["text"]
+            .as_str()
+        {
+            if !text.is_empty() {
+                assert!(!error.to_string().contains(text));
+            }
+        }
+    }
+}
+
+#[test]
+fn rejects_unknown_fields_inside_a_prompt_area() {
+    let mut value = valid_snapshot();
+    value["sessions"][0]["windows"][0]["panes"][0]["recovery"] = codex_automatic(json!({
+        "text": "The test prompt for recovering.",
+        "unexpected": true
+    }));
+
+    assert!(matches!(
+        parse(&value),
+        Err(SnapshotValidationError::InvalidJson(_))
+    ));
 }
 
 #[test]

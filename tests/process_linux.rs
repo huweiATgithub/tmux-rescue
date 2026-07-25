@@ -345,7 +345,10 @@ fn supplies_opened_codex_session_metadata_to_the_resolver() {
     };
     assert!(matches!(
         classify_pane(*evidence).recovery(),
-        PaneRecovery::Automatic(AutomaticRecovery::Codex { session_id: id })
+        PaneRecovery::Automatic(AutomaticRecovery::Codex {
+            session_id: id,
+            ..
+        })
             if id.as_uuid().to_string() == session_id
     ));
 }

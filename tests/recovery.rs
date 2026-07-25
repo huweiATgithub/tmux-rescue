@@ -155,7 +155,7 @@ fn resolves_codex_from_one_exact_opened_root_session_record() {
         .unwrap();
 
     let classification = classify_pane(evidence);
-    let PaneRecovery::Automatic(recovery @ AutomaticRecovery::Codex { session_id: id }) =
+    let PaneRecovery::Automatic(recovery @ AutomaticRecovery::Codex { session_id: id, .. }) =
         classification.recovery()
     else {
         panic!("expected automatic Codex recovery");

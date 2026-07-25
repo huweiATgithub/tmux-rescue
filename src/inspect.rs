@@ -454,7 +454,7 @@ impl PaneView {
     fn from_snapshot(pane: &tmux_rescue::PaneSnapshot, session_cwd: &[u8]) -> Self {
         let fact = match pane.recovery() {
             PaneRecovery::Idle => PaneFact::Shell,
-            PaneRecovery::Automatic(AutomaticRecovery::Codex { session_id }) => {
+            PaneRecovery::Automatic(AutomaticRecovery::Codex { session_id, .. }) => {
                 PaneFact::ToolSession {
                     name: "Codex",
                     session_id: session_id.as_uuid().to_string(),

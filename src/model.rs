@@ -20,6 +20,7 @@ pub const MAX_ARGUMENTS: usize = 4_096;
 pub const MAX_OS_VALUE_BYTES: usize = 1024 * 1024;
 pub const MAX_NAME_BYTES: usize = 4_096;
 pub const MAX_DIAGNOSTIC_BYTES: usize = 4_096;
+pub const MAX_CODEX_PROMPT_BYTES: usize = 16 * 1024;
 pub const MAX_TOPOLOGY_VALIDATION_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -130,12 +131,28 @@ pub struct RawCapturedCommand {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawCapturedCodexPromptArea {
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawAutomaticRecovery {
-    Codex { session_id: String },
-    ClaudeCode { session_id: String },
-    MdBookServe { command: RawCapturedCommand },
-    BookshelfServe { command: RawCapturedCommand },
+    Codex {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_area: Option<RawCapturedCodexPromptArea>,
+    },
+    ClaudeCode {
+        session_id: String,
+    },
+    MdBookServe {
+        command: RawCapturedCommand,
+    },
+    BookshelfServe {
+        command: RawCapturedCommand,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -365,6 +382,70 @@ impl CodexSessionId {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedPromptText(String);
+
+impl CapturedPromptText {
+    pub(crate) fn try_new(text: String) -> Result<Self, SnapshotValidationError> {
+        if text.is_empty() {
+            return Err(SnapshotValidationError::InvalidCodexPromptText {
+                reason: "text is empty".to_owned(),
+            });
+        }
+        if text.trim().is_empty() {
+            return Err(SnapshotValidationError::InvalidCodexPromptText {
+                reason: "text contains only whitespace".to_owned(),
+            });
+        }
+        if text.len() > MAX_CODEX_PROMPT_BYTES {
+            return Err(SnapshotValidationError::InvalidCodexPromptText {
+                reason: format!(
+                    "text is {} bytes; the maximum is {MAX_CODEX_PROMPT_BYTES}",
+                    text.len()
+                ),
+            });
+        }
+        if text
+            .chars()
+            .any(|character| character != '\n' && character.is_control())
+        {
+            return Err(SnapshotValidationError::InvalidCodexPromptText {
+                reason: "text contains terminal control characters".to_owned(),
+            });
+        }
+        Ok(Self(text))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn visible_row_count(&self) -> usize {
+        self.0.split('\n').count()
+    }
+
+    pub fn byte_count(&self) -> usize {
+        self.0.len()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedCodexPromptArea {
+    text: CapturedPromptText,
+}
+
+impl CapturedCodexPromptArea {
+    pub(crate) fn try_new(text: String) -> Result<Self, SnapshotValidationError> {
+        Ok(Self {
+            text: CapturedPromptText::try_new(text)?,
+        })
+    }
+
+    pub fn text(&self) -> &CapturedPromptText {
+        &self.text
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaudeSessionId(Uuid);
 
 impl ClaudeSessionId {
@@ -409,6 +490,7 @@ impl RecognizedBookshelfServeCommand {
 pub enum AutomaticRecovery {
     Codex {
         session_id: CodexSessionId,
+        prompt_area: Option<CapturedCodexPromptArea>,
     },
     ClaudeCode {
         session_id: ClaudeSessionId,
@@ -770,10 +852,16 @@ fn validate_automatic(
     field: &str,
 ) -> Result<AutomaticRecovery, SnapshotValidationError> {
     match raw {
-        RawAutomaticRecovery::Codex { session_id } => {
+        RawAutomaticRecovery::Codex {
+            session_id,
+            prompt_area,
+        } => {
             let parsed = parse_session_id("codex", &session_id)?;
             Ok(AutomaticRecovery::Codex {
                 session_id: CodexSessionId(parsed),
+                prompt_area: prompt_area
+                    .map(|prompt_area| CapturedCodexPromptArea::try_new(prompt_area.text))
+                    .transpose()?,
             })
         }
         RawAutomaticRecovery::ClaudeCode { session_id } => {
@@ -956,8 +1044,16 @@ impl From<&PaneRecovery> for RawPaneRecovery {
 impl From<&AutomaticRecovery> for RawAutomaticRecovery {
     fn from(recovery: &AutomaticRecovery) -> Self {
         match recovery {
-            AutomaticRecovery::Codex { session_id } => Self::Codex {
+            AutomaticRecovery::Codex {
+                session_id,
+                prompt_area,
+            } => Self::Codex {
                 session_id: session_id.0.to_string(),
+                prompt_area: prompt_area
+                    .as_ref()
+                    .map(|prompt_area| RawCapturedCodexPromptArea {
+                        text: prompt_area.text.as_str().to_owned(),
+                    }),
             },
             AutomaticRecovery::ClaudeCode { session_id } => Self::ClaudeCode {
                 session_id: session_id.0.to_string(),
@@ -1041,6 +1137,8 @@ pub enum SnapshotValidationError {
     InvalidUnstableAttemptCount { actual: usize, expected: usize },
     #[error("{tool} session ID {value:?} is invalid")]
     InvalidSessionId { tool: String, value: String },
+    #[error("Codex prompt text is invalid: {reason}")]
+    InvalidCodexPromptText { reason: String },
     #[error("recognized {tool} serve command is invalid: {reason}")]
     InvalidRecognizedServeCommand { tool: String, reason: String },
     #[error("{field} is invalid: {reason}")]
