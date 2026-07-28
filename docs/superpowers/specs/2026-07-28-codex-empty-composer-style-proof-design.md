@@ -141,6 +141,24 @@ parser compares that proved text to the supported suggestion set. It cannot
 obtain a detached style boolean or construct a proof for a different
 substring.
 
+### Extension Discipline
+
+The maintainability seam is intentionally small:
+
+- `visible_pane` owns styled-byte decoding, the private faintness
+  representation, and the atomic proof operation;
+- `codex_prompt` owns versioned Codex suggestion strings, footer recognition,
+  and composer grammar; and
+- the tmux adapter owns only command execution and the metadata fence.
+
+Future tmux SGR support extends the private decoder and its boundary tests.
+Future Codex renderer support extends an explicitly versioned policy table and
+layout fixtures. Neither change exposes a generic style map, introduces a
+renderer trait or registry, or teaches the tmux adapter Codex policy. The
+implementation documentation must record these extension points so a later
+change does not weaken the faint-style proof merely to accept a new string or
+layout.
+
 ## Styled Capture Grammar
 
 The boundary accepts UTF-8 text plus seven-bit `ESC [` CSI SGR sequences
