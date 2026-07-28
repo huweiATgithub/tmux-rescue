@@ -2,11 +2,22 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     CapturedCodexPromptArea, CodexPromptCaptureFailure, MAX_CODEX_PROMPT_BYTES, VisiblePaneGrid,
+    VisibleRow,
 };
 
-const EMPTY_COMPOSER_PLACEHOLDER: &str = "Ask Codex to do anything";
+// Codex 0.145.0 rotates these faint empty-composer suggestions.
+const SUPPORTED_CODEX_0145_EMPTY_SUGGESTIONS: [&str; 6] = [
+    "Ask Codex to do anything",
+    "Implement {feature}",
+    "Use /skills to list available skills",
+    "Write tests for @filename",
+    "Explain this codebase",
+    "Find and fix a bug in @filename",
+];
 const PROMPT_PREFIXES: [&str; 2] = ["› ", "» "];
 const TEXTAREA_MARGIN: &str = "  ";
+
+struct SupportedFooterLayout;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CodexPromptAreaObservation {
@@ -25,13 +36,9 @@ pub(crate) fn capture_visible_codex_prompt(grid: &VisiblePaneGrid) -> CodexPromp
     }
 
     let rows = grid.rows();
-    if rows[cursor_y + 1..height - 1]
-        .iter()
-        .any(|row| !row.as_str().is_empty())
-        || !is_supported_codex_0145_footer(rows[height - 1].as_str())
-    {
+    let Some(_supported_footer_layout) = parse_supported_footer_layout(rows, cursor_y) else {
         return unsupported_layout();
-    }
+    };
 
     let mut start_y = None;
     for row_y in (0..=cursor_y).rev() {
@@ -51,9 +58,15 @@ pub(crate) fn capture_visible_codex_prompt(grid: &VisiblePaneGrid) -> CodexPromp
     let cursor_row = rows[cursor_y].as_str();
     let textarea_start_cell = UnicodeWidthStr::width(TEXTAREA_MARGIN);
     if start_y == cursor_y && usize::from(cursor.x()) == textarea_start_cell {
-        let visible_text = strip_prompt_prefix(cursor_row)
+        let prompt_prefix = PROMPT_PREFIXES
+            .iter()
+            .find(|prefix| cursor_row.starts_with(**prefix))
             .expect("the candidate start row has a supported prompt prefix");
-        return if visible_text == EMPTY_COMPOSER_PLACEHOLDER {
+        let Some(suggestion) = rows[cursor_y].faint_suffix_after_non_faint_prefix(prompt_prefix)
+        else {
+            return unsupported_layout();
+        };
+        return if SUPPORTED_CODEX_0145_EMPTY_SUGGESTIONS.contains(&suggestion.as_str()) {
             CodexPromptAreaObservation::Absent
         } else {
             unsupported_layout()
@@ -103,6 +116,28 @@ pub(crate) fn capture_visible_codex_prompt(grid: &VisiblePaneGrid) -> CodexPromp
 
 fn unsupported_layout() -> CodexPromptAreaObservation {
     CodexPromptAreaObservation::Skipped(CodexPromptCaptureFailure::unsupported_layout())
+}
+
+fn parse_supported_footer_layout(
+    rows: &[VisibleRow],
+    cursor_y: usize,
+) -> Option<SupportedFooterLayout> {
+    let after_cursor = rows.get(cursor_y + 1..)?;
+    let footer_offset = after_cursor
+        .iter()
+        .position(|row| !row.as_str().is_empty())?;
+    if footer_offset == 0 {
+        return None;
+    }
+    let footer_y = cursor_y + 1 + footer_offset;
+    if !is_supported_codex_0145_footer(rows[footer_y].as_str())
+        || rows[footer_y + 1..]
+            .iter()
+            .any(|row| !row.as_str().is_empty())
+    {
+        return None;
+    }
+    Some(SupportedFooterLayout)
 }
 
 fn strip_prompt_prefix(row: &str) -> Option<&str> {
@@ -250,6 +285,21 @@ mod tests {
         )
     }
 
+    fn styled_empty_composer_grid(
+        glyph: char,
+        suggestion: &str,
+        footer: &str,
+        terminal_blank_rows: usize,
+    ) -> VisiblePaneGrid {
+        let mut rows = vec![
+            format!("{glyph} \x1b[2m{suggestion}\x1b[22m"),
+            String::new(),
+            footer.to_owned(),
+        ];
+        rows.extend((0..terminal_blank_rows).map(|_| String::new()));
+        grid(160, 2, 0, false, rows)
+    }
+
     fn captured_text(grid: &VisiblePaneGrid) -> String {
         match capture_visible_codex_prompt(grid) {
             CodexPromptAreaObservation::Captured(prompt_area) => {
@@ -267,26 +317,31 @@ mod tests {
     }
 
     #[test]
-    fn captures_five_visible_rows_and_preserves_blank_lines() {
-        let mut rows = vec!["arbitrary transcript row".to_owned(); 40];
-        rows[33..].clone_from_slice(&[
-            "» The test prompt for recovering.".to_owned(),
-            String::new(),
-            "  Line 1.".to_owned(),
-            String::new(),
-            "  Line 2.".to_owned(),
-            String::new(),
-            CONFIGURED_FOOTER.to_owned(),
-        ]);
-        let grid = grid(132, 9, 37, false, rows);
+    fn keeps_the_five_row_real_draft_exact_and_style_agnostic() {
+        for first_row in [
+            "» The test prompt for recovering.",
+            "» \x1b[2mThe test prompt for recovering.\x1b[22m",
+        ] {
+            let mut rows = vec!["arbitrary transcript row".to_owned(); 40];
+            rows[33..].clone_from_slice(&[
+                first_row.to_owned(),
+                String::new(),
+                "  Line 1.".to_owned(),
+                String::new(),
+                "  Line 2.".to_owned(),
+                String::new(),
+                CONFIGURED_FOOTER.to_owned(),
+            ]);
+            let grid = grid(132, 9, 37, false, rows);
 
-        let text = captured_text(&grid);
+            let text = captured_text(&grid);
 
-        assert_eq!(
-            text,
-            "The test prompt for recovering.\n\nLine 1.\n\nLine 2."
-        );
-        assert_eq!(text.len(), 49);
+            assert_eq!(
+                text,
+                "The test prompt for recovering.\n\nLine 1.\n\nLine 2."
+            );
+            assert_eq!(text.len(), 49);
+        }
     }
 
     #[test]
@@ -337,27 +392,141 @@ mod tests {
     }
 
     #[test]
-    fn returns_absent_for_an_empty_composer() {
-        let grid = compact_grid(
-            &["› Ask Codex to do anything"],
-            2,
+    fn returns_absent_for_each_style_proven_codex_0145_suggestion() {
+        let suggestions = [
+            ('›', "Ask Codex to do anything"),
+            ('»', "Implement {feature}"),
+            ('›', "Use /skills to list available skills"),
+            ('»', "Write tests for @filename"),
+            ('›', "Explain this codebase"),
+            ('»', "Find and fix a bug in @filename"),
+        ];
+
+        for (glyph, suggestion) in suggestions {
+            let grid = styled_empty_composer_grid(
+                glyph,
+                suggestion,
+                "  ? for shortcuts    100% context left",
+                0,
+            );
+
+            assert!(matches!(
+                capture_visible_codex_prompt(&grid),
+                CodexPromptAreaObservation::Absent
+            ));
+        }
+    }
+
+    #[test]
+    fn skips_known_suggestions_without_complete_style_proof() {
+        let collisions = [
+            "› Ask Codex to do anything".to_owned(),
+            "\x1b[2m› Ask Codex to do anything\x1b[22m".to_owned(),
+            "› \x1b[2mAsk Codex\x1b[22m to do anything".to_owned(),
+            "› \x1b[2mAsk Codex to do \x1b[22manything".to_owned(),
+        ];
+
+        for row in collisions {
+            let grid = grid(
+                80,
+                2,
+                0,
+                false,
+                vec![
+                    row,
+                    String::new(),
+                    "  ? for shortcuts    100% context left".to_owned(),
+                ],
+            );
+
+            assert!(matches!(
+                capture_visible_codex_prompt(&grid),
+                CodexPromptAreaObservation::Skipped(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn skips_an_unknown_faint_suggestion() {
+        let grid = styled_empty_composer_grid(
+            '›',
+            "Ask something else",
             "  ? for shortcuts    100% context left",
+            0,
         );
 
         assert!(matches!(
             capture_visible_codex_prompt(&grid),
-            CodexPromptAreaObservation::Absent
-        ));
-
-        let other_placeholder = compact_grid(
-            &["› Ask something else"],
-            2,
-            "  ? for shortcuts    100% context left",
-        );
-        assert!(matches!(
-            capture_visible_codex_prompt(&other_placeholder),
             CodexPromptAreaObservation::Skipped(_)
         ));
+    }
+
+    #[test]
+    fn accepts_a_recognized_footer_followed_by_blank_terminal_rows() {
+        for terminal_blank_rows in [0, 5] {
+            let real_draft = grid(
+                80,
+                7,
+                0,
+                false,
+                [
+                    "» draft".to_owned(),
+                    String::new(),
+                    "  95% context left".to_owned(),
+                ]
+                .into_iter()
+                .chain((0..terminal_blank_rows).map(|_| String::new()))
+                .collect(),
+            );
+            assert_eq!(captured_text(&real_draft), "draft");
+
+            let empty_composer = styled_empty_composer_grid(
+                '›',
+                "Ask Codex to do anything",
+                "  95% context left",
+                terminal_blank_rows,
+            );
+            assert!(matches!(
+                capture_visible_codex_prompt(&empty_composer),
+                CodexPromptAreaObservation::Absent
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_nonblank_or_duplicate_rows_around_the_footer() {
+        let prompt = "› \x1b[2mAsk Codex to do anything\x1b[22m";
+        let footer = "  95% context left";
+        let layouts = [
+            vec![prompt.to_owned(), footer.to_owned()],
+            vec![prompt.to_owned(), String::new(), String::new()],
+            vec![
+                prompt.to_owned(),
+                String::new(),
+                "  shortcut overlay".to_owned(),
+                footer.to_owned(),
+            ],
+            vec![
+                prompt.to_owned(),
+                String::new(),
+                footer.to_owned(),
+                footer.to_owned(),
+            ],
+            vec![
+                prompt.to_owned(),
+                String::new(),
+                footer.to_owned(),
+                "  shortcut overlay".to_owned(),
+            ],
+        ];
+
+        for rows in layouts {
+            let grid = grid(80, 2, 0, false, rows);
+            assert!(matches!(
+                capture_visible_codex_prompt(&grid),
+                CodexPromptAreaObservation::Skipped(_)
+            ));
+        }
     }
 
     #[test]

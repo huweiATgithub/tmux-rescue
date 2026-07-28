@@ -174,7 +174,11 @@ fn captured_grid(pane_id: &str) -> VisiblePaneGrid {
 fn absent_grid(pane_id: &str) -> VisiblePaneGrid {
     visible_grid(
         pane_id,
-        &["› Ask Codex to do anything", "", "  95% context left"],
+        &[
+            "› \x1b[2mAsk Codex to do anything\x1b[22m",
+            "",
+            "  95% context left",
+        ],
         2,
         0,
     )
@@ -467,6 +471,41 @@ fn absent_prompt_input_emits_no_event() {
         })
     ));
     assert!(result.events().is_empty());
+}
+
+#[test]
+fn unstyled_suggestion_retains_automatic_recovery_and_emits_one_safe_warning() {
+    let observed = topology_with_pane_id("work", 0, "%15");
+    let suggestion = "Ask Codex to do anything";
+    let row = format!("› {suggestion}");
+    let unstyled_grid = visible_grid("%15", &[&row, "", "  95% context left"], 2, 0);
+    let mut source = ScriptedSource::new(vec![Ok(observed.clone()), Ok(observed)])
+        .with_observation(codex_foreground())
+        .with_visible_reads(vec![Ok(unstyled_grid)]);
+
+    let result = capture_snapshot(&mut source, capture_time()).unwrap();
+
+    assert!(matches!(
+        result.snapshot().sessions()[0].windows()[0].panes()[0].recovery(),
+        PaneRecovery::Automatic(AutomaticRecovery::Codex {
+            prompt_area: None,
+            ..
+        })
+    ));
+    let [event] = result.events() else {
+        panic!("expected exactly one prompt-capture skip event");
+    };
+    let CaptureEvent::CodexPromptCaptureSkipped {
+        attempt: 1,
+        failure,
+        ..
+    } = event
+    else {
+        panic!("expected a prompt-capture skip event");
+    };
+    let debug = format!("{event:?}");
+    assert!(!failure.message().contains(suggestion));
+    assert!(!debug.contains(suggestion), "prompt leaked: {debug}");
 }
 
 #[test]
