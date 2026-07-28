@@ -221,7 +221,7 @@ mod tests {
             in_mode,
         )
         .unwrap();
-        VisiblePaneGrid::try_from_tmux_capture(
+        VisiblePaneGrid::try_from_tmux_styled_capture(
             metadata,
             format!("{}\n", rows.join("\n")).into_bytes(),
         )

@@ -170,7 +170,7 @@ impl<P> TmuxAdapter<P> {
                     .expect("static visible-pane failure satisfies diagnostic invariants"),
             );
         }
-        VisiblePaneGrid::try_from_tmux_capture(before, output).map_err(|error| {
+        VisiblePaneGrid::try_from_tmux_styled_capture(before, output).map_err(|error| {
             codex_prompt_capture_failure(TmuxAdapterError::MalformedOutput(error.to_string()))
         })
     }

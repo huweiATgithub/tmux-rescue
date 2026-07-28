@@ -147,7 +147,7 @@ fn downgraded_codex_foreground() -> PaneProcessObservation {
 }
 
 fn visible_grid(pane_id: &str, rows: &[&str], cursor_x: u16, cursor_y: u16) -> VisiblePaneGrid {
-    VisiblePaneGrid::try_from_tmux_capture(
+    VisiblePaneGrid::try_from_tmux_styled_capture(
         VisiblePaneMetadata::try_new(
             TmuxPaneId::try_from_bytes(pane_id.as_bytes().to_vec()).unwrap(),
             80,
