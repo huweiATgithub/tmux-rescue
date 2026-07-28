@@ -97,7 +97,32 @@ fn install_visible_grid_fake_tmux(
     let tmux = bin.join("tmux");
     fs::write(
         &tmux,
-        b"#!/bin/sh\n{ printf 'BEGIN\\nPWD=%s\\nTMUX=%s\\n' \"$PWD\" \"${TMUX-unset}\"; for arg do printf 'ARG=%s\\n' \"$arg\"; done; } >> \"$FAKE_TMUX_LOG\"\ncase \" $* \" in\n  *' list-panes '*) printf '4:work1:01:04:/tmp6:editor4:/tmp1:19:/dev/null0:7:/bin/sh3:%%15\\n' ;;\n  *' display-message -p -t %15 '*)\n    if [ \"$FAKE_TMUX_SCENARIO\" = wrong_mode ]; then\n      printf '3:%%152:801:41:81:14:true\\n'\n    elif [ -e \"$FAKE_TMUX_STATE\" ]; then\n      if [ \"$FAKE_TMUX_SCENARIO\" = changed ]; then\n        printf '3:%%152:801:41:91:11:0\\n'\n      else\n        printf '3:%%152:801:41:81:11:0\\n'\n      fi\n    else\n      : > \"$FAKE_TMUX_STATE\"\n      printf '3:%%152:801:41:81:11:0\\n'\n    fi ;;\n  *' capture-pane -p -t %15 '*)\n    if [ \"$FAKE_TMUX_SCENARIO\" = wrong_rows ]; then\n      printf '\\302\\273 private source row\\n  second row\\n  95%% context left\\n'\n    else\n      printf '\\302\\273 draft\\n  second\\n\\n  95%% context left\\n'\n    fi ;;\n  *) printf 'unexpected fake tmux command\\n' >&2; exit 2 ;;\nesac\n",
+        br#"#!/bin/sh
+{ printf 'BEGIN\nPWD=%s\nTMUX=%s\n' "$PWD" "${TMUX-unset}"; for arg do printf 'ARG=%s\n' "$arg"; done; } >> "$FAKE_TMUX_LOG"
+case " $* " in
+  *' list-panes '*) printf '4:work1:01:04:/tmp6:editor4:/tmp1:19:/dev/null0:7:/bin/sh3:%%15\n' ;;
+  *' display-message -p -t %15 '*)
+    if [ "$FAKE_TMUX_SCENARIO" = wrong_mode ]; then
+      printf '3:%%152:801:41:81:14:true\n'
+    elif [ -e "$FAKE_TMUX_STATE" ]; then
+      if [ "$FAKE_TMUX_SCENARIO" = changed ]; then
+        printf '3:%%152:801:41:91:11:0\n'
+      else
+        printf '3:%%152:801:41:81:11:0\n'
+      fi
+    else
+      : > "$FAKE_TMUX_STATE"
+      printf '3:%%152:801:41:81:11:0\n'
+    fi ;;
+  *' capture-pane -p -e -t %15 '*)
+    if [ "$FAKE_TMUX_SCENARIO" = wrong_rows ]; then
+      printf '\302\273 private source row\n  second row\n  95%% context left\n'
+    else
+      printf '\302\273 \033[2mdraft\033[0m\n  second\n\n  95%% context left\n'
+    fi ;;
+  *) printf 'unexpected fake tmux command\n' >&2; exit 2 ;;
+esac
+"#,
     )
     .unwrap();
     fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
@@ -540,7 +565,7 @@ fn visible_grid_capture_uses_stable_metadata_and_never_joins_rows() {
     assert_eq!(commands.len(), 3, "unexpected command log: {log}");
     assert!(commands[0].contains("ARG=display-message\nARG=-p\nARG=-t\nARG=%15\n"));
     assert!(commands[0].contains(METADATA_FORMAT));
-    assert!(commands[1].contains("ARG=capture-pane\nARG=-p\nARG=-t\nARG=%15\n"));
+    assert!(commands[1].contains("ARG=capture-pane\nARG=-p\nARG=-e\nARG=-t\nARG=%15\n"));
     assert!(commands[2].contains("ARG=display-message\nARG=-p\nARG=-t\nARG=%15\n"));
     assert!(commands[2].contains(METADATA_FORMAT));
     for command in &commands {
@@ -703,7 +728,7 @@ fn visible_grid_capture_targets_the_ephemeral_pane_id() {
     adapter.read_visible_pane(pane).unwrap();
 
     let log = String::from_utf8(fs::read(log).unwrap()).unwrap();
-    assert!(log.contains("ARG=capture-pane\nARG=-p\nARG=-t\nARG=%15\n"));
+    assert!(log.contains("ARG=capture-pane\nARG=-p\nARG=-e\nARG=-t\nARG=%15\n"));
     assert!(!log.contains("work:0.0"));
 }
 

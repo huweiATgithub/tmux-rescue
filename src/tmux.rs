@@ -158,7 +158,7 @@ impl<P> TmuxAdapter<P> {
         };
         let before = read_metadata().map_err(codex_prompt_capture_failure)?;
         let output = source_client_command(Some(&self.selector))
-            .args(["capture-pane", "-p", "-t", pane.pane_id().as_str()])
+            .args(["capture-pane", "-p", "-e", "-t", pane.pane_id().as_str()])
             .output()
             .map_err(|error| TmuxAdapterError::CommandUnavailable(error.to_string()))
             .and_then(|output| require_success("capture visible tmux pane", output))
@@ -1782,9 +1782,17 @@ pub enum TmuxAdapterError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    use crate::{RestoreDestination, RestoreTargetState, TargetDisposition, TmuxSelector};
+    use crate::{
+        LinuxProcessInspector, RestoreDestination, RestoreTargetState, SnapshotSource,
+        TargetDisposition, TmuxAdapter, TmuxSelector,
+    };
 
     use super::{
         OwnedProcessIdentity, OwnedProcessState, OwnedServer, RestoredPane, TemporaryClaimConfig,
@@ -1793,6 +1801,55 @@ mod tests {
     };
 
     struct TestProcessGuard(u32);
+
+    struct TemporaryTmuxServer {
+        socket: PathBuf,
+    }
+
+    impl TemporaryTmuxServer {
+        fn start(socket: &Path, working_directory: &Path, command: &Path) -> Self {
+            let output = Command::new("tmux")
+                .args(["-u", "-S"])
+                .arg(socket)
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "work",
+                    "-x",
+                    "80",
+                    "-y",
+                    "1",
+                    "-c",
+                ])
+                .arg(working_directory)
+                .arg(command)
+                .env_remove("TMUX")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "failed to start isolated tmux: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Self {
+                socket: socket.to_owned(),
+            }
+        }
+    }
+
+    impl Drop for TemporaryTmuxServer {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["-u", "-N", "-S"])
+                .arg(&self.socket)
+                .arg("kill-server")
+                .env_remove("TMUX")
+                .status();
+        }
+    }
 
     fn destination(socket: &std::path::Path) -> RestoreDestination {
         RestoreDestination::from_selector(TmuxSelector::SocketPath(socket.as_os_str().to_owned()))
@@ -1823,6 +1880,47 @@ mod tests {
         });
 
         assert!(matches!(state, OwnedProcessState::GoneOrReused));
+    }
+
+    #[test]
+    fn real_adapter_returns_the_faint_suffix_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("faint-suffix.sock");
+        let renderer = temp.path().join("render-faint-suffix");
+        fs::write(
+            &renderer,
+            "#!/bin/sh\nprintf '› '\nprintf '\\033[2mImplement {feature}\\033[0m'\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&renderer, fs::Permissions::from_mode(0o700)).unwrap();
+        let _server = TemporaryTmuxServer::start(&socket, temp.path(), &renderer);
+        let source =
+            SnapshotSource::try_from_bytes(socket.as_os_str().as_bytes().to_vec()).unwrap();
+        let adapter = TmuxAdapter::new(source, LinuxProcessInspector::new());
+        let topology = adapter.read_source_topology().unwrap();
+        let pane = &topology.sessions()[0].windows()[0].panes()[0];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let grid = loop {
+            let grid = adapter.read_source_visible_pane(pane).unwrap();
+            if grid.rows()[0].as_str() == "› Implement {feature}" {
+                break grid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "isolated pane never rendered the faint suffix: {:?}",
+                grid.rows()
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let row = &grid.rows()[0];
+        assert_eq!(row.as_str(), "› Implement {feature}");
+        assert_eq!(
+            row.faint_suffix_after_non_faint_prefix("› ")
+                .unwrap()
+                .as_str(),
+            "Implement {feature}"
+        );
     }
 
     #[test]
