@@ -161,11 +161,28 @@ impl VisiblePaneMetadata {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct VisibleRow {
     text: String,
     faint_by_char: Vec<bool>,
 }
+
+impl std::fmt::Debug for VisibleRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VisibleRow")
+            .field("text", &self.text)
+            .finish()
+    }
+}
+
+impl PartialEq for VisibleRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for VisibleRow {}
 
 #[allow(dead_code)]
 pub(crate) struct FaintVisibleText<'a>(&'a str);
@@ -204,11 +221,29 @@ impl VisibleRow {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct VisiblePaneGrid {
     metadata: VisiblePaneMetadata,
     rows: Vec<VisibleRow>,
 }
+
+impl std::fmt::Debug for VisiblePaneGrid {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VisiblePaneGrid")
+            .field("metadata", &self.metadata)
+            .field("rows", &self.rows)
+            .finish()
+    }
+}
+
+impl PartialEq for VisiblePaneGrid {
+    fn eq(&self, other: &Self) -> bool {
+        self.metadata == other.metadata && self.rows == other.rows
+    }
+}
+
+impl Eq for VisiblePaneGrid {}
 
 impl VisiblePaneGrid {
     pub fn try_from_tmux_styled_capture(
@@ -458,6 +493,25 @@ mod tests {
             row.faint_suffix_after_non_faint_prefix("› Implement")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn conventional_traits_do_not_expose_or_compare_style_evidence() {
+        let plain = VisiblePaneGrid::try_from_tmux_styled_capture(
+            one_row_metadata(80),
+            b"visible\n".to_vec(),
+        )
+        .unwrap();
+        let faint = VisiblePaneGrid::try_from_tmux_styled_capture(
+            one_row_metadata(80),
+            b"\x1b[2mvisible\x1b[0m\n".to_vec(),
+        )
+        .unwrap();
+
+        let debug = format!("{faint:?}");
+        assert!(!debug.contains("faint"));
+        assert_eq!(plain.rows()[0], faint.rows()[0]);
+        assert_eq!(plain, faint);
     }
 
     #[test]
