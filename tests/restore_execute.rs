@@ -669,7 +669,9 @@ fn prompt_preparation_failure_is_partial_and_later_panes_continue() {
     let failures = [
         CodexPromptPasteFailure::SessionMismatch,
         CodexPromptPasteFailure::PaneMissing,
-        CodexPromptPasteFailure::Failed("tmux rejected paste".to_owned()),
+        CodexPromptPasteFailure::InputDisabled,
+        CodexPromptPasteFailure::PasteFailed,
+        CodexPromptPasteFailure::CleanupFailed,
     ];
 
     for failure in failures {
@@ -709,6 +711,21 @@ fn prompt_preparation_failure_is_partial_and_later_panes_continue() {
             [coordinate(0), coordinate(1)],
             "a later pane still executes after prompt preparation fails"
         );
+    }
+}
+
+#[test]
+fn prompt_paste_failure_debug_cannot_carry_prompt_text() {
+    const SENSITIVE_PROMPT: &str = "release the unreleased signing key";
+    for failure in [
+        CodexPromptPasteFailure::SessionMismatch,
+        CodexPromptPasteFailure::PaneMissing,
+        CodexPromptPasteFailure::InputDisabled,
+        CodexPromptPasteFailure::PasteFailed,
+        CodexPromptPasteFailure::CleanupFailed,
+    ] {
+        let outcome = PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(failure);
+        assert!(!format!("{outcome:?}").contains(SENSITIVE_PROMPT));
     }
 }
 

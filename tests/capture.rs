@@ -3,11 +3,11 @@ use std::collections::VecDeque;
 use tmux_rescue::{
     AutomaticRecovery, CaptureConsistency, CaptureEvent, CaptureFailure, CaptureSource,
     CaptureSourceFailure, CaptureTime, CapturedCommand, CodexPromptCaptureFailure,
-    ForegroundProcessMember, LosslessOsString, MAX_TOPOLOGY_VALIDATION_ATTEMPTS,
-    OpenedCodexSessionFile, PaneInitialProcess, PaneProcessAnchor, PaneProcessObservation,
-    PaneRecovery, PaneTiedForegroundEvidence, RecordedAbsolutePath, SnapshotSource, TmuxPaneId,
-    TopologyObservation, TopologyPane, TopologySession, TopologyWindow, VisiblePaneGrid,
-    VisiblePaneMetadata, capture_snapshot,
+    ForegroundProcessMember, LosslessOsString, MAX_PANES_PER_WINDOW,
+    MAX_TOPOLOGY_VALIDATION_ATTEMPTS, OpenedCodexSessionFile, PaneInitialProcess,
+    PaneProcessAnchor, PaneProcessObservation, PaneRecovery, PaneTiedForegroundEvidence,
+    RecordedAbsolutePath, SnapshotSource, TmuxPaneId, TopologyObservation, TopologyPane,
+    TopologySession, TopologyWindow, VisiblePaneGrid, VisiblePaneMetadata, capture_snapshot,
 };
 
 const CODEX_SESSION_ID: &str = "1d6381bf-01c5-4c4a-b725-8e376e5ad295";
@@ -184,6 +184,29 @@ fn absent_grid(pane_id: &str) -> VisiblePaneGrid {
     )
 }
 
+fn maximum_prompt_grid(pane_id: &str) -> VisiblePaneGrid {
+    const PROMPT_ROWS: usize = 210;
+    let mut rows = Vec::with_capacity(PROMPT_ROWS + 2);
+    rows.push(format!("» {}", "x".repeat(77)));
+    rows.extend((1..PROMPT_ROWS).map(|_| format!("  {}", "x".repeat(77))));
+    rows.push(String::new());
+    rows.push("  95% context left".to_owned());
+
+    VisiblePaneGrid::try_from_tmux_styled_capture(
+        VisiblePaneMetadata::try_new(
+            TmuxPaneId::try_from_bytes(pane_id.as_bytes().to_vec()).unwrap(),
+            80,
+            u16::try_from(rows.len()).unwrap(),
+            79,
+            u16::try_from(PROMPT_ROWS - 1).unwrap(),
+            false,
+        )
+        .unwrap(),
+        format!("{}\n", rows.join("\n")).into_bytes(),
+    )
+    .unwrap()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SourceCall {
     ReadTopology,
@@ -358,6 +381,39 @@ fn failed_after_read_retains_a_candidate_but_failed_before_read_does_not_create_
 }
 
 #[test]
+fn budget_downgrade_reports_the_retained_candidates_actual_attempt() {
+    let pane_indexes = (0..u32::try_from(MAX_PANES_PER_WINDOW).unwrap()).collect::<Vec<_>>();
+    let candidate = topology("candidate", &pane_indexes);
+    let failure = CaptureSourceFailure::try_new("tmux read failed").unwrap();
+    let prompt_grid = maximum_prompt_grid("%15");
+    let mut source = ScriptedSource::new(vec![
+        Ok(candidate),
+        Err(failure.clone()),
+        Err(failure.clone()),
+        Err(failure.clone()),
+    ])
+    .with_observation(codex_foreground())
+    .with_visible_reads(vec![Ok(prompt_grid); MAX_PANES_PER_WINDOW]);
+
+    let result = capture_snapshot(&mut source, capture_time()).unwrap();
+
+    let budget_attempt = result
+        .events()
+        .iter()
+        .find_map(|event| match event {
+            CaptureEvent::CodexPromptCaptureSkipped {
+                attempt, failure, ..
+            } if failure.message() == "snapshot size budget exceeded" => Some(*attempt),
+            _ => None,
+        })
+        .expect("oversized candidate must drop prompt enrichment");
+    assert_eq!(
+        budget_attempt, 1,
+        "the retained candidate came from attempt 1"
+    );
+}
+
+#[test]
 fn exhaustion_without_any_complete_candidate_is_fatal() {
     let failure = CaptureSourceFailure::try_new("tmux read failed").unwrap();
     let mut source = ScriptedSource::new(
@@ -513,10 +569,9 @@ fn skipped_prompt_input_retains_automatic_codex_recovery() {
     let observed = topology_with_pane_id("work", 0, "%15");
     let mut source = ScriptedSource::new(vec![Ok(observed.clone()), Ok(observed)])
         .with_observation(codex_foreground())
-        .with_visible_reads(vec![Err(CodexPromptCaptureFailure::try_from_read_failure(
-            "pane metadata changed",
-        )
-        .unwrap())]);
+        .with_visible_reads(vec![Err(
+            CodexPromptCaptureFailure::visible_pane_read_failed(),
+        )]);
 
     let result = capture_snapshot(&mut source, capture_time()).unwrap();
 
@@ -532,6 +587,14 @@ fn skipped_prompt_input_retains_automatic_codex_recovery() {
         result.events(),
         [CaptureEvent::CodexPromptCaptureSkipped { attempt: 1, .. }]
     ));
+}
+
+#[test]
+fn capture_read_failure_diagnostics_cannot_carry_prompt_text() {
+    let failure = CodexPromptCaptureFailure::visible_pane_read_failed();
+
+    assert!(!failure.message().contains(SENSITIVE_PROMPT));
+    assert!(!format!("{failure:?}").contains(SENSITIVE_PROMPT));
 }
 
 #[test]

@@ -64,10 +64,11 @@ its explicit immutable snapshot path.
 For a pane already classified as one exact Codex session, the same explicit
 snapshot invocation makes a best-effort capture of pending input from the
 currently visible supported composer. The capture is optional enrichment: an
-empty composer records nothing, and a changing, hidden, scrolled-out, unsafe,
-oversized, or unsupported screen retains the exact Codex session recovery
-without prompt text. It never scans scrollback or a Codex transcript to fill in
-missing input.
+empty composer records nothing, and a changing, unsafe, oversized, or
+unsupported screen retains the exact Codex session recovery without prompt
+text. Hidden or scrolled-out portions are omitted, but a supported visible
+suffix may still be captured when the draft's start is above the visible grid.
+It never scans scrollback or a Codex transcript to fill in missing input.
 
 Snapshot capture is manual in v1. Scheduling, tmux hooks, and an internal daemon
 are deferred until the core capture API has proved useful.

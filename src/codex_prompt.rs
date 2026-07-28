@@ -660,14 +660,11 @@ mod tests {
         assert!(!failure.message().contains(&sensitive));
         assert!(!format!("{failure:?}").contains(&sensitive));
 
-        assert!(CodexPromptCaptureFailure::try_from_read_failure("").is_err());
-        assert!(CodexPromptCaptureFailure::try_from_read_failure("read\nfailure").is_err());
-        assert!(CodexPromptCaptureFailure::try_from_read_failure("x".repeat(4_097)).is_err());
+        let read_failure = CodexPromptCaptureFailure::visible_pane_read_failed();
         assert_eq!(
-            CodexPromptCaptureFailure::try_from_read_failure("tmux read failed")
-                .unwrap()
-                .message(),
-            "tmux read failed"
+            read_failure.message(),
+            "visible tmux pane could not be read"
         );
+        assert!(!format!("{read_failure:?}").contains(&sensitive));
     }
 }

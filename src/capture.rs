@@ -329,9 +329,11 @@ impl CaptureSourceFailure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexPromptCaptureFailure(CodexPromptCaptureFailureKind);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CodexPromptCaptureFailureKind {
-    ReadFailure(CaptureFailure),
+    VisiblePaneReadFailed,
+    PaneMetadataChanged,
+    InvalidVisiblePane,
     UnsupportedLayout,
     UnsafeText,
     SizeOverflow,
@@ -339,17 +341,21 @@ enum CodexPromptCaptureFailureKind {
 }
 
 impl CodexPromptCaptureFailure {
-    pub fn try_from_read_failure(
-        message: impl Into<String>,
-    ) -> Result<Self, SnapshotValidationError> {
-        CaptureFailure::try_new(message)
-            .map(CodexPromptCaptureFailureKind::ReadFailure)
-            .map(Self)
+    pub fn visible_pane_read_failed() -> Self {
+        Self(CodexPromptCaptureFailureKind::VisiblePaneReadFailed)
     }
 
     pub fn message(&self) -> &str {
-        match &self.0 {
-            CodexPromptCaptureFailureKind::ReadFailure(failure) => failure.message(),
+        match self.0 {
+            CodexPromptCaptureFailureKind::VisiblePaneReadFailed => {
+                "visible tmux pane could not be read"
+            }
+            CodexPromptCaptureFailureKind::PaneMetadataChanged => {
+                "visible pane metadata changed during capture"
+            }
+            CodexPromptCaptureFailureKind::InvalidVisiblePane => {
+                "visible tmux pane output is invalid"
+            }
             CodexPromptCaptureFailureKind::UnsupportedLayout => {
                 "visible pane does not match the supported Codex 0.145.0 prompt layout"
             }
@@ -369,6 +375,14 @@ impl CodexPromptCaptureFailure {
         Self(CodexPromptCaptureFailureKind::UnsupportedLayout)
     }
 
+    pub(crate) fn pane_metadata_changed() -> Self {
+        Self(CodexPromptCaptureFailureKind::PaneMetadataChanged)
+    }
+
+    pub(crate) fn invalid_visible_pane() -> Self {
+        Self(CodexPromptCaptureFailureKind::InvalidVisiblePane)
+    }
+
     pub(crate) fn unsafe_text() -> Self {
         Self(CodexPromptCaptureFailureKind::UnsafeText)
     }
@@ -380,6 +394,11 @@ impl CodexPromptCaptureFailure {
     fn snapshot_size_budget_exceeded() -> Self {
         Self(CodexPromptCaptureFailureKind::SnapshotSizeBudgetExceeded)
     }
+}
+
+struct CaptureCandidate {
+    attempt: usize,
+    sessions: Vec<RawSessionSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -547,8 +566,8 @@ fn capture_candidate(
     topology: &TopologyObservation,
     attempt: usize,
     events: &mut Vec<CaptureEvent>,
-) -> Vec<RawSessionSnapshot> {
-    topology
+) -> CaptureCandidate {
+    let sessions = topology
         .sessions
         .iter()
         .map(|session| RawSessionSnapshot {
@@ -600,7 +619,8 @@ fn capture_candidate(
                 })
                 .collect(),
         })
-        .collect()
+        .collect();
+    CaptureCandidate { attempt, sessions }
 }
 
 fn capture_foreground_recovery(
@@ -662,7 +682,7 @@ fn build_result(
     captured_at: CaptureTime,
     source: SnapshotSource,
     consistency: RawCaptureConsistency,
-    sessions: Vec<RawSessionSnapshot>,
+    candidate: CaptureCandidate,
     attempts: usize,
     events: Vec<CaptureEvent>,
 ) -> Result<CaptureResult, CaptureError> {
@@ -670,7 +690,7 @@ fn build_result(
         captured_at,
         source,
         consistency,
-        sessions,
+        candidate,
         attempts,
         events,
         MAX_SNAPSHOT_BYTES,
@@ -681,7 +701,7 @@ fn build_result_with_serialization_limit(
     captured_at: CaptureTime,
     source: SnapshotSource,
     consistency: RawCaptureConsistency,
-    sessions: Vec<RawSessionSnapshot>,
+    candidate: CaptureCandidate,
     attempts: usize,
     mut events: Vec<CaptureEvent>,
     serialization_limit: usize,
@@ -690,7 +710,7 @@ fn build_result_with_serialization_limit(
         captured_at: captured_at.encoded().to_owned(),
         source: source.path().to_raw(),
         consistency,
-        sessions,
+        sessions: candidate.sessions,
     };
     let mut persisted = raw
         .serialize_for_persistence()
@@ -701,7 +721,7 @@ fn build_result_with_serialization_limit(
         if !affected.is_empty() {
             events.extend(affected.into_iter().map(|pane| {
                 CaptureEvent::CodexPromptCaptureSkipped {
-                    attempt: attempts,
+                    attempt: candidate.attempt,
                     pane,
                     failure: CodexPromptCaptureFailure::snapshot_size_budget_exceeded(),
                 }
@@ -842,7 +862,10 @@ mod tests {
             CaptureTime::parse_rfc3339("2026-07-23T00:00:00Z").unwrap(),
             SnapshotSource::try_from_bytes(b"/tmp/source.sock".to_vec()).unwrap(),
             RawCaptureConsistency::Stable {},
-            candidate([Some(first_prompt.as_str()), Some(second_prompt.as_str())]),
+            CaptureCandidate {
+                attempt: 7,
+                sessions: candidate([Some(first_prompt.as_str()), Some(second_prompt.as_str())]),
+            },
             7,
             Vec::new(),
             serialization_limit,
@@ -894,7 +917,10 @@ mod tests {
             CaptureTime::parse_rfc3339("2026-07-23T00:00:00Z").unwrap(),
             SnapshotSource::try_from_bytes(b"/tmp/source.sock".to_vec()).unwrap(),
             RawCaptureConsistency::Stable {},
-            candidate([None, None]),
+            CaptureCandidate {
+                attempt: 1,
+                sessions: candidate([None, None]),
+            },
             1,
             Vec::new(),
             prompt_free_pretty_size - 1,

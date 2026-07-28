@@ -718,9 +718,9 @@ fn codex_prompt_paste_failure_label(failure: &CodexPromptPasteFailure) -> String
     match failure {
         CodexPromptPasteFailure::SessionMismatch => "Codex session changed".to_owned(),
         CodexPromptPasteFailure::PaneMissing => "target pane is missing".to_owned(),
-        CodexPromptPasteFailure::Failed(reason) => {
-            format!("prompt preparation failed: {}", safe_text(reason))
-        }
+        CodexPromptPasteFailure::InputDisabled => "target pane input is disabled".to_owned(),
+        CodexPromptPasteFailure::PasteFailed => "prompt paste failed".to_owned(),
+        CodexPromptPasteFailure::CleanupFailed => "prompt buffer cleanup failed".to_owned(),
     }
 }
 
@@ -1567,36 +1567,52 @@ mod tests {
 
     #[test]
     fn codex_prompt_attention_labels_are_safe_and_specific() {
-        assert_eq!(
-            pane_outcome_label(
-                &PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(
-                    tmux_rescue::CodexPromptPasteFailure::SessionMismatch,
-                )
+        for (failure, expected) in [
+            (
+                CodexPromptPasteFailure::SessionMismatch,
+                "recovered automatically; pending input needs attention (Codex session changed)",
             ),
-            "recovered automatically; pending input needs attention (Codex session changed)"
-        );
-        assert_eq!(
-            pane_outcome_label(
-                &PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(
-                    tmux_rescue::CodexPromptPasteFailure::PaneMissing,
-                )
+            (
+                CodexPromptPasteFailure::PaneMissing,
+                "recovered automatically; pending input needs attention (target pane is missing)",
             ),
-            "recovered automatically; pending input needs attention (target pane is missing)"
-        );
+            (
+                CodexPromptPasteFailure::InputDisabled,
+                "recovered automatically; pending input needs attention (target pane input is disabled)",
+            ),
+            (
+                CodexPromptPasteFailure::PasteFailed,
+                "recovered automatically; pending input needs attention (prompt paste failed)",
+            ),
+            (
+                CodexPromptPasteFailure::CleanupFailed,
+                "recovered automatically; pending input needs attention (prompt buffer cleanup failed)",
+            ),
+        ] {
+            assert_eq!(
+                pane_outcome_label(
+                    &PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(failure)
+                ),
+                expected
+            );
+        }
+    }
 
-        let reason = format!("tmux failed\u{202e}{}tail", "x".repeat(8 * 1024));
-        let label = pane_outcome_label(
-            &PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(
-                tmux_rescue::CodexPromptPasteFailure::Failed(reason),
-            ),
-        );
-
-        assert!(label.starts_with(concat!(
-            "recovered automatically; pending input needs attention ",
-            "(prompt preparation failed: tmux failed\\u{202e}"
-        )));
-        assert!(!label.contains('\u{202e}'));
-        assert!(label.len() <= 4 * 1024 + 100);
+    #[test]
+    fn codex_prompt_attention_label_cannot_carry_prompt_text() {
+        const SENSITIVE_PROMPT: &str = "release the unreleased signing key";
+        for failure in [
+            CodexPromptPasteFailure::SessionMismatch,
+            CodexPromptPasteFailure::PaneMissing,
+            CodexPromptPasteFailure::InputDisabled,
+            CodexPromptPasteFailure::PasteFailed,
+            CodexPromptPasteFailure::CleanupFailed,
+        ] {
+            let label = pane_outcome_label(
+                &PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(failure),
+            );
+            assert!(!label.contains(SENSITIVE_PROMPT));
+        }
     }
 
     #[test]
@@ -1675,17 +1691,14 @@ mod tests {
                 window_index: 0,
                 pane_index: 0,
             },
-            failure: tmux_rescue::CodexPromptCaptureFailure::try_from_read_failure(
-                "pane metadata changed",
-            )
-            .unwrap(),
+            failure: tmux_rescue::CodexPromptCaptureFailure::visible_pane_read_failed(),
         };
 
         write_capture_events(&mut stderr, &[event]).unwrap();
 
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
-            "warning: capture attempt 1 pane work:0:0 Codex prompt capture skipped: pane metadata changed\n"
+            "warning: capture attempt 1 pane work:0:0 Codex prompt capture skipped: visible tmux pane could not be read\n"
         );
     }
 }

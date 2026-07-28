@@ -1526,7 +1526,9 @@ pub enum AutomaticPaneObservation {
 pub enum CodexPromptPasteFailure {
     SessionMismatch,
     PaneMissing,
-    Failed(String),
+    InputDisabled,
+    PasteFailed,
+    CleanupFailed,
 }
 
 pub type CodexPromptPasteResult = Result<(), CodexPromptPasteFailure>;

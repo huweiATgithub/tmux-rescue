@@ -686,8 +686,8 @@ fn changing_metadata_or_wrong_row_count_skips_prompt_capture() {
     let _serial = SOURCE_COMMAND_TEST.lock().unwrap();
     for (scenario, expected) in [
         ("changed", "pane metadata changed"),
-        ("wrong_rows", "rows"),
-        ("wrong_mode", "pane mode"),
+        ("wrong_rows", "visible tmux pane output is invalid"),
+        ("wrong_mode", "visible tmux pane could not be read"),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let working = temp.path().join("working");
