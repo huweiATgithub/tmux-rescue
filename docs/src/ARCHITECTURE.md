@@ -392,15 +392,18 @@ client each time:
 
 ```text
 read (pane id, width, height, cursor, mode)
--> tmux capture-pane -p -t <exact-pane-id>
+-> tmux capture-pane -p -e -t <exact-pane-id>
 -> read (pane id, width, height, cursor, mode) again
 -> require identical metadata and the topology pane id
 -> refine VisiblePaneGrid
 ```
 
 The visible-grid command deliberately has no `-J`, history `-S`/`-E`, or input
-operation. Row and blank-line boundaries remain intact. The Codex layout parser
-is private to capture and accepts only the renderer evidence in
+operation. Row and blank-line boundaries remain intact. `visible_pane` consumes
+all admitted SGR, retains only private per-character faintness, and exposes
+plain rows plus one atomic proof; raw ANSI and generic style queries cannot
+cross the seam. The Codex layout parser is private to capture and accepts only
+the renderer evidence in
 [TOOL-RECOVERIES.md](TOOL-RECOVERIES.md). It returns `Absent`, a refined
 `CapturedCodexPromptArea`, or a prompt-free `CodexPromptCaptureFailure`.
 
@@ -412,6 +415,20 @@ aggregate snapshot limit, capture removes all prompt areas in memory, emits one
 `snapshot size budget exceeded` skip event per affected pane, and validates the
 same prompt-free candidate. A candidate that remains oversized fails under the
 existing snapshot-size rule.
+
+Malformed or unsupported SGR fails optional prompt enrichment with a fixed
+prompt-free diagnostic while exact session recovery remains available.
+
+#### Maintaining renderer evidence
+
+1. A newly observed tmux SGR form changes only the private decoder and its RED
+   boundary fixture.
+2. A newly observed Codex suggestion changes the versioned table, a
+   style-backed collision fixture, and [TOOL-RECOVERIES.md](TOOL-RECOVERIES.md).
+3. A new Codex layout or version gets explicit fixtures and versioned policy;
+   it must not weaken the current faint proof or footer recognizer.
+
+No renderer registry or general terminal emulation is part of this seam.
 
 ## Snapshot Storage Contract
 

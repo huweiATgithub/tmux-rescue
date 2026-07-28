@@ -149,8 +149,9 @@ suffix:
 Transcript rows above that suffix are not prompt input. The accepted composer
 rules are:
 
-- the pane is not in copy mode, the cursor leaves at least one empty row before
-  the one-line footer, and every row in that inset is empty;
+- the pane is not in copy mode and, after the cursor row, has one-or-more blank
+  inset rows, one existing recognized footer, and zero-or-more blank terminal
+  rows;
 - the first prompt row begins with exactly `› ` or `» `; later nonempty rows
   begin with exactly two ASCII spaces;
 - the cursor is at the rendered end of the last nonempty prompt row, or at the
@@ -159,8 +160,20 @@ rules are:
   `Context N% used` segment, a default ASCII `0..100% context left` form with
   the supported shortcut/queue/plan hints, or the supported narrow collapsed
   hint; and
-- the exact empty-composer text `Ask Codex to do anything` at the textarea
-  start means no captured prompt.
+- an empty composer is proven only when the cursor is at cell two on its first
+  and only prompt row, every character of `› ` or `» ` is effectively
+  non-faint, and every suggestion character is faint. The suggestion must be
+  exactly one of the following versioned suggestions. Plain, partial, or
+  unknown text is an unsupported layout rather than proven empty.
+
+| Codex version | Faint empty-composer suggestion |
+| --- | --- |
+| `0.145.0` | `Ask Codex to do anything` |
+| `0.145.0` | `Implement {feature}` |
+| `0.145.0` | `Use /skills to list available skills` |
+| `0.145.0` | `Write tests for @filename` |
+| `0.145.0` | `Explain this codebase` |
+| `0.145.0` | `Find and fix a bug in @filename` |
 
 The renderer-owned glyph and first space are removed from the first row; exactly
 two ASCII margin spaces are removed from nonempty continuation rows. Blank rows,
