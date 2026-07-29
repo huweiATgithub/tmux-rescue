@@ -164,24 +164,14 @@ rules are:
   decimal in `0..=100`; weaker forms such as `C…` remain unsupported; and
 - an empty composer is proven only when the cursor is at cell two on its first
   and only prompt row, every character of `› ` or `» ` is effectively
-  non-faint, and every suggestion character is faint. The suggestion must be
-  exactly one of the following versioned suggestions. Plain, partial, or
-  unknown text is an unsupported layout rather than proven empty.
+  non-faint, and the nonempty suffix is entirely faint. The suffix text is
+  opaque to this classification; plain or partially faint text is an
+  unsupported layout rather than proven empty.
 
-| Codex version | Faint empty-composer suggestion |
-| --- | --- |
-| `0.145.0` | `Ask Codex to do anything` |
-| `0.145.0` | `Implement {feature}` |
-| `0.145.0` | `Use /skills to list available skills` |
-| `0.145.0` | `Write tests for @filename` |
-| `0.145.0` | `Explain this codebase` |
-| `0.145.0` | `Find and fix a bug in @filename` |
-| `0.145.0` | `Run /review on my current changes` |
-| `0.145.0` | `Summarize recent commits` |
-| `0.145.0` | `Improve documentation in @filename` |
-| `0.145.0` | `Check recently modified functions for compatibility` |
-| `0.145.0` | `How many files have been modified?` |
-| `0.145.0` | `Will this algorithm scale well?` |
+This best-effort rule avoids maintaining renderer suggestion strings. Its
+accepted cost is that a real one-line draft rendered entirely faint with the
+cursor at cell two can be omitted. Normal non-faint one-line drafts at their
+rendered end and multiline drafts remain prompt-capture candidates.
 
 The renderer-owned glyph and first space are removed from the first row; exactly
 two ASCII margin spaces are removed from nonempty continuation rows. Blank rows,

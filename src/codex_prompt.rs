@@ -5,21 +5,6 @@ use crate::{
     VisibleRow,
 };
 
-// Codex 0.145.0 rotates these faint empty-composer suggestions.
-const SUPPORTED_CODEX_0145_EMPTY_SUGGESTIONS: [&str; 12] = [
-    "Ask Codex to do anything",
-    "Implement {feature}",
-    "Use /skills to list available skills",
-    "Write tests for @filename",
-    "Explain this codebase",
-    "Find and fix a bug in @filename",
-    "Run /review on my current changes",
-    "Summarize recent commits",
-    "Improve documentation in @filename",
-    "Check recently modified functions for compatibility",
-    "How many files have been modified?",
-    "Will this algorithm scale well?",
-];
 const PROMPT_PREFIXES: [&str; 2] = ["› ", "» "];
 const TEXTAREA_MARGIN: &str = "  ";
 
@@ -75,15 +60,12 @@ pub(crate) fn capture_visible_codex_prompt(grid: &VisiblePaneGrid) -> CodexPromp
             .iter()
             .find(|prefix| cursor_row.starts_with(**prefix))
             .expect("the candidate start row has a supported prompt prefix");
-        let Some(suggestion) = rows[cursor_y].faint_suffix_after_non_faint_prefix(prompt_prefix)
+        let Some(_faint_single_row_placeholder) =
+            rows[cursor_y].faint_suffix_after_non_faint_prefix(prompt_prefix)
         else {
             return unsupported_layout();
         };
-        return if SUPPORTED_CODEX_0145_EMPTY_SUGGESTIONS.contains(&suggestion.as_str()) {
-            CodexPromptAreaObservation::Absent
-        } else {
-            unsupported_layout()
-        };
+        return CodexPromptAreaObservation::Absent;
     }
     if cursor_row.is_empty() {
         if usize::from(cursor.x()) != textarea_start_cell {
@@ -376,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_both_codex_prompt_glyphs() {
+    fn keeps_non_faint_single_line_drafts_for_both_prompt_glyphs() {
         for glyph in ['›', '»'] {
             let row = format!("{glyph} pending");
             let cursor_x = u16::try_from(UnicodeWidthStr::width(row.as_str())).unwrap();
@@ -423,26 +405,14 @@ mod tests {
     }
 
     #[test]
-    fn returns_absent_for_each_style_proven_codex_0145_suggestion() {
-        let suggestions = [
+    fn returns_absent_for_any_style_proven_single_row_placeholder() {
+        for (glyph, placeholder) in [
             ('›', "Ask Codex to do anything"),
-            ('»', "Implement {feature}"),
-            ('›', "Use /skills to list available skills"),
-            ('»', "Write tests for @filename"),
-            ('›', "Explain this codebase"),
-            ('»', "Find and fix a bug in @filename"),
-            ('›', "Run /review on my current changes"),
-            ('»', "Summarize recent commits"),
-            ('›', "Improve documentation in @filename"),
-            ('»', "Check recently modified functions for compatibility"),
-            ('›', "How many files have been modified?"),
-            ('»', "Will this algorithm scale well?"),
-        ];
-
-        for (glyph, suggestion) in suggestions {
+            ('»', "A future renderer-owned placeholder"),
+        ] {
             let grid = styled_empty_composer_grid(
                 glyph,
-                suggestion,
+                placeholder,
                 "  ? for shortcuts    100% context left",
                 0,
             );
@@ -452,7 +422,7 @@ mod tests {
                     capture_visible_codex_prompt(&grid),
                     CodexPromptAreaObservation::Absent
                 ),
-                "expected a style-proven empty composer for {suggestion:?}"
+                "expected a style-proven empty composer for {placeholder:?}"
             );
         }
     }
@@ -496,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_known_suggestions_without_complete_style_proof() {
+    fn skips_single_row_text_without_complete_style_proof() {
         let collisions = [
             "› Ask Codex to do anything".to_owned(),
             "\x1b[2m› Ask Codex to do anything\x1b[22m".to_owned(),
@@ -522,21 +492,6 @@ mod tests {
                 CodexPromptAreaObservation::Skipped(_)
             ));
         }
-    }
-
-    #[test]
-    fn skips_an_unknown_faint_suggestion() {
-        let grid = styled_empty_composer_grid(
-            '›',
-            "Ask something else",
-            "  ? for shortcuts    100% context left",
-            0,
-        );
-
-        assert!(matches!(
-            capture_visible_codex_prompt(&grid),
-            CodexPromptAreaObservation::Skipped(_)
-        ));
     }
 
     #[test]

@@ -423,8 +423,9 @@ prompt-free diagnostic while exact session recovery remains available.
 
 1. A newly observed tmux SGR form changes only the private decoder and its RED
    boundary fixture.
-2. A newly observed Codex suggestion changes the versioned table, a
-   style-backed collision fixture, and [TOOL-RECOVERIES.md](TOOL-RECOVERIES.md).
+2. New Codex placeholder wording requires no policy change. A change in the
+   semantic distinction between renderer placeholders and user input changes
+   the private faint-proof contract and its collision fixtures.
 3. A new Codex layout, footer form, or version gets explicit positive and
    negative fixtures plus versioned policy. It must not weaken the current
    faint proof or admit unstructured clipped footer prefixes.

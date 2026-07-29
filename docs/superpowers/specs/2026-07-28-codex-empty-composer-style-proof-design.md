@@ -12,27 +12,21 @@ otherwise remain authoritative.
 ## Goal
 
 Recognize a normal empty Codex composer without warning only when tmux provides
-independent styling evidence that the visible suggestion is renderer-owned
-placeholder text. Also accept the normal composer when its footer is an exact
-recognized form or one of two observed structured truncations and is followed
-by unused blank terminal rows.
+independent styling evidence that its nonempty visible suffix is
+renderer-owned placeholder text. Also accept the normal composer when its
+footer is an exact recognized form or one of two observed structured
+truncations and is followed by unused blank terminal rows.
 
-The change must not silently discard a real draft whose text happens to equal
-a Codex suggestion and whose cursor has been moved to the textarea start.
+The best-effort classifier deliberately leaves the suffix text opaque. Its
+accepted collision is a real one-line draft rendered entirely faint with its
+cursor at the textarea start; that draft can be treated as empty.
 
 ## Live Evidence
 
 A read-only snapshot against the installed `codex-cli 0.145.0` produced nine
-unsupported-layout warnings for normal empty composers. Five rotating
-suggestions were visible:
-
-- `Implement {feature}`;
-- `Use /skills to list available skills`;
-- `Write tests for @filename`;
-- `Explain this codebase`; and
-- `Find and fix a bug in @filename`.
-
-For each suggestion, `tmux capture-pane -p -e` showed:
+unsupported-layout warnings for normal empty composers with several rotating
+placeholder texts. For every observed placeholder, `tmux capture-pane -p -e`
+showed:
 
 - the `› ` or `» ` live prefix was not faint;
 - every suggestion character was under SGR faint (`2`); and
@@ -47,20 +41,10 @@ rows blank. The plain-text parser rejected the first group because it knew only
 one older placeholder string and rejected the last pane because it required the
 footer to be the final physical row.
 
-A later read-only verification against the same installed `codex-cli 0.145.0`
-exposed two more fully faint suggestions:
-
-- `Run /review on my current changes`; and
-- `Summarize recent commits`.
-
-When another rotation displayed `Will this algorithm scale well?`, a local
-inventory of the installed `0.145.0` binary's contiguous built-in suggestion
-list exposed the remaining four strings:
-
-- `Improve documentation in @filename`;
-- `Check recently modified functions for compatibility`;
-- `How many files have been modified?`; and
-- `Will this algorithm scale well?`.
+A later read-only verification and an inventory of the same installed binary
+exposed more rotating placeholder wording with the same complete faint-style
+invariant. That growing text inventory established that wording is renderer
+content rather than a useful policy boundary.
 
 It also showed configured footers clipped at the terminal edge after a
 structured context prefix: `Context N% u…` and `Context N…`, where the visible
@@ -78,7 +62,8 @@ existing manual fallback.
 Read the visible pane once with `tmux capture-pane -p -e`. Refine that styled
 terminal output at the visible-pane boundary into the existing plain rows plus
 typed faint-text evidence. The Codex parser may return `Absent` only after it
-receives such evidence for the exact suggestion suffix.
+receives such evidence for the entire nonempty suffix after the prompt prefix;
+it does not inspect the proved text.
 
 This is preferred over two alternatives:
 
@@ -93,11 +78,11 @@ One styled full-grid read is also preferred over separate plain and styled
 reads. It binds displayed text and style to the same tmux observation, preserves
 the existing metadata-before/after fence, and avoids a second content race.
 
-For the later live variants, extending the versioned suggestion table and
-admitting two exact terminal truncation forms is preferred over accepting any
-`Context` prefix or any clipped configured footer. The latter would remove more
-warnings but weaken the local footer proof. Ambiguous `C…` and no-context forms
-therefore remain fail-closed.
+The later live variants establish that placeholder wording requires no
+versioned table. The two exact terminal truncation forms remain explicit:
+accepting any `Context` prefix or any clipped configured footer would weaken
+the local footer proof. Ambiguous `C…` and no-context forms therefore remain
+fail-closed.
 
 ## User-Visible Contract
 
@@ -108,27 +93,23 @@ all of these facts hold:
 - the cursor is at the two-cell textarea start on the first and only prompt
   row;
 - every character in the `› ` or `» ` prefix is effectively non-faint;
-- the entire visible suffix after that prefix is faint; and
-- the suffix exactly matches a supported Codex `0.145.0` suggestion.
-
-The supported suggestions are the eleven installed/live strings above plus the
-previously documented `Ask Codex to do anything`. Every string, including the
-older compatibility entry, remains supported only with the same faint-style
-proof; plain text alone does not establish an empty composer.
+- the visible suffix after that prefix is nonempty and entirely faint; and
+- the suffix content is not used for classification.
 
 These cases remain `Skipped` and emit the existing prompt-free warning:
 
-- a known suggestion without complete faint styling;
-- an unknown faint string;
-- a partially faint suggestion or one whose faint state is reset inside the
+- nonempty text at the textarea start without complete faint styling;
+- a partially faint suffix or one whose faint state is reset inside the
   text;
-- nonempty visible text with the cursor at the textarea start;
 - malformed or unsupported terminal attribute output; and
 - any other unsupported composer, popup, or pane layout.
 
 Real prompt capture remains style-agnostic after styled output is refined to
 plain rows. A normal draft still requires the cursor at the visible end of its
-last row and preserves the same visible text as before.
+last row and preserves the same visible text as before. The accepted
+best-effort cost is that a real one-line draft matching the complete faint
+proof at the textarea start can be omitted; normal non-faint one-line drafts
+and multiline drafts remain capture candidates.
 
 ## Refined Visible Grid
 
@@ -164,10 +145,9 @@ fn faint_suffix_after_non_faint_prefix(
 It returns `Some` only when the row starts with `prefix`, every character in
 that prefix is effectively non-faint, the suffix is nonempty, and every
 character in the suffix is effectively faint. `FaintVisibleText` is privately
-constructed, borrows that exact suffix, and exposes only `as_str()`. The Codex
-parser compares that proved text to the supported suggestion set. It cannot
-obtain a detached style boolean or construct a proof for a different
-substring.
+constructed and borrows that exact suffix. The Codex parser uses only the
+presence of that proof, not the suffix contents. It cannot obtain a detached
+style boolean or construct a proof for a different substring.
 
 ### Extension Discipline
 
@@ -175,17 +155,17 @@ The maintainability seam is intentionally small:
 
 - `visible_pane` owns styled-byte decoding, the private faintness
   representation, and the atomic proof operation;
-- `codex_prompt` owns versioned Codex suggestion strings, footer recognition,
-  and composer grammar; and
+- `codex_prompt` owns footer recognition, composer grammar, and the decision
+  that complete faint-suffix proof represents an empty composer; and
 - the tmux adapter owns only command execution and the metadata fence.
 
 Future tmux SGR support extends the private decoder and its boundary tests.
-Future Codex renderer support extends an explicitly versioned policy table and
-layout fixtures. Neither change exposes a generic style map, introduces a
-renderer trait or registry, or teaches the tmux adapter Codex policy. The
-implementation documentation must record these extension points so a later
-change does not weaken the faint-style proof merely to accept a new string or
-layout.
+Future placeholder wording requires no change; future Codex layout support
+extends explicit layout fixtures and policy. Neither change exposes a generic
+style map, introduces a renderer trait or registry, or teaches the tmux adapter
+Codex policy. The implementation documentation must record these extension
+points so a later change does not weaken the faint-style proof merely to accept
+a new layout.
 
 ## Styled Capture Grammar
 
@@ -305,11 +285,10 @@ Unit tests must prove:
 
 Parser tests must prove:
 
-- each of the eleven installed/live suggestions is `Absent` only when fully
-  faint;
-- the prior `Ask Codex to do anything` string follows the same rule;
-- the same plain strings without faint proof are `Skipped`;
-- partial faint styling and an unknown fully faint string are `Skipped`;
+- arbitrary placeholder wording is `Absent` only with complete faint proof;
+- the same plain text without faint proof is `Skipped`;
+- partial faint styling is `Skipped`;
+- a normal non-faint one-line draft at its rendered end remains captured;
 - the five-row, 49-byte real draft remains exact;
 - configured footers ending in `Context 0% u…`, `Context 100% u…`,
   `Context 0…`, or `Context 100…` are accepted, while near misses and a
@@ -338,8 +317,9 @@ Implementation updates:
 
 - `docs/src/ARCHITECTURE.md` for the styled-grid refinement boundary, named
   faint proof, capture command, and failure behavior; and
-- `docs/src/TOOL-RECOVERIES.md` for the twelve faint-proven suggestions, the two
-  structured footer truncations, and the footer-plus-terminal-blanks grammar.
+- `docs/src/TOOL-RECOVERIES.md` for text-independent faint proof, its accepted
+  one-line collision, the two structured footer truncations, and the
+  footer-plus-terminal-blanks grammar.
 
 `docs/src/DESIGN.md`, the snapshot schema, inspect and plan output, restore
 mechanics, and external-editor recovery do not change.

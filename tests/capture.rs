@@ -175,7 +175,7 @@ fn absent_grid(pane_id: &str) -> VisiblePaneGrid {
     visible_grid(
         pane_id,
         &[
-            "› \x1b[2mAsk Codex to do anything\x1b[22m",
+            "› \x1b[2mA future renderer-owned placeholder\x1b[22m",
             "",
             "  95% context left",
         ],
@@ -530,10 +530,10 @@ fn absent_prompt_input_emits_no_event() {
 }
 
 #[test]
-fn unstyled_suggestion_retains_automatic_recovery_and_emits_one_safe_warning() {
+fn unstyled_single_row_text_retains_automatic_recovery_and_emits_one_safe_warning() {
     let observed = topology_with_pane_id("work", 0, "%15");
-    let suggestion = "Ask Codex to do anything";
-    let row = format!("› {suggestion}");
+    let candidate_text = "A future renderer-owned placeholder";
+    let row = format!("› {candidate_text}");
     let unstyled_grid = visible_grid("%15", &[&row, "", "  95% context left"], 2, 0);
     let mut source = ScriptedSource::new(vec![Ok(observed.clone()), Ok(observed)])
         .with_observation(codex_foreground())
@@ -560,8 +560,8 @@ fn unstyled_suggestion_retains_automatic_recovery_and_emits_one_safe_warning() {
         panic!("expected a prompt-capture skip event");
     };
     let debug = format!("{event:?}");
-    assert!(!failure.message().contains(suggestion));
-    assert!(!debug.contains(suggestion), "prompt leaked: {debug}");
+    assert!(!failure.message().contains(candidate_text));
+    assert!(!debug.contains(candidate_text), "prompt leaked: {debug}");
 }
 
 #[test]
