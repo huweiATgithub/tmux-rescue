@@ -401,11 +401,23 @@ read (pane id, width, height, cursor, mode)
 The visible-grid command deliberately has no `-J`, history `-S`/`-E`, or input
 operation. Row and blank-line boundaries remain intact. `visible_pane` consumes
 all admitted SGR, retains only private per-character faintness, and exposes
-plain rows plus one atomic proof; raw ANSI and generic style queries cannot
-cross the seam. The Codex layout parser is private to capture and accepts only
-the renderer evidence in
-[TOOL-RECOVERIES.md](TOOL-RECOVERIES.md). It returns `Absent`, a refined
-`CapturedCodexPromptArea`, or a prompt-free `CodexPromptCaptureFailure`.
+refined plain rows plus one atomic proof; raw ANSI and generic style queries
+cannot cross the seam. The private Codex layout parser accepts only the
+renderer evidence in [TOOL-RECOVERIES.md](TOOL-RECOVERIES.md) through this
+refinement:
+
+```text
+VisiblePaneGrid
+  -> PositionedFooterCandidate
+  -> ConfiguredFooterEvidence
+  -> SupportedCodexFooter
+  -> Absent | CapturedCodexPromptArea | CodexPromptCaptureFailure
+```
+
+Private constructors enforce the placement envelope and high-or-two-distinct-low
+composition; callers cannot receive trust counts or recombine predicates.
+Configured evidence reads only refined plain rows, while the existing opaque
+faint-suffix proof remains local to empty-composer classification.
 
 Read, metadata, layout, unsafe-text, and prompt-size failures emit one typed,
 coordinate-scoped skip event while preserving prompt-free automatic Codex
@@ -421,16 +433,17 @@ prompt-free diagnostic while exact session recovery remains available.
 
 #### Maintaining renderer evidence
 
-1. A newly observed tmux SGR form changes only the private decoder and its RED
-   boundary fixture.
-2. New Codex placeholder wording requires no policy change. A change in the
-   semantic distinction between renderer placeholders and user input changes
-   the private faint-proof contract and its collision fixtures.
-3. A new Codex layout, footer form, or version gets explicit positive and
-   negative fixtures plus versioned policy. It must not weaken the current
-   faint proof or admit unstructured clipped footer prefixes.
-
-No renderer registry or general terminal emulation is part of this seam.
+1. Keep one read-only captured compatibility fixture for each observed Codex
+   update.
+2. Do not branch or rename the policy when the existing grammar accepts that
+   fixture.
+3. A new signal requires a family assignment, position rule, deduplication
+   proof, and positive, collision, malformed, reordered, and truncated
+   fixtures.
+4. Add a distinct private policy only for an incompatible layout with
+   separately recognizable invariants.
+5. Add no runtime version dispatch, config reader, registry, numeric score, or
+   generic renderer abstraction.
 
 ## Snapshot Storage Contract
 
@@ -1074,8 +1087,10 @@ Core tests use fake external capabilities to verify:
   absent-field serialization, and diagnostic privacy;
 - exact visible-grid metadata/row refinement, terminal-cell widths, stable
   metadata fencing, pane-ID replacement detection, and no-join source capture;
-- supported Codex renderer parsing, absent/unsupported handling, and optional
-  aggregate-size fallback without loss of session recovery;
+- supported Codex renderer parsing, configured-footer evidence composition,
+  style independence, terminal truncation, cross-version compatibility
+  fixtures, absent/unsupported handling, and optional aggregate-size fallback
+  without loss of session recovery;
 - missing-directory and missing-executable planned actions and degradation
   provenance;
 - deterministic `TargetShell` selection across planning and execution;

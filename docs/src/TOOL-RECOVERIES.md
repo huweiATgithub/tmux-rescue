@@ -131,10 +131,10 @@ generic app-server process, scan for the newest session, or use `--last`.
 ### Visible Prompt Evidence
 
 After exact session resolution, an explicit snapshot may optionally read the
-current visible tmux grid. The parser is intentionally tied to the observed
-Codex `0.145.0` renderer and fails closed on other layouts. Its primary frozen
-fixture is a `132x40` pane with cursor `(9,37)` and this exact seven-row bottom
-suffix:
+current visible tmux grid. Codex 0.145.0 is the verified renderer baseline, not
+a runtime version gate. A compatible later renderer continues through the same
+visible grammar. Its primary frozen baseline evidence is a `132x40` pane with
+cursor `(9,37)` and this exact seven-row, 49-byte bottom suffix:
 
 ```text
 » The test prompt for recovering.
@@ -154,19 +154,36 @@ rules are:
   rows;
 - the first prompt row begins with exactly `› ` or `» `; later nonempty rows
   begin with exactly two ASCII spaces;
-- the cursor is at the rendered end of the last nonempty prompt row, or at the
-  two-cell textarea start on an empty trailing continuation;
-- the footer is either the configured one-line form above with an exact
-  `Context N% used` segment, that configured form clipped at its final segment
-  as exact `Context N% u…` or `Context N…`, a default ASCII
-  `0..100% context left` form with the supported shortcut/queue/plan hints, or
-  the supported narrow collapsed hint. In the clipped forms, `N` is ASCII
-  decimal in `0..=100`; weaker forms such as `C…` remain unsupported; and
+- a draft, including a multiline draft, has its cursor on the final visible
+  prompt row at its rendered end, or on the accepted empty trailing
+  continuation at its two-cell textarea start;
+- the footer is either a configured status footer as classified below, a
+  default ASCII `0..100% context left` form with the supported
+  shortcut/queue/plan hints, or the supported narrow collapsed hint; and
 - an empty composer is proven only when the cursor is at cell two on its first
   and only prompt row, every character of `› ` or `» ` is effectively
   non-faint, and the nonempty suffix is entirely faint. The suffix text is
   opaque to this classification; plain or partially faint text is an
   unsupported layout rather than proven empty.
+
+A configured status footer requires the existing placement envelope plus
+either one complete high-trust signal or two distinct weak signal families.
+Complete Context N% used|left segments and a complete leading gpt- model
+selection are high trust. Later Model, Workspace, Accounting, Runtime, Git,
+and Identity forms are weak; repeated evidence from one family counts once.
+Exact instructional footers remain a separate production.
+
+The exact two-space indent and ` · ` separator are syntax, not votes. A
+recognized right-aligned Plan/IDE indicator is stripped only under exact text
+and geometry and contributes no trust. A terminal `…` and its entire incomplete
+segment contribute no evidence; <code>Context N% u</code><code>…</code> and
+`Context N…` no longer succeed alone. Footer classification is identical for
+theme-colored, all-faint,
+and unstyled text; faintness proves only an empty composer. A single weak
+family, malformed value, or insufficient surviving evidence omits only
+`prompt_area`; exact session recovery remains available. Layout drift uses the
+version-neutral `visible pane does not match a supported Codex prompt layout`
+prompt-free warning while exact session recovery remains available.
 
 This best-effort rule avoids maintaining renderer suggestion strings. Its
 accepted cost is that a real one-line draft rendered entirely faint with the
