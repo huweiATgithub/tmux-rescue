@@ -2,9 +2,9 @@
 
 ## Role
 
-This follow-up design corrects two live Codex `0.145.0` renderer assumptions
-in the visible-prompt recovery feature on PR #2. It supersedes only the empty
-composer and footer-position clauses in
+This follow-up design corrects live Codex `0.145.0` renderer assumptions in the
+visible-prompt recovery feature on PR #2. It supersedes only the empty composer
+and footer-recognition/position clauses in
 `2026-07-25-codex-visible-prompt-recovery-design.md`. The original capture,
 snapshot, inspection, planning, restore, privacy, and exact-session contracts
 otherwise remain authoritative.
@@ -13,8 +13,9 @@ otherwise remain authoritative.
 
 Recognize a normal empty Codex composer without warning only when tmux provides
 independent styling evidence that the visible suggestion is renderer-owned
-placeholder text. Also accept the normal composer when its recognized footer
-is followed by unused blank terminal rows.
+placeholder text. Also accept the normal composer when its footer is an exact
+recognized form or one of two observed structured truncations and is followed
+by unused blank terminal rows.
 
 The change must not silently discard a real draft whose text happens to equal
 a Codex suggestion and whose cursor has been moved to the textarea start.
@@ -46,6 +47,18 @@ rows blank. The plain-text parser rejected the first group because it knew only
 one older placeholder string and rejected the last pane because it required the
 footer to be the final physical row.
 
+A later read-only verification against the same installed `codex-cli 0.145.0`
+exposed two more fully faint suggestions:
+
+- `Run /review on my current changes`; and
+- `Summarize recent commits`.
+
+It also showed configured footers clipped at the terminal edge after a
+structured context prefix: `Context N% u…` and `Context N…`, where the visible
+ASCII decimal `N` is in `0..=100` and `…` is U+2026. Some still-narrower panes
+showed only `C…` or no context segment. Those weaker shapes do not carry enough
+local evidence and remain unsupported with a prompt-free warning.
+
 The separate case where Codex hosted an external editor without an opened
 session file remains outside this change. Without an exact Codex session
 identity, visible prompt capture is not attempted and recovery remains the
@@ -71,6 +84,12 @@ One styled full-grid read is also preferred over separate plain and styled
 reads. It binds displayed text and style to the same tmux observation, preserves
 the existing metadata-before/after fence, and avoids a second content race.
 
+For the later live variants, extending the versioned suggestion table and
+admitting two exact terminal truncation forms is preferred over accepting any
+`Context` prefix or any clipped configured footer. The latter would remove more
+warnings but weaken the local footer proof. Ambiguous `C…` and no-context forms
+therefore remain fail-closed.
+
 ## User-Visible Contract
 
 A supported empty composer produces no `prompt_area` and no warning only when
@@ -83,10 +102,10 @@ all of these facts hold:
 - the entire visible suffix after that prefix is faint; and
 - the suffix exactly matches a supported Codex `0.145.0` suggestion.
 
-The supported suggestions are the five live strings above plus the previously
-documented `Ask Codex to do anything`. The older string remains supported only
-with the same faint-style proof; plain text alone no longer establishes an
-empty composer.
+The supported suggestions are the seven live strings above plus the previously
+documented `Ask Codex to do anything`. Every string, including the older one,
+remains supported only with the same faint-style proof; plain text alone does
+not establish an empty composer.
 
 These cases remain `Skipped` and emit the existing prompt-free warning:
 
@@ -221,14 +240,20 @@ one recognized Codex footer
 zero-or-more blank terminal rows
 ```
 
-The existing footer recognizer remains unchanged. The parser locates the first
-nonempty row after the cursor, requires at least one blank row before it,
-requires that row to be a recognized footer, and requires every later row to be
-empty.
+The parser locates the first nonempty row after the cursor, requires at least
+one blank row before it, requires that row to be a recognized footer, and
+requires every later row to be empty. The configured-footer recognizer accepts
+its existing exact `Context N% used` segment and two additional terminal
+segment forms observed at the pane edge: exact `Context N% u…` and
+`Context N…`, with ASCII decimal `N` in `0..=100`. A truncated form must be the
+last ` · `-separated segment. It does not admit `C…`, missing digits,
+out-of-range digits, ASCII dots, other partial suffixes, or text after the
+ellipsis.
 
 It rejects a footer immediately below the cursor, a missing footer, a second
-footer, or any other nonempty row before or after the recognized footer. Moving
-the footer does not widen what counts as a footer.
+footer, or any other nonempty row before or after the recognized footer. This
+narrow recognition extension does not treat arbitrary clipped text as a
+footer.
 
 ## Capture Flow And Failures
 
@@ -271,11 +296,14 @@ Unit tests must prove:
 
 Parser tests must prove:
 
-- each of the five live suggestions is `Absent` only when fully faint;
+- each of the seven live suggestions is `Absent` only when fully faint;
 - the prior `Ask Codex to do anything` string follows the same rule;
 - the same plain strings without faint proof are `Skipped`;
 - partial faint styling and an unknown fully faint string are `Skipped`;
 - the five-row, 49-byte real draft remains exact;
+- configured footers ending in `Context 0% u…`, `Context 100% u…`,
+  `Context 0…`, or `Context 100…` are accepted, while near misses and a
+  truncated segment followed by more text are rejected;
 - a real draft and an empty composer accept both footer-last and
   footer-plus-trailing-blanks layouts; and
 - no inset row, another nonempty row, or a second footer remains unsupported.
@@ -300,8 +328,8 @@ Implementation updates:
 
 - `docs/src/ARCHITECTURE.md` for the styled-grid refinement boundary, named
   faint proof, capture command, and failure behavior; and
-- `docs/src/TOOL-RECOVERIES.md` for the six faint-proven suggestions and the
-  footer-plus-terminal-blanks grammar.
+- `docs/src/TOOL-RECOVERIES.md` for the eight faint-proven suggestions, the two
+  structured footer truncations, and the footer-plus-terminal-blanks grammar.
 
 `docs/src/DESIGN.md`, the snapshot schema, inspect and plan output, restore
 mechanics, and external-editor recovery do not change.
