@@ -278,7 +278,16 @@ fn parse_configured_footer(
         return None;
     }
     let evidence_segments = match segments.last() {
-        Some(last) if last.ends_with('…') => &segments[..segments.len() - 1],
+        Some(last) if last.ends_with('…') => {
+            if last
+                .strip_suffix('…')
+                .expect("a terminal ellipsis has a removable final scalar")
+                .contains('…')
+            {
+                return None;
+            }
+            &segments[..segments.len() - 1]
+        }
         Some(last) if last.contains('…') => return None,
         Some(_) => segments.as_slice(),
         None => return None,
@@ -794,6 +803,8 @@ mod tests {
             "  Context 78% used…",
             "  Context 78% used · path… · Fast on",
             "  Context 78% used · path…tail",
+            "  Context 78% used · path……",
+            "  Context 78% used · path…tail…",
         ];
 
         for footer in accepted {
