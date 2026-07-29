@@ -389,22 +389,16 @@ fn parse_model_selection(segment: &str) -> Option<ModelSelection> {
     }
     match (parts.next(), parts.next(), parts.next()) {
         (None, None, None) => Some(ModelSelection),
-        (Some(level), None, None)
-            if matches!(
-                level,
-                "default" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-            ) =>
-        {
-            Some(ModelSelection)
-        }
-        (Some(level), Some("fast"), None)
-            if matches!(
-                level,
-                "default" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-            ) =>
-        {
-            Some(ModelSelection)
-        }
+        (
+            Some("default" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"),
+            None,
+            None,
+        ) => Some(ModelSelection),
+        (
+            Some("default" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"),
+            Some("fast"),
+            None,
+        ) => Some(ModelSelection),
         _ => None,
     }
 }
