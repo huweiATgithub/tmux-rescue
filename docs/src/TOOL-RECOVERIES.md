@@ -134,7 +134,8 @@ After exact session resolution, an explicit snapshot may optionally read the
 current visible tmux grid. Codex 0.145.0 is the verified renderer baseline, not
 a runtime version gate. A compatible later renderer continues through the same
 visible grammar. Its primary frozen baseline evidence is a `132x40` pane with
-cursor `(9,37)` and this exact seven-row, 49-byte bottom suffix:
+cursor `(9,37)` and this exact seven-row bottom suffix, whose five prompt rows
+yield the exact 49-byte captured prompt:
 
 ```text
 » The test prompt for recovering.
@@ -176,9 +177,8 @@ Exact instructional footers remain a separate production.
 The exact two-space indent and ` · ` separator are syntax, not votes. A
 recognized right-aligned Plan/IDE indicator is stripped only under exact text
 and geometry and contributes no trust. A terminal `…` and its entire incomplete
-segment contribute no evidence; <code>Context N% u</code><code>…</code> and
-`Context N…` no longer succeed alone. Footer classification is identical for
-theme-colored, all-faint,
+segment contribute no evidence; `Context N% u…` and `Context N…` no longer
+succeed alone. Footer classification is identical for theme-colored, all-faint,
 and unstyled text; faintness proves only an empty composer. A single weak
 family, malformed value, or insufficient surviving evidence omits only
 `prompt_area`; exact session recovery remains available. Layout drift uses the
