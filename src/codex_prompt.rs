@@ -8,14 +8,63 @@ use crate::{
 const PROMPT_PREFIXES: [&str; 2] = ["› ", "» "];
 const TEXTAREA_MARGIN: &str = "  ";
 
-struct SupportedFooterLayout;
-
-enum ConfiguredContextSegment {
-    Complete,
-    TerminalTruncation,
+struct PositionedFooterCandidate<'a> {
+    content: &'a str,
+    row_width: usize,
+    pane_width: usize,
 }
 
-struct SupportedContextPercentage;
+enum SupportedCodexFooter {
+    Instructional(ExactInstructionalFooter),
+    Configured(ConfiguredFooterBasis),
+}
+
+struct ExactInstructionalFooter;
+struct ExactInstructionalHint;
+
+enum ConfiguredFooterBasis {
+    High(HighTrustSignal),
+    Corroborated(CorroboratedWeakSignals),
+}
+
+enum ConfiguredFooterEvidence {
+    High(HighTrustSignal),
+    Weak(WeakEvidence),
+}
+
+enum HighTrustSignal {
+    Context,
+    LeadingModel,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WeakSignalFamily {
+    Model,
+    Workspace,
+    Accounting,
+    Runtime,
+    Git,
+    Identity,
+}
+
+struct CorroboratedWeakSignals {
+    _first: WeakSignalFamily,
+    _second: WeakSignalFamily,
+}
+
+enum WeakEvidence {
+    None,
+    One(WeakSignalFamily),
+    Corroborated(CorroboratedWeakSignals),
+}
+
+struct ConfiguredStatusLeftZone<'a>(&'a str);
+
+struct ModelSelection;
+struct ContextPercentage;
+struct CompactCount;
+struct StrictDottedVersion;
+struct CanonicalUuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CodexPromptAreaObservation {
@@ -34,9 +83,16 @@ pub(crate) fn capture_visible_codex_prompt(grid: &VisiblePaneGrid) -> CodexPromp
     }
 
     let rows = grid.rows();
-    let Some(_supported_footer_layout) = parse_supported_footer_layout(rows, cursor_y) else {
+    let Some(supported_footer) =
+        parse_supported_codex_footer(rows, cursor_y, usize::from(metadata.width().get()))
+    else {
         return unsupported_layout();
     };
+    match supported_footer {
+        SupportedCodexFooter::Instructional(_proof) => {}
+        SupportedCodexFooter::Configured(ConfiguredFooterBasis::High(_proof)) => {}
+        SupportedCodexFooter::Configured(ConfiguredFooterBasis::Corroborated(_proof)) => {}
+    }
 
     let mut start_y = None;
     for row_y in (0..=cursor_y).rev() {
@@ -113,10 +169,22 @@ fn unsupported_layout() -> CodexPromptAreaObservation {
     CodexPromptAreaObservation::Skipped(CodexPromptCaptureFailure::unsupported_layout())
 }
 
-fn parse_supported_footer_layout(
+fn parse_supported_codex_footer(
     rows: &[VisibleRow],
     cursor_y: usize,
-) -> Option<SupportedFooterLayout> {
+    pane_width: usize,
+) -> Option<SupportedCodexFooter> {
+    let candidate = parse_positioned_footer_candidate(rows, cursor_y, pane_width)?;
+    parse_exact_instructional_footer(candidate.content)
+        .map(SupportedCodexFooter::Instructional)
+        .or_else(|| parse_configured_footer(candidate).map(SupportedCodexFooter::Configured))
+}
+
+fn parse_positioned_footer_candidate(
+    rows: &[VisibleRow],
+    cursor_y: usize,
+    pane_width: usize,
+) -> Option<PositionedFooterCandidate<'_>> {
     let after_cursor = rows.get(cursor_y + 1..)?;
     let footer_offset = after_cursor
         .iter()
@@ -125,14 +193,19 @@ fn parse_supported_footer_layout(
         return None;
     }
     let footer_y = cursor_y + 1 + footer_offset;
-    if !is_supported_codex_0145_footer(rows[footer_y].as_str())
-        || rows[footer_y + 1..]
-            .iter()
-            .any(|row| !row.as_str().is_empty())
+    if rows[footer_y + 1..]
+        .iter()
+        .any(|row| !row.as_str().is_empty())
     {
         return None;
     }
-    Some(SupportedFooterLayout)
+    let row = rows[footer_y].as_str();
+    let content = strip_textarea_margin(row)?;
+    (!content.is_empty() && !content.starts_with(' ')).then_some(PositionedFooterCandidate {
+        content,
+        row_width: UnicodeWidthStr::width(row),
+        pane_width,
+    })
 }
 
 fn strip_prompt_prefix(row: &str) -> Option<&str> {
@@ -149,84 +222,31 @@ fn strip_textarea_margin(row: &str) -> Option<&str> {
         .flatten()
 }
 
-fn is_supported_codex_0145_footer(row: &str) -> bool {
-    let Some(after_indent) = strip_textarea_margin(row) else {
-        return false;
-    };
-    let footer = after_indent.trim();
-    if footer.is_empty() {
-        return false;
-    }
-
-    let configured_segments = footer.split(" · ").collect::<Vec<_>>();
-    if configured_segments
-        .iter()
-        .all(|segment| !segment.is_empty())
-    {
-        let complete_context = configured_segments.iter().any(|segment| {
-            matches!(
-                parse_configured_context_segment(segment),
-                Some(ConfiguredContextSegment::Complete)
-            )
-        });
-        let terminal_truncation = configured_segments.last().is_some_and(|segment| {
-            matches!(
-                parse_configured_context_segment(segment),
-                Some(ConfiguredContextSegment::TerminalTruncation)
-            )
-        });
-        if complete_context || terminal_truncation {
-            return true;
-        }
-    }
-
-    if is_known_footer_hint(footer) {
-        return true;
-    }
-
-    let Some(without_suffix) = footer.strip_suffix("% context left") else {
-        return false;
-    };
-    let percentage_start = without_suffix
-        .as_bytes()
-        .iter()
-        .rposition(|byte| !byte.is_ascii_digit())
-        .map_or(0, |index| index + 1);
-    let percentage = &without_suffix[percentage_start..];
-    if percentage.is_empty()
-        || !percentage.bytes().all(|byte| byte.is_ascii_digit())
-        || percentage.parse::<u16>().map_or(true, |value| value > 100)
-    {
-        return false;
-    }
-    if percentage_start > 0
-        && !without_suffix.as_bytes()[percentage_start - 1].is_ascii_whitespace()
-    {
-        return false;
-    }
-    is_known_footer_hint(without_suffix[..percentage_start].trim_end())
+fn parse_exact_instructional_footer(content: &str) -> Option<ExactInstructionalFooter> {
+    parse_exact_instructional_hint(content)
+        .map(|_| ExactInstructionalFooter)
+        .or_else(|| {
+            let without_suffix = content.strip_suffix("% context left")?;
+            let percentage_start = without_suffix
+                .as_bytes()
+                .iter()
+                .rposition(|byte| !byte.is_ascii_digit())
+                .map_or(0, |index| index + 1);
+            let percentage = &without_suffix[percentage_start..];
+            if percentage.is_empty()
+                || percentage.parse::<u16>().map_or(true, |value| value > 100)
+                || (percentage_start > 0
+                    && !without_suffix.as_bytes()[percentage_start - 1].is_ascii_whitespace())
+            {
+                return None;
+            }
+            let base = without_suffix[..percentage_start]
+                .trim_end_matches(|character: char| character.is_ascii_whitespace());
+            parse_exact_instructional_hint(base).map(|_| ExactInstructionalFooter)
+        })
 }
 
-fn parse_configured_context_segment(segment: &str) -> Option<ConfiguredContextSegment> {
-    let value = segment.strip_prefix("Context ")?;
-    if parse_context_percentage(value, "% used").is_some() {
-        return Some(ConfiguredContextSegment::Complete);
-    }
-    ["% u…", "…"]
-        .into_iter()
-        .any(|suffix| parse_context_percentage(value, suffix).is_some())
-        .then_some(ConfiguredContextSegment::TerminalTruncation)
-}
-
-fn parse_context_percentage(value: &str, suffix: &str) -> Option<SupportedContextPercentage> {
-    let percentage = value.strip_suffix(suffix)?;
-    (!percentage.is_empty()
-        && percentage.bytes().all(|byte| byte.is_ascii_digit())
-        && percentage.parse::<u16>().is_ok_and(|value| value <= 100))
-    .then_some(SupportedContextPercentage)
-}
-
-fn is_known_footer_hint(hint: &str) -> bool {
+fn parse_exact_instructional_hint(hint: &str) -> Option<ExactInstructionalHint> {
     const BASES: [&str; 4] = [
         "",
         "? for shortcuts",
@@ -235,13 +255,242 @@ fn is_known_footer_hint(hint: &str) -> bool {
     ];
     const PLANS: [&str; 2] = ["Plan mode", "Plan mode (shift+tab to cycle)"];
 
-    BASES.contains(&hint)
+    (BASES.contains(&hint)
         || PLANS.contains(&hint)
         || BASES.iter().filter(|base| !base.is_empty()).any(|base| {
             hint.strip_prefix(base)
                 .and_then(|suffix| suffix.strip_prefix(" · "))
                 .is_some_and(|plan| PLANS.contains(&plan))
+        }))
+    .then_some(ExactInstructionalHint)
+}
+
+fn parse_configured_footer(
+    candidate: PositionedFooterCandidate<'_>,
+) -> Option<ConfiguredFooterBasis> {
+    let left_zone = configured_status_left_zone(&candidate);
+    let segments = left_zone.0.split(" · ").collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty())
+        || segments[..segments.len().saturating_sub(1)]
+            .iter()
+            .any(|segment| segment.contains('…'))
+    {
+        return None;
+    }
+    let evidence_segments = match segments.last() {
+        Some(last) if last.ends_with('…') => &segments[..segments.len() - 1],
+        Some(last) if last.contains('…') => return None,
+        Some(_) => segments.as_slice(),
+        None => return None,
+    };
+
+    let mut weak = WeakEvidence::None;
+    for (position, segment) in evidence_segments.iter().enumerate() {
+        if parse_context_segment(segment).is_some() {
+            return ConfiguredFooterEvidence::High(HighTrustSignal::Context).finish();
+        }
+        if position == 0 && parse_model_selection(segment).is_some() {
+            return ConfiguredFooterEvidence::High(HighTrustSignal::LeadingModel).finish();
+        }
+        if let Some(family) = parse_weak_signal_family(segment, position) {
+            weak = weak.insert(family);
+        }
+    }
+    ConfiguredFooterEvidence::Weak(weak).finish()
+}
+
+fn configured_status_left_zone<'a>(
+    candidate: &PositionedFooterCandidate<'a>,
+) -> ConfiguredStatusLeftZone<'a> {
+    const INDICATORS: [&str; 5] = [
+        "Plan mode (shift+tab to cycle) · IDE context",
+        "Plan mode (shift+tab to cycle)",
+        "Plan mode · IDE context",
+        "IDE context",
+        "Plan mode",
+    ];
+    let right_edge = candidate.pane_width.checked_sub(2);
+    if right_edge.is_some_and(|edge| candidate.row_width == edge) {
+        for indicator in INDICATORS {
+            if let Some(before_indicator) = candidate.content.strip_suffix(indicator) {
+                let left = before_indicator.trim_end_matches(' ');
+                if left.len() < before_indicator.len() && !left.is_empty() {
+                    return ConfiguredStatusLeftZone(left);
+                }
+            }
+        }
+    }
+    ConfiguredStatusLeftZone(candidate.content)
+}
+
+impl WeakEvidence {
+    fn insert(self, next: WeakSignalFamily) -> Self {
+        match self {
+            Self::None => Self::One(next),
+            Self::One(first) if first == next => Self::One(first),
+            Self::One(first) => Self::Corroborated(CorroboratedWeakSignals {
+                _first: first,
+                _second: next,
+            }),
+            Self::Corroborated(proof) => Self::Corroborated(proof),
+        }
+    }
+
+    fn finish(self) -> Option<CorroboratedWeakSignals> {
+        match self {
+            Self::Corroborated(proof) => Some(proof),
+            Self::None | Self::One(_) => None,
+        }
+    }
+}
+
+impl ConfiguredFooterEvidence {
+    fn finish(self) -> Option<ConfiguredFooterBasis> {
+        match self {
+            Self::High(signal) => Some(ConfiguredFooterBasis::High(signal)),
+            Self::Weak(weak) => weak.finish().map(ConfiguredFooterBasis::Corroborated),
+        }
+    }
+}
+
+fn parse_context_segment(segment: &str) -> Option<ContextPercentage> {
+    let value = segment.strip_prefix("Context ")?;
+    parse_context_percentage(value, "% used").or_else(|| parse_context_percentage(value, "% left"))
+}
+
+fn parse_context_percentage(value: &str, suffix: &str) -> Option<ContextPercentage> {
+    let percentage = value.strip_suffix(suffix)?;
+    (!percentage.is_empty()
+        && percentage.bytes().all(|byte| byte.is_ascii_digit())
+        && percentage.parse::<u16>().is_ok_and(|value| value <= 100))
+    .then_some(ContextPercentage)
+}
+
+fn parse_model_selection(segment: &str) -> Option<ModelSelection> {
+    let mut parts = segment.split(' ');
+    let token = parts.next()?;
+    let model = token.strip_prefix("gpt-")?;
+    if model.is_empty()
+        || !model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || !model.bytes().any(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    match (parts.next(), parts.next(), parts.next()) {
+        (None, None, None) => Some(ModelSelection),
+        (Some(level), None, None)
+            if matches!(
+                level,
+                "default" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+            ) =>
+        {
+            Some(ModelSelection)
+        }
+        (Some(level), Some("fast"), None)
+            if matches!(
+                level,
+                "default" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+            ) =>
+        {
+            Some(ModelSelection)
+        }
+        _ => None,
+    }
+}
+
+fn parse_compact_count(value: &str) -> Option<CompactCount> {
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(CompactCount);
+    }
+    let suffix = value.chars().last()?;
+    if !matches!(suffix, 'K' | 'M' | 'B' | 'T') {
+        return None;
+    }
+    let number = &value[..value.len() - suffix.len_utf8()];
+    if !number.contains('.') {
+        return (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+            .then_some(CompactCount);
+    }
+    let (integer, fractional) = number.split_once('.')?;
+    (!integer.is_empty()
+        && integer.bytes().all(|byte| byte.is_ascii_digit())
+        && (1..=2).contains(&fractional.len())
+        && fractional.bytes().all(|byte| byte.is_ascii_digit()))
+    .then_some(CompactCount)
+}
+
+fn parse_strict_dotted_version(value: &str) -> Option<StrictDottedVersion> {
+    let components = value.split('.').collect::<Vec<_>>();
+    (components.len() == 3
+        && components.iter().all(|component| {
+            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+        }))
+    .then_some(StrictDottedVersion)
+}
+
+fn parse_canonical_uuid(value: &str) -> Option<CanonicalUuid> {
+    let groups = value.split('-').collect::<Vec<_>>();
+    ([8, 4, 4, 4, 12]
+        .iter()
+        .zip(groups.iter())
+        .all(|(expected, group)| {
+            group.len() == *expected && group.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
+        && groups.len() == 5)
+        .then_some(CanonicalUuid)
+}
+
+fn parse_weak_signal_family(segment: &str, position: usize) -> Option<WeakSignalFamily> {
+    if position > 0 && parse_model_selection(segment).is_some() {
+        return Some(WeakSignalFamily::Model);
+    }
+    if segment == "~"
+        || segment == "/"
+        || (segment.starts_with("~/") && segment.len() > 2)
+        || (segment.starts_with('/') && segment.len() > 1)
+    {
+        return Some(WeakSignalFamily::Workspace);
+    }
+    if [" used", " window", " in", " out"].iter().any(|suffix| {
+        segment
+            .strip_suffix(suffix)
+            .and_then(parse_compact_count)
+            .is_some()
+    }) {
+        return Some(WeakSignalFamily::Accounting);
+    }
+    if matches!(
+        segment,
+        "Starting"
+            | "Ready"
+            | "Working"
+            | "Waiting"
+            | "Thinking"
+            | "Fast on"
+            | "Fast off"
+            | "raw output"
+    ) {
+        return Some(WeakSignalFamily::Runtime);
+    }
+    if segment == "No changes"
+        || segment.strip_prefix("PR #").is_some_and(|number| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        || segment.strip_prefix('+').is_some_and(|counts| {
+            counts.split_once(" -").is_some_and(|(added, removed)| {
+                !added.is_empty()
+                    && added.bytes().all(|byte| byte.is_ascii_digit())
+                    && !removed.is_empty()
+                    && removed.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+    {
+        return Some(WeakSignalFamily::Git);
+    }
+    (parse_strict_dotted_version(segment).is_some() || parse_canonical_uuid(segment).is_some())
+        .then_some(WeakSignalFamily::Identity)
 }
 
 #[cfg(test)]
@@ -428,30 +677,53 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_observed_terminal_context_truncations() {
+    fn accepts_high_or_two_distinct_low_footer_evidence() {
         for footer in [
-            "  gpt-5.6-sol ultra · ~/project · main · Context 0% u…",
-            "  gpt-5.6-sol ultra · ~/project · main · Context 48% u…",
-            "  gpt-5.6-sol ultra · ~/project · main · Context 100% u…",
-            "  gpt-5.6-sol ultra · ~/project · main · Context 0…",
-            "  gpt-5.6-sol ultra · ~/project · main · Context 5…",
-            "  gpt-5.6-sol ultra · ~/project · main · Context 100…",
+            "  Context 0% used",
+            "  Context 100% used",
+            "  Context 0% left",
+            "  Context 100% left",
+            "  gpt-5.6-sol ultra",
+            "  gpt-5.4 xhigh fast",
+            "  gpt-5.6-sol ultra · ~/projects/tmux-rescue",
+            "  ~/projects/tmux-rescue · gpt-5.6-sol ultra",
+            "  Fast on · 258K window",
+            "  Working · 2.55M used",
+            "  PR #2 · 0.146.0",
+            "  No changes · 1d6381bf-01c5-4c4a-b725-8e376e5ad295",
+            "  opaque · Fast on · 258K window",
         ] {
             let grid = compact_grid(&["› pending"], 9, footer);
 
             assert_eq!(captured_text(&grid), "pending", "footer: {footer:?}");
         }
+    }
 
+    #[test]
+    fn rejects_insufficient_correlated_or_malformed_footer_evidence() {
         for footer in [
-            "  gpt-5.6-sol ultra · ~/project · main · C…",
-            "  gpt-5.6-sol ultra · ~/project · main · Context …",
-            "  gpt-5.6-sol ultra · ~/project · main · Context 101% u…",
-            "  gpt-5.6-sol ultra · ~/project · main · Context 101…",
-            "  gpt-5.6-sol ultra · ~/project · main · Context 5% us…",
-            "  gpt-5.6-sol ultra · ~/project · main · Context 5...",
-            "  gpt-5.6-sol ultra · ~/project · main · Context ５…",
-            "  gpt-5.6-sol ultra · ~/project · main · Context 5% u… · Fast on",
-            "  gpt-5.6-sol ultra · ~/project · main · Context 5… · Fast on",
+            "  main · gpt-5.6-sol ultra",
+            "  ~/projects/tmux-rescue",
+            "  258K window",
+            "  Fast on",
+            "  PR #2",
+            "  0.146.0",
+            "  258K window · 2.55M used",
+            "  Fast on · raw output",
+            "  main · gpt-5.6-sol ultra · gpt-5.4 high",
+            "  Context 101% used",
+            "  Context ９% left",
+            "  prose mentioning gpt-5.6-sol ultra",
+            "  ~/project · gpt-alpha",
+            "  ~/project · gpt-5.6-sol super",
+            "  Fast on · 2.555M used",
+            "  PR #2 · v0.146.0",
+            "  PR #2 · 0.146",
+            "  PR #2 · 0.146.0-beta",
+            "  PR #2 · 0..146",
+            "  PR #2 · ０.146.0",
+            "  Context 78% used ·  · Fast on",
+            "  Context 78% used | Fast on",
         ] {
             let grid = compact_grid(&["› pending"], 9, footer);
 
@@ -462,6 +734,150 @@ mod tests {
                 ),
                 "expected an unsupported footer for {footer:?}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_structured_signal_boundaries() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-sol ultra", "gpt-5.4 xhigh fast"] {
+            assert!(parse_model_selection(model).is_some(), "model: {model:?}");
+        }
+        for model in [
+            "gpt-",
+            "gpt-alpha",
+            "gpt-5.6-sol super",
+            "gpt-5.6-sol  ultra",
+        ] {
+            assert!(parse_model_selection(model).is_none(), "model: {model:?}");
+        }
+
+        for count in ["0", "258K", "2.5M", "2.55T"] {
+            assert!(parse_compact_count(count).is_some(), "count: {count:?}");
+        }
+        for count in ["-1", ".5M", "2.M", "2.555M", "2.5m"] {
+            assert!(parse_compact_count(count).is_none(), "count: {count:?}");
+        }
+
+        for version in ["0.146.0", "12.0.300"] {
+            assert!(
+                parse_strict_dotted_version(version).is_some(),
+                "version: {version:?}"
+            );
+        }
+        for version in ["0.146", "0.146.0-beta", "0..146", "０.146.0"] {
+            assert!(
+                parse_strict_dotted_version(version).is_none(),
+                "version: {version:?}"
+            );
+        }
+
+        for uuid in [
+            "1d6381bf-01c5-4c4a-b725-8e376e5ad295",
+            "1D6381BF-01C5-4C4A-B725-8E376E5AD295",
+        ] {
+            assert!(parse_canonical_uuid(uuid).is_some(), "uuid: {uuid:?}");
+        }
+    }
+
+    #[test]
+    fn uses_only_complete_evidence_before_terminal_truncation() {
+        let accepted = [
+            "  Context 78% used · ~/very/long/path…",
+            "  gpt-5.6-sol ultra · ~/very/long/path…",
+            "  Fast on · 258K window · unknown…",
+        ];
+        let rejected = [
+            "  Context 48% u…",
+            "  Context 48…",
+            "  C…",
+            "  gpt-5.6…",
+            "  Context 78% used…",
+            "  Context 78% used · path… · Fast on",
+            "  Context 78% used · path…tail",
+        ];
+
+        for footer in accepted {
+            assert_eq!(
+                captured_text(&compact_grid(&["› pending"], 9, footer)),
+                "pending",
+                "footer: {footer:?}"
+            );
+        }
+        for footer in rejected {
+            assert!(
+                matches!(
+                    capture_visible_codex_prompt(&compact_grid(&["› pending"], 9, footer)),
+                    CodexPromptAreaObservation::Skipped(_)
+                ),
+                "footer: {footer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_footer_recognition_is_style_independent() {
+        for footer in [
+            "  Fast on · 258K window",
+            "\x1b[2m  Fast on · 258K window\x1b[22m",
+            "  \x1b[38;5;1mFast on\x1b[39m \x1b[2m·\x1b[22m \x1b[38;5;2m258K window\x1b[39m",
+        ] {
+            assert_eq!(
+                captured_text(&compact_grid(&["› pending"], 9, footer)),
+                "pending",
+                "footer: {footer:?}"
+            );
+        }
+    }
+
+    fn footer_with_right_indicator(width: usize, left: &str, indicator: &str) -> String {
+        let occupied =
+            UnicodeWidthStr::width(format!("{TEXTAREA_MARGIN}{left}{indicator}").as_str());
+        let gap = width
+            .checked_sub(2 + occupied)
+            .filter(|gap| *gap >= 1)
+            .unwrap();
+        format!("{TEXTAREA_MARGIN}{left}{}{}", " ".repeat(gap), indicator)
+    }
+
+    #[test]
+    fn accepts_only_exact_right_aligned_indicator_geometry() {
+        for indicator in [
+            "Plan mode",
+            "Plan mode (shift+tab to cycle)",
+            "IDE context",
+            "Plan mode · IDE context",
+            "Plan mode (shift+tab to cycle) · IDE context",
+        ] {
+            let footer = footer_with_right_indicator(80, "Context 78% used", indicator);
+            assert_eq!(
+                captured_text(&grid(
+                    80,
+                    9,
+                    0,
+                    false,
+                    vec!["› pending".to_owned(), String::new(), footer],
+                )),
+                "pending",
+                "indicator: {indicator:?}"
+            );
+        }
+
+        for footer in [
+            footer_with_right_indicator(80, "Context 78% used", "Review mode"),
+            footer_with_right_indicator(79, "Context 78% used", "Plan mode"),
+            footer_with_right_indicator(81, "Context 78% used", "Plan mode"),
+            "   Context 78% used".to_owned(),
+        ] {
+            assert!(matches!(
+                capture_visible_codex_prompt(&grid(
+                    80,
+                    9,
+                    0,
+                    false,
+                    vec!["› pending".to_owned(), String::new(), footer],
+                )),
+                CodexPromptAreaObservation::Skipped(_)
+            ));
         }
     }
 
@@ -557,6 +973,34 @@ mod tests {
             let grid = grid(80, 2, 0, false, rows);
             assert!(matches!(
                 capture_visible_codex_prompt(&grid),
+                CodexPromptAreaObservation::Skipped(_)
+            ));
+        }
+
+        for (rows, cursor_y, cursor_x) in [
+            (
+                vec![
+                    "› first".to_owned(),
+                    "  second".to_owned(),
+                    String::new(),
+                    "  Context 78% used".to_owned(),
+                ],
+                0,
+                7,
+            ),
+            (
+                vec![
+                    "› pending".to_owned(),
+                    String::new(),
+                    "  Context 78% used".to_owned(),
+                    "  gpt-5.6-sol ultra · ~/project".to_owned(),
+                ],
+                0,
+                9,
+            ),
+        ] {
+            assert!(matches!(
+                capture_visible_codex_prompt(&grid(80, cursor_x, cursor_y, false, rows)),
                 CodexPromptAreaObservation::Skipped(_)
             ));
         }
