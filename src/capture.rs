@@ -357,7 +357,7 @@ impl CodexPromptCaptureFailure {
                 "visible tmux pane output is invalid"
             }
             CodexPromptCaptureFailureKind::UnsupportedLayout => {
-                "visible pane does not match the supported Codex 0.145.0 prompt layout"
+                "visible pane does not match a supported Codex prompt layout"
             }
             CodexPromptCaptureFailureKind::UnsafeText => {
                 "visible Codex prompt text is not safe to capture"

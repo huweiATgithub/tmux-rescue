@@ -165,7 +165,7 @@ fn visible_grid(pane_id: &str, rows: &[&str], cursor_x: u16, cursor_y: u16) -> V
 fn captured_grid(pane_id: &str) -> VisiblePaneGrid {
     visible_grid(
         pane_id,
-        &["» draft", "  second", "", "  95% context left"],
+        &["» draft", "  second", "", "  gpt-5.6-sol ultra · /tmp/work"],
         8,
         1,
     )
@@ -465,6 +465,7 @@ fn exact_codex_capture_attaches_visible_prompt_input() {
     };
     assert_eq!(session_id.as_uuid().to_string(), CODEX_SESSION_ID);
     assert_eq!(prompt_area.text().as_str(), "draft\nsecond");
+    assert!(result.events().is_empty());
     assert_eq!(
         source.calls,
         [
@@ -559,6 +560,10 @@ fn unstyled_single_row_text_retains_automatic_recovery_and_emits_one_safe_warnin
     else {
         panic!("expected a prompt-capture skip event");
     };
+    assert_eq!(
+        failure.message(),
+        "visible pane does not match a supported Codex prompt layout"
+    );
     let debug = format!("{event:?}");
     assert!(!failure.message().contains(candidate_text));
     assert!(!debug.contains(candidate_text), "prompt leaked: {debug}");
