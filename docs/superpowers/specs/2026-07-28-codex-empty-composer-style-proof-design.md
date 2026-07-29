@@ -53,6 +53,15 @@ exposed two more fully faint suggestions:
 - `Run /review on my current changes`; and
 - `Summarize recent commits`.
 
+When another rotation displayed `Will this algorithm scale well?`, a local
+inventory of the installed `0.145.0` binary's contiguous built-in suggestion
+list exposed the remaining four strings:
+
+- `Improve documentation in @filename`;
+- `Check recently modified functions for compatibility`;
+- `How many files have been modified?`; and
+- `Will this algorithm scale well?`.
+
 It also showed configured footers clipped at the terminal edge after a
 structured context prefix: `Context N% u…` and `Context N…`, where the visible
 ASCII decimal `N` is in `0..=100` and `…` is U+2026. Some still-narrower panes
@@ -102,10 +111,10 @@ all of these facts hold:
 - the entire visible suffix after that prefix is faint; and
 - the suffix exactly matches a supported Codex `0.145.0` suggestion.
 
-The supported suggestions are the seven live strings above plus the previously
-documented `Ask Codex to do anything`. Every string, including the older one,
-remains supported only with the same faint-style proof; plain text alone does
-not establish an empty composer.
+The supported suggestions are the eleven installed/live strings above plus the
+previously documented `Ask Codex to do anything`. Every string, including the
+older compatibility entry, remains supported only with the same faint-style
+proof; plain text alone does not establish an empty composer.
 
 These cases remain `Skipped` and emit the existing prompt-free warning:
 
@@ -296,7 +305,8 @@ Unit tests must prove:
 
 Parser tests must prove:
 
-- each of the seven live suggestions is `Absent` only when fully faint;
+- each of the eleven installed/live suggestions is `Absent` only when fully
+  faint;
 - the prior `Ask Codex to do anything` string follows the same rule;
 - the same plain strings without faint proof are `Skipped`;
 - partial faint styling and an unknown fully faint string are `Skipped`;
@@ -328,7 +338,7 @@ Implementation updates:
 
 - `docs/src/ARCHITECTURE.md` for the styled-grid refinement boundary, named
   faint proof, capture command, and failure behavior; and
-- `docs/src/TOOL-RECOVERIES.md` for the eight faint-proven suggestions, the two
+- `docs/src/TOOL-RECOVERIES.md` for the twelve faint-proven suggestions, the two
   structured footer truncations, and the footer-plus-terminal-blanks grammar.
 
 `docs/src/DESIGN.md`, the snapshot schema, inspect and plan output, restore

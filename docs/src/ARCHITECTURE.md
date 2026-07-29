@@ -425,8 +425,9 @@ prompt-free diagnostic while exact session recovery remains available.
    boundary fixture.
 2. A newly observed Codex suggestion changes the versioned table, a
    style-backed collision fixture, and [TOOL-RECOVERIES.md](TOOL-RECOVERIES.md).
-3. A new Codex layout or version gets explicit fixtures and versioned policy;
-   it must not weaken the current faint proof or footer recognizer.
+3. A new Codex layout, footer form, or version gets explicit positive and
+   negative fixtures plus versioned policy. It must not weaken the current
+   faint proof or admit unstructured clipped footer prefixes.
 
 No renderer registry or general terminal emulation is part of this seam.
 

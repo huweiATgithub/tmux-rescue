@@ -157,9 +157,11 @@ rules are:
 - the cursor is at the rendered end of the last nonempty prompt row, or at the
   two-cell textarea start on an empty trailing continuation;
 - the footer is either the configured one-line form above with an exact
-  `Context N% used` segment, a default ASCII `0..100% context left` form with
-  the supported shortcut/queue/plan hints, or the supported narrow collapsed
-  hint; and
+  `Context N% used` segment, that configured form clipped at its final segment
+  as exact `Context N% u…` or `Context N…`, a default ASCII
+  `0..100% context left` form with the supported shortcut/queue/plan hints, or
+  the supported narrow collapsed hint. In the clipped forms, `N` is ASCII
+  decimal in `0..=100`; weaker forms such as `C…` remain unsupported; and
 - an empty composer is proven only when the cursor is at cell two on its first
   and only prompt row, every character of `› ` or `» ` is effectively
   non-faint, and every suggestion character is faint. The suggestion must be
@@ -174,6 +176,12 @@ rules are:
 | `0.145.0` | `Write tests for @filename` |
 | `0.145.0` | `Explain this codebase` |
 | `0.145.0` | `Find and fix a bug in @filename` |
+| `0.145.0` | `Run /review on my current changes` |
+| `0.145.0` | `Summarize recent commits` |
+| `0.145.0` | `Improve documentation in @filename` |
+| `0.145.0` | `Check recently modified functions for compatibility` |
+| `0.145.0` | `How many files have been modified?` |
+| `0.145.0` | `Will this algorithm scale well?` |
 
 The renderer-owned glyph and first space are removed from the first row; exactly
 two ASCII margin spaces are removed from nonempty continuation rows. Blank rows,

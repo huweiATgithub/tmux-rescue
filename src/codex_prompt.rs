@@ -6,18 +6,31 @@ use crate::{
 };
 
 // Codex 0.145.0 rotates these faint empty-composer suggestions.
-const SUPPORTED_CODEX_0145_EMPTY_SUGGESTIONS: [&str; 6] = [
+const SUPPORTED_CODEX_0145_EMPTY_SUGGESTIONS: [&str; 12] = [
     "Ask Codex to do anything",
     "Implement {feature}",
     "Use /skills to list available skills",
     "Write tests for @filename",
     "Explain this codebase",
     "Find and fix a bug in @filename",
+    "Run /review on my current changes",
+    "Summarize recent commits",
+    "Improve documentation in @filename",
+    "Check recently modified functions for compatibility",
+    "How many files have been modified?",
+    "Will this algorithm scale well?",
 ];
 const PROMPT_PREFIXES: [&str; 2] = ["› ", "» "];
 const TEXTAREA_MARGIN: &str = "  ";
 
 struct SupportedFooterLayout;
+
+enum ConfiguredContextSegment {
+    Complete,
+    TerminalTruncation,
+}
+
+struct SupportedContextPercentage;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CodexPromptAreaObservation {
@@ -167,11 +180,22 @@ fn is_supported_codex_0145_footer(row: &str) -> bool {
     if configured_segments
         .iter()
         .all(|segment| !segment.is_empty())
-        && configured_segments
-            .iter()
-            .any(|segment| is_context_used_segment(segment))
     {
-        return true;
+        let complete_context = configured_segments.iter().any(|segment| {
+            matches!(
+                parse_configured_context_segment(segment),
+                Some(ConfiguredContextSegment::Complete)
+            )
+        });
+        let terminal_truncation = configured_segments.last().is_some_and(|segment| {
+            matches!(
+                parse_configured_context_segment(segment),
+                Some(ConfiguredContextSegment::TerminalTruncation)
+            )
+        });
+        if complete_context || terminal_truncation {
+            return true;
+        }
     }
 
     if is_known_footer_hint(footer) {
@@ -201,16 +225,23 @@ fn is_supported_codex_0145_footer(row: &str) -> bool {
     is_known_footer_hint(without_suffix[..percentage_start].trim_end())
 }
 
-fn is_context_used_segment(segment: &str) -> bool {
-    let Some(percentage) = segment
-        .strip_prefix("Context ")
-        .and_then(|value| value.strip_suffix("% used"))
-    else {
-        return false;
-    };
-    !percentage.is_empty()
+fn parse_configured_context_segment(segment: &str) -> Option<ConfiguredContextSegment> {
+    let value = segment.strip_prefix("Context ")?;
+    if parse_context_percentage(value, "% used").is_some() {
+        return Some(ConfiguredContextSegment::Complete);
+    }
+    ["% u…", "…"]
+        .into_iter()
+        .any(|suffix| parse_context_percentage(value, suffix).is_some())
+        .then_some(ConfiguredContextSegment::TerminalTruncation)
+}
+
+fn parse_context_percentage(value: &str, suffix: &str) -> Option<SupportedContextPercentage> {
+    let percentage = value.strip_suffix(suffix)?;
+    (!percentage.is_empty()
         && percentage.bytes().all(|byte| byte.is_ascii_digit())
-        && percentage.parse::<u16>().is_ok_and(|value| value <= 100)
+        && percentage.parse::<u16>().is_ok_and(|value| value <= 100))
+    .then_some(SupportedContextPercentage)
 }
 
 fn is_known_footer_hint(hint: &str) -> bool {
@@ -400,6 +431,12 @@ mod tests {
             ('»', "Write tests for @filename"),
             ('›', "Explain this codebase"),
             ('»', "Find and fix a bug in @filename"),
+            ('›', "Run /review on my current changes"),
+            ('»', "Summarize recent commits"),
+            ('›', "Improve documentation in @filename"),
+            ('»', "Check recently modified functions for compatibility"),
+            ('›', "How many files have been modified?"),
+            ('»', "Will this algorithm scale well?"),
         ];
 
         for (glyph, suggestion) in suggestions {
@@ -410,10 +447,51 @@ mod tests {
                 0,
             );
 
-            assert!(matches!(
-                capture_visible_codex_prompt(&grid),
-                CodexPromptAreaObservation::Absent
-            ));
+            assert!(
+                matches!(
+                    capture_visible_codex_prompt(&grid),
+                    CodexPromptAreaObservation::Absent
+                ),
+                "expected a style-proven empty composer for {suggestion:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_only_observed_terminal_context_truncations() {
+        for footer in [
+            "  gpt-5.6-sol ultra · ~/project · main · Context 0% u…",
+            "  gpt-5.6-sol ultra · ~/project · main · Context 48% u…",
+            "  gpt-5.6-sol ultra · ~/project · main · Context 100% u…",
+            "  gpt-5.6-sol ultra · ~/project · main · Context 0…",
+            "  gpt-5.6-sol ultra · ~/project · main · Context 5…",
+            "  gpt-5.6-sol ultra · ~/project · main · Context 100…",
+        ] {
+            let grid = compact_grid(&["› pending"], 9, footer);
+
+            assert_eq!(captured_text(&grid), "pending", "footer: {footer:?}");
+        }
+
+        for footer in [
+            "  gpt-5.6-sol ultra · ~/project · main · C…",
+            "  gpt-5.6-sol ultra · ~/project · main · Context …",
+            "  gpt-5.6-sol ultra · ~/project · main · Context 101% u…",
+            "  gpt-5.6-sol ultra · ~/project · main · Context 101…",
+            "  gpt-5.6-sol ultra · ~/project · main · Context 5% us…",
+            "  gpt-5.6-sol ultra · ~/project · main · Context 5...",
+            "  gpt-5.6-sol ultra · ~/project · main · Context ５…",
+            "  gpt-5.6-sol ultra · ~/project · main · Context 5% u… · Fast on",
+            "  gpt-5.6-sol ultra · ~/project · main · Context 5… · Fast on",
+        ] {
+            let grid = compact_grid(&["› pending"], 9, footer);
+
+            assert!(
+                matches!(
+                    capture_visible_codex_prompt(&grid),
+                    CodexPromptAreaObservation::Skipped(_)
+                ),
+                "expected an unsupported footer for {footer:?}"
+            );
         }
     }
 
