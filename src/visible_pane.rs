@@ -171,7 +171,8 @@ impl std::fmt::Debug for VisibleRow {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("VisibleRow")
-            .field("text", &self.text)
+            .field("characters", &self.text.chars().count())
+            .field("display_cells", &UnicodeWidthStr::width(self.text.as_str()))
             .finish()
     }
 }
@@ -497,19 +498,21 @@ mod tests {
 
     #[test]
     fn conventional_traits_do_not_expose_or_compare_style_evidence() {
+        let sensitive = "sensitive-visible-row";
         let plain = VisiblePaneGrid::try_from_tmux_styled_capture(
             one_row_metadata(80),
-            b"visible\n".to_vec(),
+            format!("{sensitive}\n").into_bytes(),
         )
         .unwrap();
         let faint = VisiblePaneGrid::try_from_tmux_styled_capture(
             one_row_metadata(80),
-            b"\x1b[2mvisible\x1b[0m\n".to_vec(),
+            format!("\x1b[2m{sensitive}\x1b[0m\n").into_bytes(),
         )
         .unwrap();
 
         let debug = format!("{faint:?}");
         assert!(!debug.contains("faint"));
+        assert!(!debug.contains(sensitive));
         assert_eq!(plain.rows()[0], faint.rows()[0]);
         assert_eq!(plain, faint);
     }

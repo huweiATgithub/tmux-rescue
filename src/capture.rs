@@ -4,12 +4,13 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::{
-    AutomaticRecovery, CaptureFailure, CaptureTime, LosslessOsString, MAX_PANES_PER_WINDOW,
-    MAX_SESSIONS, MAX_SNAPSHOT_BYTES, MAX_TOPOLOGY_VALIDATION_ATTEMPTS, MAX_WINDOWS_PER_SESSION,
-    PaneRecovery, PaneTiedForegroundEvidence, RawAutomaticRecovery, RawCaptureConsistency,
-    RawPaneRecovery, RawPaneSnapshot, RawSessionSnapshot, RawSnapshot, RawWindowSnapshot,
-    RecordedAbsolutePath, ResolverOutcome, SnapshotSource, SnapshotValidationError, TmuxPaneId,
-    ValidatedSnapshot, VisiblePaneGrid, classify_pane,
+    AutomaticRecovery, CaptureFailure, CaptureTime, CapturedCodexPromptArea, CodexSessionId,
+    LosslessOsString, MAX_PANES_PER_WINDOW, MAX_SESSIONS, MAX_SNAPSHOT_BYTES,
+    MAX_TOPOLOGY_VALIDATION_ATTEMPTS, MAX_WINDOWS_PER_SESSION, PaneRecovery,
+    PaneTiedForegroundEvidence, RawAutomaticRecovery, RawCaptureConsistency, RawPaneRecovery,
+    RawPaneSnapshot, RawSessionSnapshot, RawSnapshot, RawWindowSnapshot, RecordedAbsolutePath,
+    ResolverOutcome, SnapshotSource, SnapshotValidationError, TmuxPaneId, ValidatedSnapshot,
+    VisiblePaneGrid, classify_pane,
     codex_prompt::{CodexPromptAreaObservation, capture_visible_codex_prompt},
     model::{validate_session_name, validate_window_name},
 };
@@ -338,6 +339,7 @@ enum CodexPromptCaptureFailureKind {
     UnsafeText,
     SizeOverflow,
     SnapshotSizeBudgetExceeded,
+    SessionChanged,
 }
 
 impl CodexPromptCaptureFailure {
@@ -368,6 +370,9 @@ impl CodexPromptCaptureFailure {
             CodexPromptCaptureFailureKind::SnapshotSizeBudgetExceeded => {
                 "snapshot size budget exceeded"
             }
+            CodexPromptCaptureFailureKind::SessionChanged => {
+                "Codex session changed during visible prompt capture"
+            }
         }
     }
 
@@ -393,6 +398,48 @@ impl CodexPromptCaptureFailure {
 
     fn snapshot_size_budget_exceeded() -> Self {
         Self(CodexPromptCaptureFailureKind::SnapshotSizeBudgetExceeded)
+    }
+
+    fn session_changed() -> Self {
+        Self(CodexPromptCaptureFailureKind::SessionChanged)
+    }
+}
+
+struct SessionBoundCodexPromptCapture {
+    session_id: CodexSessionId,
+    prompt_area: CapturedCodexPromptArea,
+}
+
+impl SessionBoundCodexPromptCapture {
+    fn try_bind(
+        expected_session_id: CodexSessionId,
+        closing_observation: PaneProcessObservation,
+        prompt_area: CapturedCodexPromptArea,
+    ) -> Result<Self, CodexPromptCaptureFailure> {
+        let PaneProcessObservation::Foreground(evidence) = closing_observation else {
+            return Err(CodexPromptCaptureFailure::session_changed());
+        };
+        let PaneRecovery::Automatic(AutomaticRecovery::Codex {
+            session_id: closing_session_id,
+            prompt_area: None,
+        }) = classify_pane(*evidence).into_recovery()
+        else {
+            return Err(CodexPromptCaptureFailure::session_changed());
+        };
+        if closing_session_id != expected_session_id {
+            return Err(CodexPromptCaptureFailure::session_changed());
+        }
+        Ok(Self {
+            session_id: expected_session_id,
+            prompt_area,
+        })
+    }
+
+    fn into_recovery(self) -> PaneRecovery {
+        PaneRecovery::Automatic(AutomaticRecovery::Codex {
+            session_id: self.session_id,
+            prompt_area: Some(self.prompt_area),
+        })
     }
 }
 
@@ -650,7 +697,23 @@ fn capture_foreground_recovery(
             let prompt_area = match source.read_visible_pane(pane) {
                 Ok(grid) => match capture_visible_codex_prompt(&grid) {
                     CodexPromptAreaObservation::Absent => None,
-                    CodexPromptAreaObservation::Captured(prompt_area) => Some(prompt_area),
+                    CodexPromptAreaObservation::Captured(prompt_area) => {
+                        match SessionBoundCodexPromptCapture::try_bind(
+                            session_id.clone(),
+                            source.inspect_pane(pane),
+                            prompt_area,
+                        ) {
+                            Ok(bound_capture) => return bound_capture.into_recovery(),
+                            Err(failure) => {
+                                events.push(CaptureEvent::CodexPromptCaptureSkipped {
+                                    attempt,
+                                    pane: coordinate.clone(),
+                                    failure,
+                                });
+                                None
+                            }
+                        }
+                    }
                     CodexPromptAreaObservation::Skipped(failure) => {
                         events.push(CaptureEvent::CodexPromptCaptureSkipped {
                             attempt,

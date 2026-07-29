@@ -11,6 +11,7 @@ use tmux_rescue::{
 };
 
 const CODEX_SESSION_ID: &str = "1d6381bf-01c5-4c4a-b725-8e376e5ad295";
+const SECOND_CODEX_SESSION_ID: &str = "27ea5a6d-5b84-4770-998e-a1a8285b0e9a";
 const SENSITIVE_PROMPT: &str = "release the unreleased signing key";
 
 fn os(value: &str) -> LosslessOsString {
@@ -96,6 +97,10 @@ fn foreground(executable: &str, argv: &[&str]) -> PaneTiedForegroundEvidence {
 }
 
 fn codex_foreground() -> PaneProcessObservation {
+    codex_foreground_for(CODEX_SESSION_ID)
+}
+
+fn codex_foreground_for(session_id: &str) -> PaneProcessObservation {
     let native_member = ForegroundProcessMember::try_new(
         12_346,
         12_345,
@@ -111,10 +116,10 @@ fn codex_foreground() -> PaneProcessObservation {
         8,
         42,
         path(&format!(
-            "/home/user/.codex/sessions/2026/07/23/rollout-{CODEX_SESSION_ID}.jsonl"
+            "/home/user/.codex/sessions/2026/07/23/rollout-{session_id}.jsonl"
         )),
         format!(
-            r#"{{"type":"session_meta","payload":{{"id":"{CODEX_SESSION_ID}","originator":"codex-tui","thread_source":"user","cwd":"/tmp/work","parent_thread_id":null}}}}"#
+            r#"{{"type":"session_meta","payload":{{"id":"{session_id}","originator":"codex-tui","thread_source":"user","cwd":"/tmp/work","parent_thread_id":null}}}}"#
         )
         .into_bytes(),
     )
@@ -465,6 +470,9 @@ fn exact_codex_capture_attaches_visible_prompt_input() {
     };
     assert_eq!(session_id.as_uuid().to_string(), CODEX_SESSION_ID);
     assert_eq!(prompt_area.text().as_str(), "draft\nsecond");
+    let debug = format!("{result:?}");
+    assert!(!debug.contains("draft"));
+    assert!(!debug.contains("second"));
     assert!(result.events().is_empty());
     assert_eq!(
         source.calls,
@@ -472,9 +480,41 @@ fn exact_codex_capture_attaches_visible_prompt_input() {
             SourceCall::ReadTopology,
             SourceCall::InspectPane("%15".to_owned()),
             SourceCall::ReadVisiblePane("%15".to_owned()),
+            SourceCall::InspectPane("%15".to_owned()),
             SourceCall::ReadTopology,
         ]
     );
+}
+
+#[test]
+fn changed_codex_session_after_grid_capture_drops_only_prompt_enrichment() {
+    let observed = topology_with_pane_id("work", 0, "%15");
+    let mut source = ScriptedSource::new(vec![Ok(observed.clone()), Ok(observed)])
+        .with_observations(vec![
+            codex_foreground(),
+            codex_foreground_for(SECOND_CODEX_SESSION_ID),
+        ])
+        .with_visible_reads(vec![Ok(captured_grid("%15"))]);
+
+    let result = capture_snapshot(&mut source, capture_time()).unwrap();
+
+    let PaneRecovery::Automatic(AutomaticRecovery::Codex {
+        session_id,
+        prompt_area: None,
+    }) = result.snapshot().sessions()[0].windows()[0].panes()[0].recovery()
+    else {
+        panic!("expected prompt-free automatic Codex recovery");
+    };
+    assert_eq!(session_id.as_uuid().to_string(), CODEX_SESSION_ID);
+    let [CaptureEvent::CodexPromptCaptureSkipped { failure, .. }] = result.events() else {
+        panic!("expected one prompt-capture skip event");
+    };
+    assert_eq!(
+        failure.message(),
+        "Codex session changed during visible prompt capture"
+    );
+    let debug = format!("{result:?}");
+    assert!(!debug.contains("draft"), "prompt leaked: {debug}");
 }
 
 #[test]

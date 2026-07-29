@@ -114,7 +114,7 @@ case " $* " in
       : > "$FAKE_TMUX_STATE"
       printf '3:%%152:801:41:81:11:0\n'
     fi ;;
-  *' capture-pane -p -e -t %15 '*)
+  *' capture-pane -p -e -N -T -t %15 '*)
     if [ "$FAKE_TMUX_SCENARIO" = wrong_rows ]; then
       printf '\302\273 private source row\n  second row\n  95%% context left\n'
     else
@@ -565,7 +565,9 @@ fn visible_grid_capture_uses_stable_metadata_and_never_joins_rows() {
     assert_eq!(commands.len(), 3, "unexpected command log: {log}");
     assert!(commands[0].contains("ARG=display-message\nARG=-p\nARG=-t\nARG=%15\n"));
     assert!(commands[0].contains(METADATA_FORMAT));
-    assert!(commands[1].contains("ARG=capture-pane\nARG=-p\nARG=-e\nARG=-t\nARG=%15\n"));
+    assert!(
+        commands[1].contains("ARG=capture-pane\nARG=-p\nARG=-e\nARG=-N\nARG=-T\nARG=-t\nARG=%15\n")
+    );
     assert!(commands[2].contains("ARG=display-message\nARG=-p\nARG=-t\nARG=%15\n"));
     assert!(commands[2].contains(METADATA_FORMAT));
     for command in &commands {
@@ -609,7 +611,7 @@ fn real_visible_grid_capture_preserves_the_approved_codex_suffix() {
     fs::write(
         &renderer,
         format!(
-            "#!/bin/sh\nprintf '%s' '» The test prompt for recovering.\n\n  Line 1.\n\n  Line 2.\n\n{APPROVED_CODEX_FOOTER}'\nprintf '\\033[2A\\r\\033[9C'\nexec /bin/sleep 30\n"
+            "#!/bin/sh\nprintf '%s' '» The test prompt for recovering.   \n\n  Line 1.\n\n  Line 2.\n\n{APPROVED_CODEX_FOOTER}'\nprintf '\\033[2A\\r\\033[9C'\nexec /bin/sleep 30\n"
         ),
     )
     .unwrap();
@@ -634,7 +636,7 @@ fn real_visible_grid_capture_preserves_the_approved_codex_suffix() {
     let topology = adapter.read_topology().unwrap();
     let pane = &topology.sessions()[0].windows()[0].panes()[0];
     let expected = [
-        "» The test prompt for recovering.",
+        "» The test prompt for recovering.   ",
         "",
         "  Line 1.",
         "",
@@ -728,7 +730,7 @@ fn visible_grid_capture_targets_the_ephemeral_pane_id() {
     adapter.read_visible_pane(pane).unwrap();
 
     let log = String::from_utf8(fs::read(log).unwrap()).unwrap();
-    assert!(log.contains("ARG=capture-pane\nARG=-p\nARG=-e\nARG=-t\nARG=%15\n"));
+    assert!(log.contains("ARG=capture-pane\nARG=-p\nARG=-e\nARG=-N\nARG=-T\nARG=-t\nARG=%15\n"));
     assert!(!log.contains("work:0.0"));
 }
 

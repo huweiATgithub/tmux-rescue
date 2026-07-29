@@ -344,6 +344,7 @@ fn codex_prompt_input_is_bound_to_its_enclosing_session_launch() {
 
     assert_eq!(launch.directory().path().as_bytes(), b"/recorded/codex");
     assert_eq!(launch.input().executable().path().as_bytes(), b"/bin/sh");
+    assert!(!format!("{plan:?}").contains(CODEX_PROMPT_TEXT));
     assert!(matches!(
         launch.expectation(),
         AutomaticRecoveryExpectation::Codex(session_id)

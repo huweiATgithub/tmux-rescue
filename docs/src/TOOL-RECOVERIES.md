@@ -193,7 +193,9 @@ rendered end and multiline drafts remain prompt-capture candidates.
 The renderer-owned glyph and first space are removed from the first row; exactly
 two ASCII margin spaces are removed from nonempty continuation rows. Blank rows,
 visible soft-wrap boundaries, additional indentation, and a trailing empty
-prompt row are preserved. Visible text such as
+prompt row are preserved. Source capture uses command-level `-N -T` so explicit
+trailing spaces are retained while unused terminal cells are omitted. Visible
+text such as
 `[Pasted Content 12345 chars]` is stored literally; tmux-rescue does not resolve
 or reconstruct the hidden pasted content behind that placeholder.
 
@@ -202,6 +204,11 @@ above the current grid may yield only its visible suffix. Hidden, scrolled-out,
 popup-covered, copy-mode, unsafe, oversized, changing, or otherwise unsupported
 input is omitted. Such a failure retains the exact automatic Codex session
 recovery and emits only a prompt-free skip reason.
+
+Before attaching captured text, tmux-rescue re-observes the foreground process
+and requires the same exact Codex session ID that authorized the grid read. A
+different, unavailable, or no-longer-exact session drops only `prompt_area` with
+a fixed prompt-free warning; the initially resolved automatic recovery remains.
 
 ### Recovery Payload
 

@@ -632,6 +632,13 @@ mod tests {
     }
 
     #[test]
+    fn preserves_explicit_trailing_spaces_on_a_non_cursor_row() {
+        let grid = compact_grid(&["» first line   ", "  second line"], 13, "  tab to queue");
+
+        assert_eq!(captured_text(&grid), "first line   \nsecond line");
+    }
+
+    #[test]
     fn preserves_literal_pasted_content_placeholders() {
         let row = "» before [Pasted Content 12345 chars] after";
         let cursor_x = u16::try_from(UnicodeWidthStr::width(row)).unwrap();

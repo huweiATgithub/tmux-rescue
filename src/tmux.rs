@@ -159,7 +159,15 @@ impl<P> TmuxAdapter<P> {
         let before =
             read_metadata().map_err(|_| CodexPromptCaptureFailure::visible_pane_read_failed())?;
         let output = source_client_command(Some(&self.selector))
-            .args(["capture-pane", "-p", "-e", "-t", pane.pane_id().as_str()])
+            .args([
+                "capture-pane",
+                "-p",
+                "-e",
+                "-N",
+                "-T",
+                "-t",
+                pane.pane_id().as_str(),
+            ])
             .output()
             .map_err(|error| TmuxAdapterError::CommandUnavailable(error.to_string()))
             .and_then(|output| require_success("capture visible tmux pane", output))

@@ -130,10 +130,19 @@ pub struct RawCapturedCommand {
     pub argv: Vec<RawEncodedOsString>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawCapturedCodexPromptArea {
     pub text: String,
+}
+
+impl fmt::Debug for RawCapturedCodexPromptArea {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawCapturedCodexPromptArea")
+            .field("text", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -409,8 +418,18 @@ impl CodexSessionId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CapturedPromptText(String);
+
+impl fmt::Debug for CapturedPromptText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedPromptText")
+            .field("visible_rows", &self.visible_row_count())
+            .field("bytes", &self.byte_count())
+            .finish()
+    }
+}
 
 impl CapturedPromptText {
     pub(crate) fn try_new(text: String) -> Result<Self, SnapshotValidationError> {

@@ -392,19 +392,20 @@ client each time:
 
 ```text
 read (pane id, width, height, cursor, mode)
--> tmux capture-pane -p -e -t <exact-pane-id>
+-> tmux capture-pane -p -e -N -T -t <exact-pane-id>
 -> read (pane id, width, height, cursor, mode) again
 -> require identical metadata and the topology pane id
 -> refine VisiblePaneGrid
 ```
 
 The visible-grid command deliberately has no `-J`, history `-S`/`-E`, or input
-operation. Row and blank-line boundaries remain intact. `visible_pane` consumes
-all admitted SGR, retains only private per-character faintness, and exposes
-refined plain rows plus one atomic proof; raw ANSI and generic style queries
-cannot cross the seam. The private Codex layout parser accepts only the
-renderer evidence in [TOOL-RECOVERIES.md](TOOL-RECOVERIES.md) through this
-refinement:
+operation. Command-level `-N -T` preserves explicit trailing spaces while
+omitting unused trailing cells, so row bytes, row boundaries, and blank-line
+boundaries remain intact. `visible_pane` consumes all admitted SGR, retains only
+private per-character faintness, and exposes refined plain rows plus one atomic
+proof; raw ANSI and generic style queries cannot cross the seam. The private
+Codex layout parser accepts only the renderer evidence in
+[TOOL-RECOVERIES.md](TOOL-RECOVERIES.md) through this refinement:
 
 ```text
 VisiblePaneGrid
@@ -419,14 +420,21 @@ composition; callers cannot receive trust counts or recombine predicates.
 Configured evidence reads only refined plain rows, while the existing opaque
 faint-suffix proof remains local to empty-composer classification.
 
-Read, metadata, layout, unsafe-text, and prompt-size failures emit one typed,
-coordinate-scoped skip event while preserving prompt-free automatic Codex
-session recovery. Diagnostics are bounded and never retain captured rows. If
-optional prompt areas alone make the complete raw candidate exceed the existing
-aggregate snapshot limit, capture removes all prompt areas in memory, emits one
-`snapshot size budget exceeded` skip event per affected pane, and validates the
-same prompt-free candidate. A candidate that remains oversized fails under the
-existing snapshot-size rule.
+A captured prompt area is not attachable immediately. Capture re-observes the
+foreground process after the grid read, refines it to the same exact Codex
+session ID, and constructs a private `SessionBoundCodexPromptCapture`. Callers
+can consume only that proof-bearing pair. An unavailable, non-Codex,
+conflicting, or different-session closing observation drops the prompt area
+without replacing the initially classified automatic recovery.
+
+Read, metadata, layout, unsafe-text, prompt-size, and closing-session failures
+emit one typed, coordinate-scoped skip event while preserving prompt-free
+automatic Codex session recovery. Diagnostics are bounded and never retain
+captured rows. If optional prompt areas alone make the complete raw candidate
+exceed the existing aggregate snapshot limit, capture removes all prompt areas
+in memory, emits one `snapshot size budget exceeded` skip event per affected
+pane, and validates the same prompt-free candidate. A candidate that remains
+oversized fails under the existing snapshot-size rule.
 
 Malformed or unsupported SGR fails optional prompt enrichment with a fixed
 prompt-free diagnostic while exact session recovery remains available.
@@ -1047,7 +1055,10 @@ the capture/model/plan/execution path. Capture failures and warnings contain
 only bounded reasons, inspection owns counts rather than text, plan output owns
 only a row count, and restore results use fixed or bounded prompt-free labels.
 No diagnostic, `Debug` failure, inspect document, plan, progress warning, or
-result line may echo the draft.
+result line may echo the draft. The raw prompt object, refined prompt text, and
+visible-row carriers own redacted or count-only `Debug` implementations, so
+outer snapshot, capture, plan, and restore types may derive `Debug` without
+re-exposing their text.
 
 Restore never mutates an existing target server, never creates a missing
 working directory, and never removes a server it cannot prove it created.

@@ -1,8 +1,8 @@
 use serde_json::{Value, json};
 use tmux_rescue::{
     AutomaticRecovery, MAX_CODEX_PROMPT_BYTES, MAX_DIAGNOSTIC_BYTES, MAX_OS_VALUE_BYTES,
-    MAX_SESSIONS, MAX_TOPOLOGY_VALIDATION_ATTEMPTS, PaneRecovery, SnapshotValidationError,
-    ValidatedSnapshot,
+    MAX_SESSIONS, MAX_TOPOLOGY_VALIDATION_ATTEMPTS, PaneRecovery, RawSnapshot,
+    SnapshotValidationError, ValidatedSnapshot,
 };
 
 fn encoded(value: &str) -> Value {
@@ -84,6 +84,20 @@ fn validates_and_round_trips_a_codex_visible_prompt_area() {
 
     let serialized: Value = serde_json::from_slice(&snapshot.to_json_pretty().unwrap()).unwrap();
     assert_eq!(serialized, value);
+}
+
+#[test]
+fn raw_and_refined_snapshot_debug_redacts_codex_prompt_text() {
+    let sensitive = "sensitive prompt must not appear in Debug";
+    let mut value = valid_snapshot();
+    value["sessions"][0]["windows"][0]["panes"][0]["recovery"] =
+        codex_automatic(json!({"text": sensitive}));
+
+    let raw: RawSnapshot = serde_json::from_value(value.clone()).unwrap();
+    let snapshot = parse(&value).unwrap();
+
+    assert!(!format!("{raw:?}").contains(sensitive));
+    assert!(!format!("{snapshot:?}").contains(sensitive));
 }
 
 #[test]
