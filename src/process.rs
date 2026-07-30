@@ -1022,26 +1022,43 @@ mod observation_tests {
     }
 
     #[test]
-    fn zero_link_codex_strips_one_kernel_decoration_for_identity_only() {
-        let command = observed_command(b"/tmp/codex (deleted)", 8, 42, 0).unwrap();
-        assert_eq!(
-            command.command().executable().as_bytes(),
-            b"/tmp/codex (deleted)"
-        );
-        assert_eq!(
-            command.executable_identity_basename(),
-            Some(b"codex".as_slice())
-        );
-    }
-
-    #[test]
-    fn linked_codex_uses_the_raw_executable_for_identity() {
-        let command = observed_command(b"/tmp/codex", 8, 42, 1).unwrap();
-        assert_eq!(command.command().executable().as_bytes(), b"/tmp/codex");
-        assert_eq!(
-            command.executable_identity_basename(),
-            Some(b"codex".as_slice())
-        );
+    fn pinned_executable_identity_accepts_only_a_proved_kernel_deletion_decoration() {
+        for (raw_link, link_count, expected_identity) in [
+            (b"/tmp/codex".as_slice(), 1, Some(b"codex".as_slice())),
+            (
+                b"/tmp/codex (deleted)".as_slice(),
+                1,
+                Some(b"codex (deleted)".as_slice()),
+            ),
+            (
+                b"/tmp/codex (deleted)".as_slice(),
+                0,
+                Some(b"codex".as_slice()),
+            ),
+            (
+                b"/tmp/codex (deleted) (deleted)".as_slice(),
+                0,
+                Some(b"codex (deleted)".as_slice()),
+            ),
+            (b"/tmp/codex".as_slice(), 0, None),
+            (b" (deleted)".as_slice(), 0, None),
+        ] {
+            let result = observed_command(raw_link, 8, 42, link_count);
+            match expected_identity {
+                Some(expected_identity) => {
+                    let command = result.unwrap();
+                    assert_eq!(command.command().executable().as_bytes(), raw_link);
+                    assert_eq!(
+                        command.executable_identity_basename(),
+                        Some(expected_identity)
+                    );
+                }
+                None => assert!(matches!(
+                    result,
+                    Err(ProcessInspectionFailure::InvalidEvidence(_))
+                )),
+            }
+        }
     }
 
     fn observed(executable: &[u8]) -> InspectedProcess {
@@ -1067,6 +1084,17 @@ mod observation_tests {
         }
     }
 
+    fn pinned_observed(
+        raw_link: &[u8],
+        device: u64,
+        inode: u64,
+        link_count: u64,
+    ) -> InspectedProcess {
+        let mut process = observed(b"/tmp/codex");
+        process.command = observed_command(raw_link, device, inode, link_count).unwrap();
+        process
+    }
+
     #[test]
     fn final_process_fence_rejects_exec_with_the_same_pid_and_start_time() {
         assert!(!same_process_observations(
@@ -1086,6 +1114,23 @@ mod observation_tests {
             std::slice::from_ref(&original),
             &[original.clone(), joined],
         ));
+    }
+
+    #[test]
+    fn final_process_fence_rejects_pinned_executable_observation_mutations() {
+        let original = pinned_observed(b"/tmp/codex", 8, 42, 1);
+
+        for replacement in [
+            pinned_observed(b"/tmp/codex", 8, 42, 2),
+            pinned_observed(b"/tmp/renamed-codex", 8, 42, 1),
+            pinned_observed(b"/tmp/codex", 9, 43, 1),
+        ] {
+            assert_ne!(original.command, replacement.command);
+            assert!(!same_process_observations(
+                std::slice::from_ref(&original),
+                std::slice::from_ref(&replacement),
+            ));
+        }
     }
 
     #[test]

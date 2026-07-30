@@ -177,6 +177,33 @@ fn resolves_codex_from_one_exact_opened_root_session_record() {
 }
 
 #[test]
+fn public_raw_codex_suffix_cannot_forge_unlinked_identity() {
+    let session_id = "1d6381bf-01c5-4c4a-b725-8e376e5ad295";
+    let session_file = OpenedCodexSessionFile::try_new(
+        12_345,
+        8,
+        42,
+        path(&format!(
+            "/home/user/.codex/sessions/2026/07/23/rollout-{session_id}.jsonl"
+        )),
+        format!(
+            r#"{{"type":"session_meta","payload":{{"id":"{session_id}","originator":"codex-tui","thread_source":"user","cwd":"/tmp/work","parent_thread_id":null}}}}"#
+        )
+        .into_bytes(),
+    )
+    .unwrap();
+    let evidence = evidence("/tmp/codex (deleted)", &["codex"])
+        .with_codex_session_evidence(path("/home/user/.codex/sessions"), vec![session_file])
+        .unwrap();
+
+    let classification = classify_pane(evidence);
+    let PaneRecovery::Manual(command) = classification.recovery() else {
+        panic!("public raw evidence must remain manual");
+    };
+    assert_eq!(command.executable().as_bytes(), b"/tmp/codex (deleted)");
+}
+
+#[test]
 fn conflicting_codex_root_ids_downgrade_to_manual() {
     let ids = [
         "1d6381bf-01c5-4c4a-b725-8e376e5ad295",

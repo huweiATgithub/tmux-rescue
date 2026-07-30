@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use tmux_rescue::{
     AutomaticRecovery, LinuxProcessInspector, LosslessOsString, PaneInitialProcess,
     PaneProcessAnchor, PaneProcessObservation, PaneProcessProbe, PaneRecovery,
-    ProcessInspectionFailure, RecordedAbsolutePath, TmuxPaneId, TopologyPane, classify_pane,
-    derive_automatic_command, parse_proc_cmdline, parse_proc_stat, select_foreground_processes,
+    ProcessInspectionFailure, RecordedAbsolutePath, ResolverOutcome, TmuxPaneId, TopologyPane,
+    classify_pane, derive_automatic_command, parse_proc_cmdline, parse_proc_stat,
+    select_foreground_processes,
 };
 
 const ZSH: &str = "/usr/bin/zsh";
@@ -135,6 +136,28 @@ fn fake_process(
     symlink(cwd, process.join("cwd")).unwrap();
     fs::create_dir(process.join("fd")).unwrap();
     symlink("/dev/pts/42", process.join("fd/0")).unwrap();
+}
+
+fn attach_exact_codex_session(
+    root: &Path,
+    proc_root: &Path,
+    holder_process_id: u32,
+) -> RecordedAbsolutePath {
+    let session_id = "1d6381bf-01c5-4c4a-b725-8e376e5ad295";
+    let codex_store = root.join("codex/sessions");
+    fs::create_dir_all(&codex_store).unwrap();
+    let session_file = codex_store.join(format!("rollout-{session_id}.jsonl"));
+    let session_record = format!(
+        r#"{{"type":"session_meta","payload":{{"id":"{session_id}","originator":"codex-tui","thread_source":"user","cwd":"/tmp/work","parent_thread_id":null}}}}"#
+    );
+    fs::write(&session_file, format!("{session_record}\n")).unwrap();
+    symlink(
+        &session_file,
+        proc_root.join(holder_process_id.to_string()).join("fd/7"),
+    )
+    .unwrap();
+    RecordedAbsolutePath::try_from_bytes(codex_store.as_os_str().as_encoded_bytes().to_vec())
+        .unwrap()
 }
 
 fn pane(initial_process: PaneInitialProcess) -> TopologyPane {
@@ -462,6 +485,173 @@ fn recognizes_codex_when_the_native_executable_is_held_open_after_unlink() {
             b"resume".as_slice(),
             session_id.as_bytes()
         ],
+    );
+}
+
+#[test]
+fn keeps_an_unlinked_literal_codex_deleted_executable_manual() {
+    let temp = tempfile::tempdir().unwrap();
+    let proc_root = temp.path().join("proc");
+    fs::create_dir(&proc_root).unwrap();
+    let native_path = fixture_executable(temp.path(), "codex (deleted)");
+    let native = File::open(&native_path).unwrap();
+    fs::remove_file(&native_path).unwrap();
+    let held_path = PathBuf::from(format!("/proc/self/fd/{}", native.as_raw_fd()));
+    fake_process(
+        &proc_root,
+        100,
+        &stat(100, "zsh", 1, 100, 77, 34_817, 200, 10),
+        Path::new(ZSH),
+        b"zsh\0",
+        "/tmp/work",
+    );
+    fake_process(
+        &proc_root,
+        200,
+        &stat(200, "codex", 100, 200, 77, 34_817, 200, 20),
+        &held_path,
+        b"codex\0",
+        "/tmp/work",
+    );
+    let codex_store = attach_exact_codex_session(temp.path(), &proc_root, 200);
+    let inspector =
+        LinuxProcessInspector::with_proc_root_and_tool_stores(proc_root, Some(codex_store), None);
+
+    let PaneProcessObservation::Foreground(evidence) = inspector
+        .observe(&pane(PaneInitialProcess::DefaultShell {
+            executable: os(ZSH),
+        }))
+        .unwrap()
+    else {
+        panic!("expected foreground evidence");
+    };
+    let classification = classify_pane(*evidence);
+    let PaneRecovery::Manual(command) = classification.recovery() else {
+        panic!("literal suffix must remain manual");
+    };
+    assert_eq!(
+        command.executable().as_bytes(),
+        format!("{} (deleted)", native_path.display()).as_bytes()
+    );
+}
+
+#[test]
+fn keeps_noninteractive_codex_modes_manual_with_proved_unlink_and_session_evidence() {
+    for mode in [b"app-server".as_slice(), b"exec", b"mcp-server"] {
+        let temp = tempfile::tempdir().unwrap();
+        let proc_root = temp.path().join("proc");
+        fs::create_dir(&proc_root).unwrap();
+        let native_path = fixture_executable(temp.path(), "codex");
+        let native = File::open(&native_path).unwrap();
+        fs::remove_file(&native_path).unwrap();
+        let held_path = PathBuf::from(format!("/proc/self/fd/{}", native.as_raw_fd()));
+        fake_process(
+            &proc_root,
+            100,
+            &stat(100, "zsh", 1, 100, 77, 34_817, 200, 10),
+            Path::new(ZSH),
+            b"zsh\0",
+            "/tmp/work",
+        );
+        let argv = [b"codex".as_slice(), mode].join(&0);
+        let mut nul_terminated_argv = argv;
+        nul_terminated_argv.push(0);
+        fake_process(
+            &proc_root,
+            200,
+            &stat(200, "codex", 100, 200, 77, 34_817, 200, 20),
+            &held_path,
+            &nul_terminated_argv,
+            "/tmp/work",
+        );
+        let codex_store = attach_exact_codex_session(temp.path(), &proc_root, 200);
+        let inspector = LinuxProcessInspector::with_proc_root_and_tool_stores(
+            proc_root,
+            Some(codex_store),
+            None,
+        );
+
+        let PaneProcessObservation::Foreground(evidence) = inspector
+            .observe(&pane(PaneInitialProcess::DefaultShell {
+                executable: os(ZSH),
+            }))
+            .unwrap()
+        else {
+            panic!("expected foreground evidence");
+        };
+        assert!(matches!(
+            classify_pane(*evidence).recovery(),
+            PaneRecovery::Manual(_)
+        ));
+    }
+}
+
+#[test]
+fn keeps_the_raw_node_leader_as_manual_fallback_when_codex_lacks_session_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    let proc_root = temp.path().join("proc");
+    fs::create_dir(&proc_root).unwrap();
+    let node_executable = fixture_executable(temp.path(), "node");
+    let native_path = fixture_executable(temp.path(), "codex");
+    let native = File::open(&native_path).unwrap();
+    fs::remove_file(&native_path).unwrap();
+    let held_path = PathBuf::from(format!("/proc/self/fd/{}", native.as_raw_fd()));
+    fake_process(
+        &proc_root,
+        100,
+        &stat(100, "zsh", 1, 100, 77, 34_817, 200, 10),
+        Path::new(ZSH),
+        b"zsh\0",
+        "/tmp/work",
+    );
+    fake_process(
+        &proc_root,
+        200,
+        &stat(200, "node", 100, 200, 77, 34_817, 200, 20),
+        &node_executable,
+        b"node\0/opt/codex/bin/codex.js\0",
+        "/tmp/work",
+    );
+    fake_process(
+        &proc_root,
+        201,
+        &stat(201, "codex", 200, 200, 77, 34_817, 200, 21),
+        &held_path,
+        b"codex\0",
+        "/tmp/work",
+    );
+    let codex_store = temp.path().join("codex/sessions");
+    fs::create_dir_all(&codex_store).unwrap();
+    let inspector = LinuxProcessInspector::with_proc_root_and_tool_stores(
+        proc_root,
+        Some(
+            RecordedAbsolutePath::try_from_bytes(
+                codex_store.as_os_str().as_encoded_bytes().to_vec(),
+            )
+            .unwrap(),
+        ),
+        None,
+    );
+
+    let PaneProcessObservation::Foreground(evidence) = inspector
+        .observe(&pane(PaneInitialProcess::DefaultShell {
+            executable: os(ZSH),
+        }))
+        .unwrap()
+    else {
+        panic!("expected foreground evidence");
+    };
+    let classification = classify_pane(*evidence);
+    let PaneRecovery::Manual(command) = classification.recovery() else {
+        panic!("missing Codex session proof must remain manual");
+    };
+    assert!(matches!(
+        classification.resolver_outcome(),
+        ResolverOutcome::InsufficientEvidence(_)
+    ));
+    assert_eq!(
+        command.executable().as_bytes(),
+        node_executable.as_os_str().as_encoded_bytes()
     );
 }
 
