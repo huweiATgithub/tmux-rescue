@@ -998,12 +998,28 @@ fn default_tool_store(environment: &str, default_directory: &str) -> Option<Reco
 
 #[cfg(test)]
 mod observation_tests {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
     use super::{
         CapturedCommand, InspectedProcess, LosslessOsString, ObservedProcessCommand,
         OpenedClaudeSessionFile, PinnedExecutableObservation, ProcessExecutableKey,
         ProcessInspectionFailure, ProcessStat, RecordedAbsolutePath, ToolEvidenceObservation,
-        ToolRecordObservation, ensure_tool_evidence_unchanged, same_process_observations,
+        ToolRecordObservation, ensure_tool_evidence_unchanged, read_pinned_executable,
+        same_process_observations,
     };
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     fn observed_command(
         raw_link: &[u8],
@@ -1059,6 +1075,50 @@ mod observation_tests {
                 )),
             }
         }
+    }
+
+    #[test]
+    fn production_acquisition_refines_a_running_unlinked_executable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("codex");
+        fs::copy("/bin/sleep", &executable).unwrap();
+        let child = ChildGuard(Command::new(&executable).arg("30").spawn().unwrap());
+        let process_id = child.0.id();
+        let process_executable = Path::new("/proc").join(process_id.to_string()).join("exe");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let exec_confirmation = loop {
+            let observation = match fs::read_link(&process_executable) {
+                Ok(link) if link == executable => break Ok(()),
+                Ok(link) => format!("link {}", link.display()),
+                Err(error) => format!("I/O error {error}"),
+            };
+            if Instant::now() >= deadline {
+                break Err(observation);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if let Err(last_observation) = exec_confirmation {
+            panic!("child {process_id} did not exec {executable:?}: {last_observation}");
+        }
+
+        let before_unlink = fs::metadata(&executable).unwrap();
+        fs::remove_file(&executable).unwrap();
+
+        let acquired = read_pinned_executable(&process_executable, process_id).unwrap();
+        assert!(acquired.raw_link.as_bytes().ends_with(b"/codex (deleted)"));
+        assert_eq!(acquired.key.device, before_unlink.dev());
+        assert_eq!(acquired.key.inode, before_unlink.ino());
+        assert_eq!(acquired.link_count, 0);
+
+        let command = ObservedProcessCommand::from_pinned(
+            acquired,
+            vec![LosslessOsString::try_from_bytes(b"codex".to_vec()).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            command.executable_identity_basename(),
+            Some(b"codex".as_slice())
+        );
     }
 
     fn observed(executable: &[u8]) -> InspectedProcess {
