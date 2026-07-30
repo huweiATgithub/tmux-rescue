@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tmux_rescue::{
     AutomaticRecovery, LinuxProcessInspector, LosslessOsString, PaneInitialProcess,
@@ -9,6 +9,8 @@ use tmux_rescue::{
     ProcessInspectionFailure, RecordedAbsolutePath, TmuxPaneId, TopologyPane, classify_pane,
     derive_automatic_command, parse_proc_cmdline, parse_proc_stat, select_foreground_processes,
 };
+
+const ZSH: &str = "/usr/bin/zsh";
 
 #[allow(clippy::too_many_arguments)]
 fn stat(
@@ -109,11 +111,18 @@ fn path(value: &str) -> RecordedAbsolutePath {
     RecordedAbsolutePath::try_from_bytes(value.as_bytes().to_vec()).unwrap()
 }
 
+fn fixture_executable(root: &Path, relative_path: &str) -> PathBuf {
+    let executable = root.join(".executables").join(relative_path);
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, b"fake executable image").unwrap();
+    executable
+}
+
 fn fake_process(
     proc_root: &Path,
     pid: u32,
     stat_bytes: &[u8],
-    executable: &str,
+    executable: &Path,
     argv: &[u8],
     cwd: &str,
 ) {
@@ -121,18 +130,7 @@ fn fake_process(
     fs::create_dir_all(&process).unwrap();
     fs::write(process.join("stat"), stat_bytes).unwrap();
     fs::write(process.join("cmdline"), argv).unwrap();
-    let executable = Path::new(executable);
-    let executable = if executable.exists() {
-        executable.to_owned()
-    } else {
-        let backing = proc_root
-            .join(".executables")
-            .join(pid.to_string())
-            .join(executable.strip_prefix("/").unwrap_or(executable));
-        fs::create_dir_all(backing.parent().unwrap()).unwrap();
-        fs::write(&backing, b"fake executable image").unwrap();
-        backing
-    };
+    assert!(executable.is_file());
     symlink(executable, process.join("exe")).unwrap();
     symlink(cwd, process.join("cwd")).unwrap();
     fs::create_dir(process.join("fd")).unwrap();
@@ -155,7 +153,7 @@ fn rejects_a_pane_process_not_bound_to_the_recorded_tty() {
         temp.path(),
         100,
         &stat(100, "zsh", 1, 100, 77, 34_817, 100, 10),
-        "/bin/zsh",
+        Path::new(ZSH),
         b"zsh\0",
         "/tmp/work",
     );
@@ -167,7 +165,7 @@ fn rejects_a_pane_process_not_bound_to_the_recorded_tty() {
             100,
             os("/dev/pts/99"),
             PaneInitialProcess::DefaultShell {
-                executable: os("/bin/zsh"),
+                executable: os(ZSH),
             },
         )
         .unwrap(),
@@ -186,7 +184,7 @@ fn rejects_an_idle_shell_outside_the_recorded_pane_directory() {
         temp.path(),
         100,
         &stat(100, "zsh", 1, 100, 77, 34_817, 100, 10),
-        "/bin/zsh",
+        Path::new(ZSH),
         b"zsh\0",
         "/tmp/other",
     );
@@ -194,7 +192,7 @@ fn rejects_an_idle_shell_outside_the_recorded_pane_directory() {
     assert!(matches!(
         LinuxProcessInspector::with_proc_root(temp.path().to_owned()).observe(&pane(
             PaneInitialProcess::DefaultShell {
-                executable: os("/bin/zsh"),
+                executable: os(ZSH),
             }
         )),
         Err(ProcessInspectionFailure::PaneWorkingDirectoryMismatch { .. })
@@ -208,7 +206,7 @@ fn proves_idle_for_default_and_conservatively_recognized_explicit_shells() {
         temp.path(),
         100,
         &stat(100, "zsh", 1, 100, 77, 34_817, 100, 10),
-        "/bin/zsh",
+        Path::new(ZSH),
         b"zsh\0",
         "/tmp/work",
     );
@@ -217,7 +215,7 @@ fn proves_idle_for_default_and_conservatively_recognized_explicit_shells() {
     assert!(matches!(
         inspector
             .observe(&pane(PaneInitialProcess::DefaultShell {
-                executable: os("/usr/bin/zsh")
+                executable: os(ZSH)
             }))
             .unwrap(),
         PaneProcessObservation::Idle
@@ -229,7 +227,7 @@ fn proves_idle_for_default_and_conservatively_recognized_explicit_shells() {
         PaneProcessObservation::Idle
     ));
 
-    fs::write(temp.path().join("100/cmdline"), b"/bin/zsh\0-i\0").unwrap();
+    fs::write(temp.path().join("100/cmdline"), b"/usr/bin/zsh\0-i\0").unwrap();
     assert!(matches!(
         inspector
             .observe(&pane(PaneInitialProcess::ExplicitCommand))
@@ -244,9 +242,9 @@ fn keeps_an_explicit_shell_command_as_foreground_recovery() {
     fake_process(
         temp.path(),
         100,
-        &stat(100, "sh", 1, 100, 77, 34_817, 100, 10),
-        "/bin/sh",
-        b"/bin/sh\0-c\0sleep 30\0",
+        &stat(100, "zsh", 1, 100, 77, 34_817, 100, 10),
+        Path::new(ZSH),
+        b"/usr/bin/zsh\0-c\0sleep 30\0",
         "/tmp/work",
     );
     let inspector = LinuxProcessInspector::with_proc_root(temp.path().to_owned());
@@ -262,11 +260,13 @@ fn keeps_an_explicit_shell_command_as_foreground_recovery() {
 #[test]
 fn retains_a_rooted_native_child_as_transient_foreground_evidence() {
     let temp = tempfile::tempdir().unwrap();
+    let node_executable = fixture_executable(temp.path(), "node");
+    let codex_executable = fixture_executable(temp.path(), "codex");
     fake_process(
         temp.path(),
         100,
         &stat(100, "zsh", 1, 100, 77, 34_817, 200, 10),
-        "/bin/zsh",
+        Path::new(ZSH),
         b"zsh\0",
         "/tmp/work",
     );
@@ -274,7 +274,7 @@ fn retains_a_rooted_native_child_as_transient_foreground_evidence() {
         temp.path(),
         200,
         &stat(200, "node", 100, 200, 77, 34_817, 200, 20),
-        "/usr/bin/node",
+        &node_executable,
         b"node\0/opt/codex/bin/codex.js\0",
         "/tmp/work",
     );
@@ -282,7 +282,7 @@ fn retains_a_rooted_native_child_as_transient_foreground_evidence() {
         temp.path(),
         201,
         &stat(201, "codex", 200, 200, 77, 34_817, 200, 21),
-        "/opt/codex/vendor/codex",
+        &codex_executable,
         b"codex\0",
         "/tmp/work",
     );
@@ -290,18 +290,15 @@ fn retains_a_rooted_native_child_as_transient_foreground_evidence() {
 
     let observation = inspector
         .observe(&pane(PaneInitialProcess::DefaultShell {
-            executable: os("/bin/zsh"),
+            executable: os(ZSH),
         }))
         .unwrap();
     let PaneProcessObservation::Foreground(evidence) = observation else {
         panic!("expected a foreground command");
     };
-    assert!(
-        evidence
-            .command()
-            .executable()
-            .as_bytes()
-            .ends_with(b"/node")
+    assert_eq!(
+        evidence.command().executable().as_bytes(),
+        node_executable.as_os_str().as_encoded_bytes(),
     );
     assert_eq!(evidence.members().len(), 1);
     assert_eq!(evidence.members()[0].process_id(), 201);
@@ -312,11 +309,13 @@ fn supplies_opened_codex_session_metadata_to_the_resolver() {
     let temp = tempfile::tempdir().unwrap();
     let proc_root = temp.path().join("proc");
     fs::create_dir(&proc_root).unwrap();
+    let node_executable = fixture_executable(temp.path(), "node");
+    let codex_executable = fixture_executable(temp.path(), "codex");
     fake_process(
         &proc_root,
         100,
         &stat(100, "zsh", 1, 100, 77, 34_817, 200, 10),
-        "/bin/zsh",
+        Path::new(ZSH),
         b"zsh\0",
         "/tmp/work",
     );
@@ -324,7 +323,7 @@ fn supplies_opened_codex_session_metadata_to_the_resolver() {
         &proc_root,
         200,
         &stat(200, "node", 100, 200, 77, 34_817, 200, 20),
-        "/usr/bin/node",
+        &node_executable,
         b"node\0/opt/codex/bin/codex.js\0",
         "/tmp/work",
     );
@@ -332,7 +331,7 @@ fn supplies_opened_codex_session_metadata_to_the_resolver() {
         &proc_root,
         201,
         &stat(201, "codex", 200, 200, 77, 34_817, 200, 21),
-        "/opt/codex/vendor/codex",
+        &codex_executable,
         b"codex\0",
         "/tmp/work",
     );
@@ -358,7 +357,7 @@ fn supplies_opened_codex_session_metadata_to_the_resolver() {
 
     let PaneProcessObservation::Foreground(evidence) = inspector
         .observe(&pane(PaneInitialProcess::DefaultShell {
-            executable: os("/bin/zsh"),
+            executable: os(ZSH),
         }))
         .unwrap()
     else {
@@ -379,11 +378,12 @@ fn recognizes_codex_when_the_native_executable_is_held_open_after_unlink() {
     let temp = tempfile::tempdir().unwrap();
     let proc_root = temp.path().join("proc");
     fs::create_dir(&proc_root).unwrap();
+    let node_executable = fixture_executable(temp.path(), "node");
     fake_process(
         &proc_root,
         100,
         &stat(100, "zsh", 1, 100, 77, 34_817, 200, 10),
-        "/bin/zsh",
+        Path::new(ZSH),
         b"zsh\0",
         "/tmp/work",
     );
@@ -391,7 +391,7 @@ fn recognizes_codex_when_the_native_executable_is_held_open_after_unlink() {
         &proc_root,
         200,
         &stat(200, "node", 100, 200, 77, 34_817, 200, 20),
-        "/usr/bin/node",
+        &node_executable,
         b"node\0/opt/codex/bin/codex.js\0",
         "/tmp/work",
     );
@@ -399,7 +399,7 @@ fn recognizes_codex_when_the_native_executable_is_held_open_after_unlink() {
     fs::write(&native_path, b"held native image").unwrap();
     let native = File::open(&native_path).unwrap();
     fs::remove_file(&native_path).unwrap();
-    let held_path = format!("/proc/self/fd/{}", native.as_raw_fd());
+    let held_path = PathBuf::from(format!("/proc/self/fd/{}", native.as_raw_fd()));
     fake_process(
         &proc_root,
         201,
@@ -413,7 +413,7 @@ fn recognizes_codex_when_the_native_executable_is_held_open_after_unlink() {
             .unwrap()
             .as_os_str()
             .as_encoded_bytes(),
-        held_path.as_bytes(),
+        held_path.as_os_str().as_encoded_bytes(),
     );
 
     let session_id = "1d6381bf-01c5-4c4a-b725-8e376e5ad295";
@@ -438,7 +438,7 @@ fn recognizes_codex_when_the_native_executable_is_held_open_after_unlink() {
 
     let PaneProcessObservation::Foreground(evidence) = inspector
         .observe(&pane(PaneInitialProcess::DefaultShell {
-            executable: os("/bin/zsh"),
+            executable: os(ZSH),
         }))
         .unwrap()
     else {
@@ -470,11 +470,12 @@ fn supplies_exact_claude_process_metadata_to_the_resolver() {
     let temp = tempfile::tempdir().unwrap();
     let proc_root = temp.path().join("proc");
     fs::create_dir(&proc_root).unwrap();
+    let claude_executable = fixture_executable(temp.path(), "claude/versions/2.1.195");
     fake_process(
         &proc_root,
         100,
         &stat(100, "zsh", 1, 100, 77, 34_817, 200, 10),
-        "/bin/zsh",
+        Path::new(ZSH),
         b"zsh\0",
         "/tmp/work",
     );
@@ -482,7 +483,7 @@ fn supplies_exact_claude_process_metadata_to_the_resolver() {
         &proc_root,
         200,
         &stat(200, "claude", 100, 200, 77, 34_817, 200, 20),
-        "/home/user/.local/share/claude/versions/2.1.195",
+        &claude_executable,
         b"claude\0",
         "/tmp/work",
     );
@@ -509,7 +510,7 @@ fn supplies_exact_claude_process_metadata_to_the_resolver() {
 
     let PaneProcessObservation::Foreground(evidence) = inspector
         .observe(&pane(PaneInitialProcess::DefaultShell {
-            executable: os("/bin/zsh"),
+            executable: os(ZSH),
         }))
         .unwrap()
     else {
