@@ -61,6 +61,15 @@ state for each pane. Every selected server publishes into the same
 Selector values do not partition storage; restoring a non-latest capture uses
 its explicit immutable snapshot path.
 
+For a pane already classified as one exact Codex session, the same explicit
+snapshot invocation makes a best-effort capture of pending input from the
+currently visible supported composer. The capture is optional enrichment: an
+empty composer records nothing, and a changing, unsafe, oversized, or
+unsupported screen retains the exact Codex session recovery without prompt
+text. Hidden or scrolled-out portions are omitted, but a supported visible
+suffix may still be captured when the draft's start is above the visible grid.
+It never scans scrollback or a Codex transcript to fill in missing input.
+
 Snapshot capture is manual in v1. Scheduling, tmux hooks, and an internal daemon
 are deferred until the core capture API has proved useful.
 
@@ -88,6 +97,10 @@ Inspection is read-only. It does not contact tmux, inspect current processes,
 construct a restore plan, or preflight the current machine. Values remain
 complete and color is a redundant semantic aid rather than the only carrier of
 meaning.
+
+When a snapshot contains visible Codex pending input, inspection reports only
+its visible-row and byte counts. The text is never copied into the inspection
+view or terminal output.
 
 The portable default icon mode uses Unicode index markers; the optional Nerd
 mode uses Nerd Font Mono glyphs. A window containing exactly one pane is
@@ -140,6 +153,13 @@ cleanup evidence contracts are defined in
 [ARCHITECTURE.md](ARCHITECTURE.md). Once program recovery begins, the server is
 retained and independent panes are recovered on a best-effort basis.
 
+For a planned Codex recovery with captured pending input, execution first
+resumes and confirms the exact session normally. It then makes a fresh exact-
+session observation immediately before a guarded literal bracketed paste. The
+prompt is prepared without Enter. A changed session, missing pane, ownership
+loss, or paste failure sends no prompt input where it can be detected, retains
+the recovered server, and reports that pane as needing attention.
+
 ## Recovery Policy
 
 Automatic recovery uses the closed whitelist defined by
@@ -163,7 +183,8 @@ For each source tmux server, v1 preserves:
 - each session working directory;
 - ordered windows, source window indexes, and window names;
 - ordered panes, source pane indexes, and pane working directories; and
-- one typed recovery state per pane.
+- one typed recovery state per pane, including optional supported visible Codex
+  pending input for an exact Codex session.
 
 Window names are structural state and are restored. Session and pane working
 directories are independent; each restored pane explicitly uses its own
@@ -185,6 +206,16 @@ a fully proven owned destination can reach topology mutation or rollback;
 cleanup after an unconfirmed claim has its own narrower, cleanup-only proof.
 Commands are stored as structured argv and rendered for the target interactive
 shell only after validation.
+
+Captured Codex pending input is coupled to its exact session identity. Human
+inspection, restore plans, warnings, and results expose only counts or fixed
+status text, never the draft. Restore rechecks the exact session and pane before
+one no-Enter paste attempt; it does not submit, retry, or redirect the draft to
+a fallback command.
+
+Snapshot JSON, including captured pending input, is plaintext. State files are
+owner-only by default, but copied snapshots and backups remain sensitive and
+must be protected by the user.
 
 Failures are visible in progress logs and the final per-pane summary. A partial
 program recovery retains the new target server so the user can inspect it and
@@ -212,10 +243,13 @@ v1 does not:
 - restore active windows, active panes, attached clients, runtime pane or
   window ids, zoom state, or other tmux runtime state;
 - capture or restore environment variables;
-- persist pane titles, prompts, activity timestamps, transcript tails, or other
-  reminder metadata;
+- persist pane titles, shell prompts, activity timestamps, transcript tails, or
+  other reminder metadata;
 - capture or reconstruct process trees beyond the pane's foreground command;
-- restore scrollback, editor state, process memory, or unsaved terminal input;
+- restore scrollback, editor state, process memory, or hidden, scrolled-out, or
+  unsupported unsaved terminal input;
+- claim that a visible Codex suffix is the complete draft, recover input from an
+  unsupported renderer, or submit recovered pending input;
 - automatically run commands outside the whitelist;
 - provide JSON inspection output, filtering, sorting, collapsing, paging, an
   interactive TUI, ASCII connectors, or terminal-width-dependent truncation;

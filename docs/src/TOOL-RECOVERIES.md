@@ -35,7 +35,10 @@ The persisted automatic-recovery type is exactly:
 
 ```text
 AutomaticRecovery =
-  | Codex { session_id: CodexSessionId }
+  | Codex {
+      session_id: CodexSessionId,
+      prompt_area: Option<CapturedCodexPromptArea>
+    }
   | ClaudeCode { session_id: ClaudeSessionId }
   | MdBookServe { command: RecognizedMdBookServeCommand }
   | BookshelfServe { command: RecognizedBookshelfServeCommand }
@@ -43,9 +46,11 @@ AutomaticRecovery =
 
 The Codex and Claude variants derive their canonical resume argv from the
 validated session ID; no separately serialized command can disagree with that
-identity. The serve-command variants wrap a `CapturedCommand` only after their
-constructors prove the executable and argv rules in their sections. Raw JSON
-cannot construct any of these refined payloads directly.
+identity. The optional Codex prompt area is capture enrichment bound to that
+same variant, not command or identity evidence. The serve-command variants wrap
+a `CapturedCommand` only after their constructors prove the executable and argv
+rules in their sections. Raw JSON cannot construct any of these refined
+payloads directly.
 
 ## Shared Resolver Contract
 
@@ -123,10 +128,95 @@ unparseable required field prevent automatic recovery.
 resolver must not substitute it for `payload.id`, infer ownership from a
 generic app-server process, scan for the newest session, or use `--last`.
 
+### Visible Prompt Evidence
+
+After exact session resolution, an explicit snapshot may optionally read the
+current visible tmux grid. Codex 0.145.0 is the verified renderer baseline, not
+a runtime version gate. A compatible later renderer continues through the same
+visible grammar. Its primary frozen baseline evidence is a `132x40` pane with
+cursor `(9,37)` and this exact seven-row bottom suffix, whose five prompt rows
+yield the exact 49-byte captured prompt:
+
+```text
+» The test prompt for recovering.
+
+  Line 1.
+
+  Line 2.
+
+  gpt-5.6-sol ultra · ~/projects/tmux-rescue · main · Context 78% used · 258K window · Fast on · Approve for me · 2.55M used · Main…
+```
+
+Transcript rows above that suffix are not prompt input. The accepted composer
+rules are:
+
+- the pane is not in copy mode and, after the cursor row, has one-or-more blank
+  inset rows, one existing recognized footer, and zero-or-more blank terminal
+  rows;
+- the first prompt row begins with exactly `› ` or `» `; later nonempty rows
+  begin with exactly two ASCII spaces;
+- a draft, including a multiline draft, has its cursor on the final visible
+  prompt row at its rendered end, or on the accepted empty trailing
+  continuation at its two-cell textarea start;
+- the footer is either a configured status footer as classified below, a
+  default ASCII `0..100% context left` form with the supported
+  shortcut/queue/plan hints, or the supported narrow collapsed hint; and
+- an empty composer is proven only when the cursor is at cell two on its first
+  and only prompt row, every character of `› ` or `» ` is effectively
+  non-faint, and the nonempty suffix is entirely faint. The suffix text is
+  opaque to this classification; plain or partially faint text is an
+  unsupported layout rather than proven empty.
+
+A configured status footer requires the existing placement envelope plus
+either one complete high-trust signal or two distinct weak signal families.
+Complete Context N% used|left segments and a complete leading gpt- model
+selection are high trust. Later Model, Workspace, Accounting, Runtime, Git,
+and Identity forms are weak; repeated evidence from one family counts once.
+Exact instructional footers remain a separate production.
+
+The exact two-space indent and ` · ` separator are syntax, not votes. A
+recognized right-aligned Plan/IDE indicator is stripped only under exact text
+and geometry and contributes no trust. A terminal `…` and its entire incomplete
+segment contribute no evidence; `Context N% u…` and `Context N…` no longer
+succeed alone. Footer classification is identical for theme-colored, all-faint,
+and unstyled text; faintness proves only an empty composer. A single weak
+family, malformed value, or insufficient surviving evidence omits only
+`prompt_area`; exact session recovery remains available. Layout drift uses the
+version-neutral `visible pane does not match a supported Codex prompt layout`
+prompt-free warning while exact session recovery remains available.
+
+This best-effort rule avoids maintaining renderer suggestion strings. Its
+accepted cost is that a real one-line draft rendered entirely faint with the
+cursor at cell two can be omitted. Normal non-faint one-line drafts at their
+rendered end and multiline drafts remain prompt-capture candidates.
+
+The renderer-owned glyph and first space are removed from the first row; exactly
+two ASCII margin spaces are removed from nonempty continuation rows. Blank rows,
+visible soft-wrap boundaries, additional indentation, and a trailing empty
+prompt row are preserved. Source capture uses command-level `-N -T` so explicit
+trailing spaces are retained while unused terminal cells are omitted. Visible
+text such as
+`[Pasted Content 12345 chars]` is stored literally; tmux-rescue does not resolve
+or reconstruct the hidden pasted content behind that placeholder.
+
+This is a visible-suffix contract, not a completeness claim. A draft beginning
+above the current grid may yield only its visible suffix. Hidden, scrolled-out,
+popup-covered, copy-mode, unsafe, oversized, changing, or otherwise unsupported
+input is omitted. Such a failure retains the exact automatic Codex session
+recovery and emits only a prompt-free skip reason.
+
+Before attaching captured text, tmux-rescue re-observes the foreground process
+and requires the same exact Codex session ID that authorized the grid read. A
+different, unavailable, or no-longer-exact session drops only `prompt_area` with
+a fixed prompt-free warning; the initially resolved automatic recovery remains.
+
 ### Recovery Payload
 
 ```text
-AutomaticRecovery::Codex { session_id: CodexSessionId }
+AutomaticRecovery::Codex {
+  session_id: CodexSessionId,
+  prompt_area: Option<CapturedCodexPromptArea>
+}
 
 derived argv = ["codex", "resume", <session-id>]
 ```
@@ -137,6 +227,18 @@ absolute executable.
 After launch, `RecoveredAutomatically` requires a pane-tied Codex session file
 whose parsed `payload.id` equals the requested `CodexSessionId`. A foreground
 Codex process without exact identity confirmation becomes `NeedsAttention`.
+
+If the payload also contains a prompt area, the normal post-launch observation
+must first recover that exact session. Prompt preparation then performs a second
+fresh pane-tied classification and again requires the same exact
+`CodexSessionId`; the earlier settle result is not reusable authorization. Only
+that match permits one literal `set-buffer` plus bracketed
+`paste-buffer -d -p -r` into the exact retained pane. It sends no Enter and does
+not retry. A different session, missing pane, ownership loss, endpoint change,
+or failed paste sends no prompt input where detectable and produces a
+recovered-but-partial needs-attention result. The prompt text remains plaintext
+inside the owner-only snapshot and is never included in inspection, plan,
+warning, or result text.
 
 ## Claude Code
 

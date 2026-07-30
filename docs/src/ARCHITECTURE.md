@@ -166,6 +166,38 @@ CapturedCommand {
 `AutomaticRecovery` is a closed enum. Its members and payload contracts are
 defined only in [TOOL-RECOVERIES.md](TOOL-RECOVERIES.md).
 
+The optional Codex prompt-enrichment boundary is:
+
+```text
+RawCapturedCodexPromptArea {
+  text: String
+}
+
+RawAutomaticRecovery::Codex {
+  session_id: String,
+  prompt_area: Option<RawCapturedCodexPromptArea>
+}
+
+CapturedCodexPromptArea {
+  text: CapturedPromptText
+}
+
+CapturedPromptText = NonEmptyNonWhitespaceNoControlExceptLineFeedText<=16KiB
+```
+
+The raw prompt object denies unknown fields. Raw refinement constructs
+`CapturedPromptText`; it does not validate and retain the original `String`.
+The refined text permits line feed as its only control character, exposes
+visible-row and byte counts, and carries those guarantees downstream without
+rechecking raw text.
+
+`prompt_area` defaults to absent when reading and is omitted when absent on
+write. New readers therefore load existing Codex snapshots and serialize an
+unchanged prompt-free Codex value without adding the field. This is one-way
+reader compatibility: a prompt-bearing snapshot contains a new field that an
+older strict reader may reject. v1 still has no schema version, migration, or
+downgrade-writing contract.
+
 `CapturedCommand` preserves the executable identity and the complete observed
 argv, including `argv[0]`, with argument boundaries intact. `Executable` and
 `argv[0]` are nonempty operating-system strings; later argv elements may be
@@ -209,6 +241,8 @@ A validated snapshot guarantees:
 - every pane has exactly one `PaneRecovery` value;
 - manual recovery contains a complete, nonempty argv;
 - automatic recovery is a valid member of the closed whitelist;
+- an optional Codex prompt area contains at most 16 KiB of nonempty,
+  non-whitespace text with line feed as its only control character;
 - an unstable attempt count proves exhaustion of
   `MAX_TOPOLOGY_VALIDATION_ATTEMPTS`; and
 - reminder metadata, environment variables, shell identity, and layout data are
@@ -264,14 +298,18 @@ read topology_before
 -> compare topology fingerprints
 ```
 
-The topology fingerprint contains only the canonical ownership tree:
+The topology fingerprint contains the canonical ownership tree plus each
+capture-time pane identity:
 
 ```text
-session_name -> window_index -> pane_index
+session_name -> window_index -> (pane_index, TmuxPaneId)
 ```
 
 Working directories, window names, foreground processes, and recovery payloads
-are not part of topology equality.
+are not part of topology equality. `TmuxPaneId` is an ephemeral refined value
+of the form `%` followed by ASCII digits; it is not persisted as a durable
+snapshot identity. Including it in the capture fingerprint prevents a pane
+replacement at the same source coordinate from validating one attempt.
 
 Every started attempt consumes one unit of the policy limit. Its result is one
 of:
@@ -335,6 +373,85 @@ Automatic resolution uses the complete evidence contract in
 Capture reports unavailable pane data, resolver downgrades, and topology
 validation failures through typed events. The CLI renders those events; the
 core does not print.
+
+### Optional Codex Prompt Enrichment
+
+Visible prompt capture runs only after classification has produced
+`AutomaticRecovery::Codex` with one exact session ID and no prompt area. It is
+not attempted for other automatic variants, manual/unavailable panes, or a
+Codex-like pane that did not meet the identity rules.
+
+The source boundary returns only a refined `VisiblePaneGrid`. Its metadata
+contains the exact `TmuxPaneId`, nonzero width and height, an in-bounds cursor,
+and pane-mode state. Grid refinement requires valid UTF-8, one required final
+output delimiter, exactly `height` rows, no row control characters, and no row
+wider than the pane in terminal display cells.
+
+The real adapter performs this sequence with the same selected no-start tmux
+client each time:
+
+```text
+read (pane id, width, height, cursor, mode)
+-> tmux capture-pane -p -e -N -T -t <exact-pane-id>
+-> read (pane id, width, height, cursor, mode) again
+-> require identical metadata and the topology pane id
+-> refine VisiblePaneGrid
+```
+
+The visible-grid command deliberately has no `-J`, history `-S`/`-E`, or input
+operation. Command-level `-N -T` preserves explicit trailing spaces while
+omitting unused trailing cells, so row bytes, row boundaries, and blank-line
+boundaries remain intact. `visible_pane` consumes all admitted SGR, retains only
+private per-character faintness, and exposes refined plain rows plus one atomic
+proof; raw ANSI and generic style queries cannot cross the seam. The private
+Codex layout parser accepts only the renderer evidence in
+[TOOL-RECOVERIES.md](TOOL-RECOVERIES.md) through this refinement:
+
+```text
+VisiblePaneGrid
+  -> PositionedFooterCandidate
+  -> ConfiguredFooterEvidence
+  -> SupportedCodexFooter
+  -> Absent | CapturedCodexPromptArea | CodexPromptCaptureFailure
+```
+
+Private constructors enforce the placement envelope and high-or-two-distinct-low
+composition; callers cannot receive trust counts or recombine predicates.
+Configured evidence reads only refined plain rows, while the existing opaque
+faint-suffix proof remains local to empty-composer classification.
+
+A captured prompt area is not attachable immediately. Capture re-observes the
+foreground process after the grid read, refines it to the same exact Codex
+session ID, and constructs a private `SessionBoundCodexPromptCapture`. Callers
+can consume only that proof-bearing pair. An unavailable, non-Codex,
+conflicting, or different-session closing observation drops the prompt area
+without replacing the initially classified automatic recovery.
+
+Read, metadata, layout, unsafe-text, prompt-size, and closing-session failures
+emit one typed, coordinate-scoped skip event while preserving prompt-free
+automatic Codex session recovery. Diagnostics are bounded and never retain
+captured rows. If optional prompt areas alone make the complete raw candidate
+exceed the existing aggregate snapshot limit, capture removes all prompt areas
+in memory, emits one `snapshot size budget exceeded` skip event per affected
+pane, and validates the same prompt-free candidate. A candidate that remains
+oversized fails under the existing snapshot-size rule.
+
+Malformed or unsupported SGR fails optional prompt enrichment with a fixed
+prompt-free diagnostic while exact session recovery remains available.
+
+#### Maintaining renderer evidence
+
+1. Keep one read-only captured compatibility fixture for each observed Codex
+   update.
+2. Do not branch or rename the policy when the existing grammar accepts that
+   fixture.
+3. A new signal requires a family assignment, position rule, deduplication
+   proof, and positive, collision, malformed, reordered, and truncated
+   fixtures.
+4. Add a distinct private policy only for an incompatible layout with
+   separately recognizable invariants.
+5. Add no runtime version dispatch, config reader, registry, numeric score, or
+   generic renderer abstraction.
 
 ## Snapshot Storage Contract
 
@@ -467,6 +584,12 @@ directories are always present; exact byte equality with the containing
 session path is rendered as the session-working-directory reference marker
 (`cwd = ◆`).
 
+For a prompt-bearing Codex pane, the private view stores only
+`PendingInputCounts { visible_rows, bytes }` derived during view construction.
+It renders `pending input  N visible rows · M bytes` after the session ID and
+never retains or renders `CapturedPromptText`. The program aggregates are
+unchanged by optional prompt enrichment.
+
 `termtree` owns recursive connector geometry only. Private display types own
 node content, ordered aggregation, command boundaries, and cwd compression.
 Lossless operating-system values preserve printable Unicode, visibly escape
@@ -556,11 +679,7 @@ RestorePlan {
 
 PlannedPaneAction =
   | LeaveIdle { directory: ResolvedDirectory }
-  | LaunchAutomatic {
-      directory: ExistingRecordedDirectory,
-      input: LaunchableShellInput,
-      expected: AutomaticRecoveryExpectation
-    }
+  | LaunchAutomatic(PlannedAutomaticLaunch)
   | PasteManualHint {
       directory: ResolvedDirectory,
       input: RenderedShellInput
@@ -574,6 +693,17 @@ PlannedPaneAction =
       directory: ResolvedDirectory,
       reason: CapturedRecoveryUnavailable
     }
+
+PlannedAutomaticLaunch {
+  directory: ExistingRecordedDirectory,
+  input: LaunchableShellInput,
+  expected: AutomaticRecoveryExpectation,
+  codex_prompt: Option<PlannedCodexPromptPaste>
+}
+
+PlannedCodexPromptPaste {
+  input: CapturedCodexPromptArea
+}
 ```
 
 `ResolvedDirectory` retains whether it is the recorded directory or a named
@@ -587,6 +717,19 @@ available executable in an existing recorded directory. `RestorePlan` and its
 actions are opaque products of planning; execution cannot reconstruct an action
 from raw snapshot fields. The plan contains no parallel absolute destination
 identity and no destination-availability capability.
+
+`PlannedAutomaticLaunch` and `PlannedCodexPromptPaste` have private fields and
+no public constructors. One post-preflight constructor matches the same
+`AutomaticRecovery` once to derive both the recovery expectation and optional
+Codex prompt, so a prompt cannot be paired with a different session or another
+automatic variant. Directory or executable fallback returns before this
+constructor and therefore drops optional prompt input structurally. Execution
+can obtain a Codex prompt only as the matched `(CodexSessionId,
+CapturedCodexPromptArea)` pair.
+
+Human plan rendering exposes only `after recovery  paste N visible rows without
+Enter`; it does not include prompt bytes. Inspection separately reports the
+visible-row and byte counts. Neither surface renders the text.
 
 The first plan line renders the exact stored selector:
 
@@ -776,15 +919,40 @@ executor observes the pane using the whitelist variant's recovery expectation:
   and
 - a missing pane or observation failure is a local failure.
 
+When that observation reports the exact recovered Codex session and the opaque
+launch also carries a prompt, the executor invokes one separate required
+`paste_codex_prompt_area` operation. The target does not reuse the settle
+observation. It freshly observes and classifies the retained pane, requires the
+same exact `CodexSessionId`, and only then constructs an owner-token-scoped,
+uniquely suffixed buffer. One tmux conditional rechecks the complete owned
+server identity, pane liveness, and the retained pane PID, then runs exactly:
+
+```text
+set-buffer -b <unique-buffer> -- <exact-prompt-bytes>
+paste-buffer -d -p -r -b <unique-buffer> -t <exact-pane-id>
+```
+
+This running-pane guard deliberately omits the shell-current-command clause
+used by all pre-launch input: the exact recovered Codex process, not the shell,
+must be foreground. Prompt preparation sends no `send-keys`, Enter, retry, or
+settle delay. A fresh session mismatch sends no tmux input. A missing pane,
+ownership or endpoint change, failed conditional, or observation failure
+returns a typed prompt-paste failure and does not redirect the text to a shell
+or automatic fallback. A later existence check treats the pane as present only
+when the exact selected probe returns the retained refined `TmuxPaneId`.
+
 This is a best-effort v1 input boundary, not an atomic Linux process lock: tmux
 cannot include foreground PID and process-start identity in the same predicate
 that sends pane input. A foreground transition that occurs in the scheduling
 gap and is indistinguishable by pane PID and command basename can evade the
 second check. The planned shell or automatic executable can likewise be
 replaced after its last file-identity check and before tmux receives the input.
-v1 keeps these gaps small, never reuses an earlier capture-time observation,
-and logs any detectable refusal; eliminating the residual races requires a
-stronger future tmux or process-control capability.
+Prompt preparation has the same non-atomic observation limit between its fresh
+exact-session process observation and the tmux-side owned-pane condition; tmux
+does not expose an atomic predicate for the Codex session ID or composer state.
+v1 keeps these gaps small, never reuses an earlier capture-time or settle
+observation for prompt input, and logs any detectable refusal; eliminating the
+residual races requires a stronger future tmux or process-control capability.
 
 ### Restore Outcomes
 
@@ -793,6 +961,8 @@ Per-pane execution outcomes are:
 ```text
 RestoredIdleShell
 RecoveredAutomatically
+RecoveredAutomaticallyWithPromptPrepared
+RecoveredAutomaticallyWithPromptNeedsAttention(CodexPromptPasteFailure)
 PreparedManualHint
 PreparedAutomaticFallbackHint(AutomaticFallbackReason)
 AutomaticLaunchFailedHintPrepared
@@ -803,10 +973,12 @@ NeedsAttention(AttentionReason)
 including unavailable captured recovery data, a blocked process gate, and a
 missing target pane. Planned manual hints are normal completion. An unavailable
 pane, failed automatic recovery, automatic recovery downgraded during
-preflight, any plan degradation, unexpected foreground process, or missing
-pane makes the overall execution partial. Overall execution also records the
-observed `TargetDisposition`; it never infers retained or removed state from
-the attempted operation alone.
+preflight, prompt preparation needing attention, any plan degradation,
+unexpected foreground process, or missing pane makes the overall execution
+partial. Successful prompt preparation is complete. Prompt failure does not
+stop later panes. Overall execution also records the observed
+`TargetDisposition`; it never infers retained or removed state from the
+attempted operation alone.
 
 Snapshot CLI outcomes are:
 
@@ -878,6 +1050,16 @@ Recovery text is sent literally, and Enter is a separate operation. Manual and
 fallback hints cannot contain embedded Enter or uncontrolled terminal
 sequences. Logs escape unsafe control data.
 
+Captured prompt text is intentionally plaintext snapshot data but is private to
+the capture/model/plan/execution path. Capture failures and warnings contain
+only bounded reasons, inspection owns counts rather than text, plan output owns
+only a row count, and restore results use fixed or bounded prompt-free labels.
+No diagnostic, `Debug` failure, inspect document, plan, progress warning, or
+result line may echo the draft. The raw prompt object, refined prompt text, and
+visible-row carriers own redacted or count-only `Debug` implementations, so
+outer snapshot, capture, plan, and restore types may derive `Debug` without
+re-exposing their text.
+
 Restore never mutates an existing target server, never creates a missing
 working directory, and never removes a server it cannot prove it created.
 
@@ -912,6 +1094,14 @@ Core tests use fake external capabilities to verify:
   every source command;
 - idle, automatic, manual, and unavailable pane classification;
 - rejection of incoherent or cross-variant automatic payloads;
+- optional Codex prompt backward loading, strict prompt refinement, omitted
+  absent-field serialization, and diagnostic privacy;
+- exact visible-grid metadata/row refinement, terminal-cell widths, stable
+  metadata fencing, pane-ID replacement detection, and no-join source capture;
+- supported Codex renderer parsing, configured-footer evidence composition,
+  style independence, terminal truncation, cross-version compatibility
+  fixtures, absent/unsupported handling, and optional aggregate-size fallback
+  without loss of session recovery;
 - missing-directory and missing-executable planned actions and degradation
   provenance;
 - deterministic `TargetShell` selection across planning and execution;
@@ -928,6 +1118,9 @@ Core tests use fake external capabilities to verify:
 - best-effort pane continuation after recovery begins;
 - a foreground-process change during guarded input, with no input sent;
 - exact automatic identity or serve-command confirmation after launch;
+- opaque same-variant Codex session/prompt planning, count-only inspect/plan
+  output, fresh exact-session prompt verification, literal multiline paste
+  without Enter, and typed no-input failures;
 - hint pasting without Enter only through the guarded input operation; and
 - typed outcome and exit-status mapping.
 
@@ -954,5 +1147,8 @@ Real-tmux integration tests create uniquely addressed temporary `-L` and `-S`
 servers and temporary state directories. They exercise exact selector
 pass-through for snapshot and restore, global-latest selection, source-path
 fallback, and protection of an existing server's process, sessions, topology,
-and options after claim-token mismatch. They run serially and never inspect,
+and options after claim-token mismatch. Isolated mechanics tests also retain the
+approved seven-row Codex suffix and blank rows through the real visible-grid
+read without `-J`, and paste the exact multiline prompt into a controlled
+bracketed-paste target without submission. They run serially and never inspect,
 mutate, or target the user's default tmux server.

@@ -1,25 +1,34 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
-use std::sync::Mutex;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tmux_rescue::{
-    AttentionReason, GuardedPaneFailure, GuardedPaneOperation, LosslessOsString,
-    PaneProcessObservation, PaneProcessProbe, PaneRestoreOutcome, PlanningExecutable,
-    ProcessInspectionFailure, RecordedAbsolutePath, RestoreEnvironment, RestoreEnvironmentFailure,
-    RestoreExecutionFailure, RestoreExecutor, RestorePlan, RestoreRunStatus,
-    RestoreTargetCapability, RestoreTargetState, RollbackOutcome, TargetDisposition, TargetShell,
-    TmuxRestoreAdapter, TmuxSelector, TopologyPane, ValidatedSnapshot, plan_restore,
+    AttentionReason, AutomaticPaneObservation, AutomaticRecovery, AutomaticRecoveryExpectation,
+    CapturedCodexPromptArea, CapturedCommand, CodexPromptPasteFailure, CodexSessionId,
+    GuardedPaneFailure, GuardedPaneOperation, LosslessOsString, OpenedCodexSessionFile,
+    PaneProcessObservation, PaneProcessProbe, PaneRecovery, PaneRestoreOutcome,
+    PaneTiedForegroundEvidence, PlanningExecutable, ProcessInspectionFailure, RecordedAbsolutePath,
+    RestoreEnvironment, RestoreEnvironmentFailure, RestoreExecutionFailure, RestoreExecutor,
+    RestorePlan, RestoreRunStatus, RestoreTargetCapability, RestoreTargetState, RollbackOutcome,
+    TargetDisposition, TargetShell, TmuxRestoreAdapter, TmuxSelector, TopologyPane,
+    ValidatedSnapshot, plan_restore,
 };
 
 static ISOLATED_TMUX_TEST: Mutex<()> = Mutex::new(());
+const CODEX_SESSION_A: &str = "018f8f15-2e24-7a8a-a5c0-bf32e04c45be";
+const CODEX_SESSION_B: &str = "a27834ae-6192-4287-a005-86063335c28e";
+const CODEX_PROMPT_TEXT: &str = "The test prompt for recovering.\n\nLine 1.\n\nLine 2.";
 
 fn encoded(value: &str) -> Value {
     json!({"encoding": "utf8", "value": value})
@@ -81,6 +90,26 @@ fn automatic_mdbook_pane(
     })
 }
 
+fn automatic_codex_pane(
+    source_index: u32,
+    working_directory: &Path,
+    session_id: &str,
+    prompt: &str,
+) -> Value {
+    json!({
+        "source_index": source_index,
+        "working_directory": encoded_path(working_directory),
+        "recovery": {
+            "kind": "automatic",
+            "recovery": {
+                "kind": "codex",
+                "session_id": session_id,
+                "prompt_area": {"text": prompt}
+            }
+        }
+    })
+}
+
 fn window(source_index: u32, name: &str, panes: Vec<Value>) -> Value {
     json!({
         "source_index": source_index,
@@ -110,6 +139,7 @@ fn snapshot(source: &Path, sessions: Vec<Value>) -> ValidatedSnapshot {
 struct PlanningEnvironment {
     home: RecordedAbsolutePath,
     executables: HashMap<Vec<u8>, Vec<u8>>,
+    target_shell: PathBuf,
 }
 
 impl PlanningEnvironment {
@@ -118,7 +148,13 @@ impl PlanningEnvironment {
             home: RecordedAbsolutePath::try_from_bytes(home.as_os_str().as_bytes().to_vec())
                 .unwrap(),
             executables: HashMap::new(),
+            target_shell: PathBuf::from("/bin/sh"),
         }
+    }
+
+    fn with_target_shell(mut self, target_shell: &Path) -> Self {
+        self.target_shell = target_shell.to_owned();
+        self
     }
 
     fn with_executable(mut self, command: &Path) -> Self {
@@ -131,7 +167,7 @@ impl PlanningEnvironment {
 
 impl RestoreEnvironment for PlanningEnvironment {
     fn target_shell(&self) -> Result<TargetShell, RestoreEnvironmentFailure> {
-        TargetShell::try_from_bytes(b"/bin/sh".to_vec())
+        TargetShell::try_from_bytes(self.target_shell.as_os_str().as_bytes().to_vec())
             .map_err(|error| RestoreEnvironmentFailure::new(error.to_string()))
     }
 
@@ -230,6 +266,37 @@ struct TargetCommandContext {
 
 struct AlwaysIdleProbe;
 
+type ObservationAction = (usize, Box<dyn Fn(&TopologyPane)>);
+
+struct ScriptedCodexProbe {
+    session_ids: Mutex<VecDeque<&'static str>>,
+    observations: Arc<AtomicUsize>,
+    after_observation: Option<ObservationAction>,
+}
+
+impl ScriptedCodexProbe {
+    fn new(session_ids: impl IntoIterator<Item = &'static str>) -> (Self, Arc<AtomicUsize>) {
+        let observations = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                session_ids: Mutex::new(session_ids.into_iter().collect()),
+                observations: Arc::clone(&observations),
+                after_observation: None,
+            },
+            observations,
+        )
+    }
+
+    fn after_observation(
+        mut self,
+        observation_number: usize,
+        action: impl Fn(&TopologyPane) + 'static,
+    ) -> Self {
+        self.after_observation = Some((observation_number, Box::new(action)));
+        self
+    }
+}
+
 impl PaneProcessProbe for AlwaysIdleProbe {
     fn observe(
         &self,
@@ -237,6 +304,105 @@ impl PaneProcessProbe for AlwaysIdleProbe {
     ) -> Result<PaneProcessObservation, ProcessInspectionFailure> {
         Ok(PaneProcessObservation::Idle)
     }
+}
+
+impl PaneProcessProbe for ScriptedCodexProbe {
+    fn observe(
+        &self,
+        pane: &TopologyPane,
+    ) -> Result<PaneProcessObservation, ProcessInspectionFailure> {
+        let session_id = self
+            .session_ids
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("test script supplies one session per process observation");
+        let observation = codex_observation(pane, session_id);
+        let observation_number = self.observations.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some((expected_number, action)) = &self.after_observation
+            && observation_number == *expected_number
+        {
+            action(pane);
+        }
+        Ok(observation)
+    }
+}
+
+fn lossless(value: &str) -> LosslessOsString {
+    LosslessOsString::try_from_bytes(value.as_bytes().to_vec()).unwrap()
+}
+
+fn codex_observation(pane: &TopologyPane, session_id: &str) -> PaneProcessObservation {
+    let process_id = 12_345;
+    let tty = pane.process_anchor().pane_tty().clone();
+    let command =
+        CapturedCommand::try_new(lossless("/usr/bin/codex"), vec![lossless("codex")]).unwrap();
+    let session_file = OpenedCodexSessionFile::try_new(
+        process_id,
+        8,
+        42,
+        RecordedAbsolutePath::try_from_bytes(
+            format!("/home/user/.codex/sessions/2026/07/25/rollout-{session_id}.jsonl")
+                .into_bytes(),
+        )
+        .unwrap(),
+        serde_json::to_vec(&json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "originator": "codex-tui",
+                "thread_source": "user",
+                "cwd": pane.working_directory().as_os_str().to_str().unwrap(),
+                "parent_thread_id": null
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let evidence = PaneTiedForegroundEvidence::try_new(
+        command,
+        pane.working_directory().clone(),
+        tty.clone(),
+        tty,
+        process_id,
+        process_id,
+        process_id,
+        99,
+    )
+    .unwrap()
+    .with_codex_session_evidence(
+        RecordedAbsolutePath::try_from_bytes(b"/home/user/.codex/sessions".to_vec()).unwrap(),
+        vec![session_file],
+    )
+    .unwrap();
+    PaneProcessObservation::Foreground(Box::new(evidence))
+}
+
+fn codex_prompt_fixture(
+    temp: &Path,
+    session_id: &str,
+    prompt: &str,
+) -> (CodexSessionId, CapturedCodexPromptArea) {
+    let snapshot = snapshot(
+        &temp.join("source.sock"),
+        vec![session(
+            "codex-fixture",
+            temp,
+            vec![window(
+                0,
+                "codex-fixture",
+                vec![automatic_codex_pane(0, temp, session_id, prompt)],
+            )],
+        )],
+    );
+    let PaneRecovery::Automatic(AutomaticRecovery::Codex {
+        session_id,
+        prompt_area: Some(prompt),
+    }) = snapshot.sessions()[0].windows()[0].panes()[0].recovery()
+    else {
+        panic!("expected a Codex prompt fixture");
+    };
+    (session_id.clone(), prompt.clone())
 }
 
 impl Drop for TargetCommandContext {
@@ -293,7 +459,7 @@ fn install_logging_tmux_proxy(temp: &Path) -> (PathBuf, Vec<EnvironmentGuard>) {
     let executable = bin.join("tmux");
     fs::write(
         &executable,
-        b"#!/bin/sh\nprintf 'COMMAND\n' >> \"$FAKE_TMUX_LOG\"\nexec \"$REAL_TMUX\" \"$@\"\n",
+        b"#!/bin/sh\nfor arg do printf '%s\\000' \"$arg\"; done >> \"$FAKE_TMUX_LOG\"\nexec \"$REAL_TMUX\" \"$@\"\n",
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -309,6 +475,223 @@ fn install_logging_tmux_proxy(temp: &Path) -> (PathBuf, Vec<EnvironmentGuard>) {
         EnvironmentGuard::set("REAL_TMUX", &real_tmux),
     ];
     (log, guards)
+}
+
+struct BlockedPromptProxyLogs {
+    input: PathBuf,
+    pane_probe: PathBuf,
+}
+
+fn install_blocked_prompt_proxy(
+    temp: &Path,
+    selector: &TmuxSelector,
+    target_pane: &str,
+    remove_pane: bool,
+) -> (BlockedPromptProxyLogs, Vec<EnvironmentGuard>) {
+    let real_tmux = std::env::split_paths(std::env::var_os("PATH").as_deref().unwrap_or_default())
+        .map(|directory| directory.join("tmux"))
+        .find(|candidate| candidate.is_file())
+        .expect("tmux is installed");
+    let bin = temp.join(if remove_pane {
+        "remove-pane-proxy-bin"
+    } else {
+        "retain-pane-proxy-bin"
+    });
+    fs::create_dir(&bin).unwrap();
+    let executable = bin.join("tmux");
+    fs::write(
+        &executable,
+        br#"#!/bin/sh
+case " $* " in
+  *' display-message '*)
+    for arg do printf '%s\000' "$arg"; done >> "$PANE_PROBE_LOG"
+    ;;
+  *' if-shell '*)
+    output=$("$REAL_TMUX" "$@")
+    status=$?
+    case "$output" in
+      TMUX_RESCUE_INPUT_BLOCKED_*)
+        if [ "$REMOVE_BLOCKED_PANE" = 1 ]; then
+          "$REAL_TMUX" -u -N "$TEST_SELECTOR_FLAG" "$TEST_SELECTOR_VALUE" set-option -s exit-empty off >/dev/null || exit 97
+          "$REAL_TMUX" -u -N "$TEST_SELECTOR_FLAG" "$TEST_SELECTOR_VALUE" kill-pane -t "$TEST_TARGET_PANE" >/dev/null || exit 98
+        fi
+        ;;
+      *) printf 'INPUT_EXECUTED\n' >> "$PROMPT_PROXY_LOG" ;;
+    esac
+    if [ -n "$output" ]; then printf '%s\n' "$output"; fi
+    exit "$status"
+    ;;
+esac
+exec "$REAL_TMUX" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let input_log = temp.join(if remove_pane {
+        "remove-pane-proxy.log"
+    } else {
+        "retain-pane-proxy.log"
+    });
+    let pane_probe_log = temp.join(if remove_pane {
+        "remove-pane-probe.log"
+    } else {
+        "retain-pane-probe.log"
+    });
+    let old_path = std::env::var_os("PATH");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        old_path.as_deref().unwrap_or(OsStr::new("")),
+    )))
+    .unwrap();
+    let guards = vec![
+        EnvironmentGuard::set("PATH", &path),
+        EnvironmentGuard::set("REAL_TMUX", &real_tmux),
+        EnvironmentGuard::set("TEST_SELECTOR_FLAG", selector.flag()),
+        EnvironmentGuard::set("TEST_SELECTOR_VALUE", selector.value()),
+        EnvironmentGuard::set("TEST_TARGET_PANE", target_pane),
+        EnvironmentGuard::set("REMOVE_BLOCKED_PANE", if remove_pane { "1" } else { "0" }),
+        EnvironmentGuard::set("PROMPT_PROXY_LOG", &input_log),
+        EnvironmentGuard::set("PANE_PROBE_LOG", &pane_probe_log),
+    ];
+    (
+        BlockedPromptProxyLogs {
+            input: input_log,
+            pane_probe: pane_probe_log,
+        },
+        guards,
+    )
+}
+
+struct PromptPasteRaceLogs {
+    buffer_created: PathBuf,
+}
+
+fn install_prompt_paste_race_proxy(
+    temp: &Path,
+    selector: &TmuxSelector,
+    target_pane: &str,
+    replace_owner: bool,
+) -> (PromptPasteRaceLogs, Vec<EnvironmentGuard>) {
+    let real_tmux = std::env::split_paths(std::env::var_os("PATH").as_deref().unwrap_or_default())
+        .map(|directory| directory.join("tmux"))
+        .find(|candidate| candidate.is_file())
+        .expect("tmux is installed");
+    let bin = temp.join(if replace_owner {
+        "reowned-paste-race-proxy-bin"
+    } else {
+        "paste-race-proxy-bin"
+    });
+    fs::create_dir(&bin).unwrap();
+    let executable = bin.join("tmux");
+    fs::write(
+        &executable,
+        br#"#!/bin/sh
+if [ ! -e "$PROMPT_RACE_DONE" ]; then
+  case " $* " in
+    *' if-shell '*)
+      condition=$9
+      commands=${10}
+      blocked=${11}
+      set_command=${commands%% ; *}
+      "$REAL_TMUX" -u -N "$TEST_SELECTOR_FLAG" "$TEST_SELECTOR_VALUE" if-shell -F -t "$TEST_TARGET_PANE" "$condition" "$set_command" "$blocked" || exit 96
+      "$REAL_TMUX" -u -N "$TEST_SELECTOR_FLAG" "$TEST_SELECTOR_VALUE" list-buffers -F '#{buffer_name}' > "$PROMPT_RACE_BUFFER_LOG" || exit 97
+      test -s "$PROMPT_RACE_BUFFER_LOG" || exit 98
+      : > "$PROMPT_RACE_DONE"
+      if [ "$REPLACE_PROMPT_OWNER" = 1 ]; then
+        "$REAL_TMUX" -u -N "$TEST_SELECTOR_FLAG" "$TEST_SELECTOR_VALUE" set-option -s @tmux_rescue_owner replacement-owner >/dev/null || exit 99
+      fi
+      "$REAL_TMUX" -u -N "$TEST_SELECTOR_FLAG" "$TEST_SELECTOR_VALUE" kill-pane -t "$TEST_TARGET_PANE" >/dev/null || exit 100
+      case "$commands" in
+        *' ; '*)
+          paste_command=${commands#* ; }
+          exec "$REAL_TMUX" -u -N "$TEST_SELECTOR_FLAG" "$TEST_SELECTOR_VALUE" if-shell -F -t "$TEST_TARGET_PANE" 1 "$paste_command" ""
+          ;;
+        *) exit 0 ;;
+      esac
+      ;;
+  esac
+fi
+exec "$REAL_TMUX" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let buffer_created = temp.join(if replace_owner {
+        "reowned-buffer-created.log"
+    } else {
+        "buffer-created.log"
+    });
+    let done = temp.join(if replace_owner {
+        "reowned-paste-race.done"
+    } else {
+        "paste-race.done"
+    });
+    let old_path = std::env::var_os("PATH");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        old_path.as_deref().unwrap_or(OsStr::new("")),
+    )))
+    .unwrap();
+    let guards = vec![
+        EnvironmentGuard::set("PATH", &path),
+        EnvironmentGuard::set("REAL_TMUX", &real_tmux),
+        EnvironmentGuard::set("TEST_SELECTOR_FLAG", selector.flag()),
+        EnvironmentGuard::set("TEST_SELECTOR_VALUE", selector.value()),
+        EnvironmentGuard::set("TEST_TARGET_PANE", target_pane),
+        EnvironmentGuard::set("PROMPT_RACE_BUFFER_LOG", &buffer_created),
+        EnvironmentGuard::set("PROMPT_RACE_DONE", &done),
+        EnvironmentGuard::set(
+            "REPLACE_PROMPT_OWNER",
+            if replace_owner { "1" } else { "0" },
+        ),
+    ];
+    (PromptPasteRaceLogs { buffer_created }, guards)
+}
+
+fn nul_framed_arguments(path: &Path) -> Vec<Vec<u8>> {
+    let bytes = fs::read(path).unwrap_or_default();
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    assert_eq!(bytes.last(), Some(&0));
+    bytes[..bytes.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+fn parse_tmux_command_list(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
+    let mut commands = vec![Vec::new()];
+    let mut cursor = 0;
+    while cursor < input.len() {
+        assert_eq!(input[cursor], b'"', "argument must start with a quote");
+        cursor += 1;
+        let mut argument = Vec::new();
+        while input.get(cursor) != Some(&b'"') {
+            assert_eq!(input.get(cursor), Some(&b'\\'));
+            let octal = input
+                .get(cursor + 1..cursor + 4)
+                .expect("quoted byte must have three octal digits");
+            assert!(octal.iter().all(|byte| matches!(byte, b'0'..=b'7')));
+            let value = octal
+                .iter()
+                .fold(0_u8, |value, digit| value * 8 + (digit - b'0'));
+            argument.push(value);
+            cursor += 4;
+        }
+        cursor += 1;
+        commands.last_mut().unwrap().push(argument);
+        if cursor == input.len() {
+            break;
+        }
+        if input[cursor..].starts_with(b" ; ") {
+            commands.push(Vec::new());
+            cursor += 3;
+        } else {
+            assert_eq!(input.get(cursor), Some(&b' '));
+            cursor += 1;
+        }
+    }
+    assert!(commands.iter().all(|command| !command.is_empty()));
+    commands
 }
 
 fn install_claim_evidence_tmux(
@@ -1296,6 +1679,816 @@ fn endpoint_replacement_before_recovery_input_dispatches_no_tmux_command() {
         fs::read(&log_path).unwrap_or_default(),
         b"",
         "recovery input reached the replacement endpoint"
+    );
+}
+
+#[test]
+fn changed_codex_identity_dispatches_no_tmux_input() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("changed-codex-identity.sock");
+    let plan = single_pane_plan(temp.path(), target_selector(&socket));
+    let (session_id, prompt) = codex_prompt_fixture(
+        temp.path(),
+        CODEX_SESSION_A,
+        "draft line\nsecond line: \u{4f60}\u{597d}",
+    );
+    let expected = AutomaticRecoveryExpectation::Codex(session_id.clone());
+    let (probe, observations) = ScriptedCodexProbe::new([CODEX_SESSION_A, CODEX_SESSION_B]);
+    let _server = IsolatedServerGuard::for_socket(&socket);
+    let mut adapter = TmuxRestoreAdapter::with_process_probe(probe);
+    let mut owned = adapter
+        .claim(plan.destination(), plan.target_shell())
+        .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+    owned
+        .create_topology(&plan)
+        .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    let coordinate = plan.panes()[0].coordinate().clone();
+    let mut recovery = owned.begin_recovery();
+
+    assert_eq!(
+        recovery.observe_automatic(&coordinate, &expected),
+        AutomaticPaneObservation::Recovered
+    );
+    let (log_path, _proxy) = install_logging_tmux_proxy(temp.path());
+
+    let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
+
+    assert_eq!(result, Err(CodexPromptPasteFailure::SessionMismatch));
+    assert_eq!(observations.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read(&log_path).unwrap_or_default(),
+        b"",
+        "changed Codex identity dispatched tmux input"
+    );
+}
+
+#[test]
+fn disabled_pane_input_rejects_prompt_paste_without_writing() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("disabled-prompt-input.sock");
+    let selector = target_selector(&socket);
+    let plan = single_pane_plan(temp.path(), selector.clone());
+    let (session_id, prompt) = codex_prompt_fixture(
+        temp.path(),
+        CODEX_SESSION_A,
+        "disabled pane must not receive this sensitive prompt",
+    );
+    let expected = AutomaticRecoveryExpectation::Codex(session_id.clone());
+    let (probe, observations) = ScriptedCodexProbe::new([CODEX_SESSION_A, CODEX_SESSION_A]);
+    let _server = IsolatedServerGuard::for_socket(&socket);
+    let mut adapter = TmuxRestoreAdapter::with_process_probe(probe);
+    let mut owned = adapter
+        .claim(plan.destination(), plan.target_shell())
+        .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+    owned
+        .create_topology(&plan)
+        .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    let coordinate = plan.panes()[0].coordinate().clone();
+    let mut recovery = owned.begin_recovery();
+    assert_eq!(
+        recovery.observe_automatic(&coordinate, &expected),
+        AutomaticPaneObservation::Recovered
+    );
+    let target_pane = String::from_utf8(selected_tmux_stdout(
+        &selector,
+        &["display-message", "-p", "-t", "planned:0.0", "#{pane_id}"],
+    ))
+    .unwrap();
+    let target_pane = target_pane.trim_end();
+    require_success(
+        "disable exact pane input",
+        selected_tmux(&selector, true)
+            .args(["select-pane", "-d", "-t", target_pane])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        selected_tmux_stdout(
+            &selector,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                target_pane,
+                "#{pane_input_off}"
+            ],
+        ),
+        b"1\n"
+    );
+
+    let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
+    let captured = selected_tmux_stdout(&selector, &["capture-pane", "-p", "-t", target_pane]);
+
+    assert_eq!(observations.load(Ordering::SeqCst), 2);
+    assert!(
+        !captured
+            .windows(prompt.text().as_str().len())
+            .any(|bytes| bytes == prompt.text().as_str().as_bytes()),
+        "disabled pane received the recovered prompt"
+    );
+    assert_eq!(result, Err(CodexPromptPasteFailure::InputDisabled));
+}
+
+#[test]
+fn pane_exit_between_buffer_creation_and_paste_cleans_the_unique_buffer() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("prompt-paste-pane-exit.sock");
+    let selector = target_selector(&socket);
+    let plan = single_pane_plan(temp.path(), selector.clone());
+    let (session_id, prompt) = codex_prompt_fixture(
+        temp.path(),
+        CODEX_SESSION_A,
+        "pane exit must not leave this sensitive prompt buffered",
+    );
+    let expected = AutomaticRecoveryExpectation::Codex(session_id.clone());
+    let (probe, observations) = ScriptedCodexProbe::new([CODEX_SESSION_A, CODEX_SESSION_A]);
+    let _server = IsolatedServerGuard::for_socket(&socket);
+    let mut adapter = TmuxRestoreAdapter::with_process_probe(probe);
+    let mut owned = adapter
+        .claim(plan.destination(), plan.target_shell())
+        .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+    owned
+        .create_topology(&plan)
+        .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    let coordinate = plan.panes()[0].coordinate().clone();
+    let mut recovery = owned.begin_recovery();
+    assert_eq!(
+        recovery.observe_automatic(&coordinate, &expected),
+        AutomaticPaneObservation::Recovered
+    );
+    let target_pane = String::from_utf8(selected_tmux_stdout(
+        &selector,
+        &["display-message", "-p", "-t", "planned:0.0", "#{pane_id}"],
+    ))
+    .unwrap();
+    let target_pane = target_pane.trim_end();
+    require_success(
+        "create keepalive pane for prompt-paste race",
+        selected_tmux(&selector, true)
+            .args(["split-window", "-d", "-t", target_pane])
+            .output()
+            .unwrap(),
+    );
+    let (race_logs, _proxy) =
+        install_prompt_paste_race_proxy(temp.path(), &selector, target_pane, false);
+
+    let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
+    let buffers = selected_tmux(&selector, true)
+        .args(["list-buffers", "-F", "#{buffer_name}"])
+        .output()
+        .unwrap();
+    let created_buffer = fs::read(&race_logs.buffer_created).unwrap();
+    let created_buffer = created_buffer
+        .strip_suffix(b"\n")
+        .expect("buffer proof has one line");
+
+    assert_eq!(observations.load(Ordering::SeqCst), 2);
+    assert!(created_buffer.starts_with(b"tmux-rescue-"));
+    assert!(!created_buffer.contains(&b'\n'));
+    assert!(
+        !buffers
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .any(|buffer| buffer == created_buffer),
+        "exact prompt buffer survived failed paste: {}",
+        String::from_utf8_lossy(created_buffer)
+    );
+    assert_eq!(result, Err(CodexPromptPasteFailure::PasteFailed));
+}
+
+#[test]
+fn cleanup_refuses_a_reowned_server_and_surfaces_cleanup_failure() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("prompt-buffer-reowned.sock");
+    let selector = target_selector(&socket);
+    let plan = single_pane_plan(temp.path(), selector.clone());
+    let (session_id, prompt) = codex_prompt_fixture(
+        temp.path(),
+        CODEX_SESSION_A,
+        "replacement owner must retain this same-named buffer",
+    );
+    let expected = AutomaticRecoveryExpectation::Codex(session_id.clone());
+    let (probe, observations) = ScriptedCodexProbe::new([CODEX_SESSION_A, CODEX_SESSION_A]);
+    let _server = IsolatedServerGuard::for_socket(&socket);
+    let mut adapter = TmuxRestoreAdapter::with_process_probe(probe);
+    let mut owned = adapter
+        .claim(plan.destination(), plan.target_shell())
+        .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+    owned
+        .create_topology(&plan)
+        .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    let coordinate = plan.panes()[0].coordinate().clone();
+    let mut recovery = owned.begin_recovery();
+    assert_eq!(
+        recovery.observe_automatic(&coordinate, &expected),
+        AutomaticPaneObservation::Recovered
+    );
+    let target_pane = String::from_utf8(selected_tmux_stdout(
+        &selector,
+        &["display-message", "-p", "-t", "planned:0.0", "#{pane_id}"],
+    ))
+    .unwrap();
+    let target_pane = target_pane.trim_end();
+    require_success(
+        "create keepalive pane for reowned prompt-paste race",
+        selected_tmux(&selector, true)
+            .args(["split-window", "-d", "-t", target_pane])
+            .output()
+            .unwrap(),
+    );
+    let (race_logs, _proxy) =
+        install_prompt_paste_race_proxy(temp.path(), &selector, target_pane, true);
+
+    let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
+    let buffers = selected_tmux(&selector, true)
+        .args(["list-buffers", "-F", "#{buffer_name}"])
+        .output()
+        .unwrap();
+    let created_buffer = fs::read(&race_logs.buffer_created).unwrap();
+    let created_buffer = created_buffer
+        .strip_suffix(b"\n")
+        .expect("buffer proof has one line");
+
+    assert_eq!(observations.load(Ordering::SeqCst), 2);
+    assert!(created_buffer.starts_with(b"tmux-rescue-"));
+    assert!(!created_buffer.contains(&b'\n'));
+    assert_eq!(
+        selected_tmux_stdout(&selector, &["show-options", "-sv", "@tmux_rescue_owner"],),
+        b"replacement-owner\n"
+    );
+    assert!(
+        buffers
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .any(|buffer| buffer == created_buffer),
+        "cleanup deleted the exact buffer after target ownership changed"
+    );
+    assert_eq!(result, Err(CodexPromptPasteFailure::CleanupFailed));
+}
+
+#[test]
+fn endpoint_replacement_before_prompt_paste_dispatches_no_tmux_input() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("replaced-before-prompt-paste.sock");
+    let selector = target_selector(&socket);
+    let plan = single_pane_plan(temp.path(), selector.clone());
+    let (session_id, prompt) = codex_prompt_fixture(
+        temp.path(),
+        CODEX_SESSION_A,
+        "replacement must not receive this input",
+    );
+    let expected = AutomaticRecoveryExpectation::Codex(session_id.clone());
+    let (probe, observations) = ScriptedCodexProbe::new([CODEX_SESSION_A, CODEX_SESSION_A]);
+    let _server = IsolatedServerGuard::for_socket(&socket);
+    let mut adapter = TmuxRestoreAdapter::with_process_probe(probe);
+    let mut owned = adapter
+        .claim(plan.destination(), plan.target_shell())
+        .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+    owned
+        .create_topology(&plan)
+        .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    let coordinate = plan.panes()[0].coordinate().clone();
+    let mut recovery = owned.begin_recovery();
+    assert_eq!(
+        recovery.observe_automatic(&coordinate, &expected),
+        AutomaticPaneObservation::Recovered
+    );
+
+    let original_server_pid = String::from_utf8(selected_tmux_stdout(
+        &selector,
+        &["display-message", "-p", "#{pid}"],
+    ))
+    .unwrap()
+    .trim()
+    .parse::<u32>()
+    .unwrap();
+    require_success(
+        "stop original owned server",
+        selected_tmux(&selector, true)
+            .arg("kill-server")
+            .output()
+            .unwrap(),
+    );
+    let original_process = PathBuf::from(format!("/proc/{original_server_pid}"));
+    let process_exit_deadline = Instant::now() + Duration::from_secs(2);
+    while original_process.exists() && Instant::now() < process_exit_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !original_process.exists(),
+        "original owned server process did not exit before replacement"
+    );
+    if socket.exists() {
+        fs::remove_file(&socket).unwrap();
+    }
+    let _replacement = SelectedServerGuard::start_preexisting(selector, temp.path());
+    let (log_path, _proxy) = install_logging_tmux_proxy(temp.path());
+
+    let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
+
+    assert_eq!(result, Err(CodexPromptPasteFailure::PasteFailed));
+    assert_eq!(observations.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read(&log_path).unwrap_or_default(),
+        b"",
+        "prompt input reached the replacement endpoint"
+    );
+}
+
+#[test]
+fn blocked_prompt_guard_reports_the_exact_identity_race_without_input() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("blocked-prompt-guard.sock");
+    let selector = target_selector(&socket);
+    let plan = single_pane_plan(temp.path(), selector.clone());
+    let (session_id, prompt) = codex_prompt_fixture(
+        temp.path(),
+        CODEX_SESSION_A,
+        "blocked owner must not receive this input",
+    );
+    let expected = AutomaticRecoveryExpectation::Codex(session_id.clone());
+    let owner_selector = selector.clone();
+    let (probe, observations) = ScriptedCodexProbe::new([CODEX_SESSION_A, CODEX_SESSION_A]);
+    let probe = probe.after_observation(2, move |_| {
+        require_success(
+            "replace the owner after fresh Codex observation",
+            selected_tmux(&owner_selector, true)
+                .args([
+                    "set-option",
+                    "-s",
+                    "@tmux_rescue_owner",
+                    "replacement-owner",
+                ])
+                .output()
+                .unwrap(),
+        );
+    });
+    let _server = IsolatedServerGuard::for_socket(&socket);
+    let mut adapter = TmuxRestoreAdapter::with_process_probe(probe);
+    let mut owned = adapter
+        .claim(plan.destination(), plan.target_shell())
+        .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+    owned
+        .create_topology(&plan)
+        .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    let coordinate = plan.panes()[0].coordinate().clone();
+    let mut recovery = owned.begin_recovery();
+    assert_eq!(
+        recovery.observe_automatic(&coordinate, &expected),
+        AutomaticPaneObservation::Recovered
+    );
+    let target_pane = String::from_utf8(selected_tmux_stdout(
+        &selector,
+        &["display-message", "-p", "-t", "planned:0.0", "#{pane_id}"],
+    ))
+    .unwrap();
+    let (logs, _proxy) =
+        install_blocked_prompt_proxy(temp.path(), &selector, target_pane.trim_end(), false);
+
+    let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
+
+    assert_eq!(result, Err(CodexPromptPasteFailure::PasteFailed));
+    assert_eq!(observations.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read(&logs.input).unwrap_or_default(),
+        b"",
+        "the blocked conditional executed prompt input"
+    );
+    assert_eq!(
+        nul_framed_arguments(&logs.pane_probe),
+        vec![
+            b"-u".to_vec(),
+            b"-N".to_vec(),
+            selector.flag().as_bytes().to_vec(),
+            selector.value().as_bytes().to_vec(),
+            b"display-message".to_vec(),
+            b"-p".to_vec(),
+            b"-t".to_vec(),
+            target_pane.trim_end().as_bytes().to_vec(),
+            b"#{pane_id}".to_vec(),
+        ]
+    );
+}
+
+#[test]
+fn pane_removed_after_blocked_prompt_guard_reports_pane_missing() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("removed-after-blocked-prompt-guard.sock");
+    let selector = target_selector(&socket);
+    let plan = single_pane_plan(temp.path(), selector.clone());
+    let (session_id, prompt) = codex_prompt_fixture(
+        temp.path(),
+        CODEX_SESSION_A,
+        "removed pane must not receive this input",
+    );
+    let expected = AutomaticRecoveryExpectation::Codex(session_id.clone());
+    let owner_selector = selector.clone();
+    let (probe, observations) = ScriptedCodexProbe::new([CODEX_SESSION_A, CODEX_SESSION_A]);
+    let probe = probe.after_observation(2, move |_| {
+        require_success(
+            "replace the owner after fresh Codex observation",
+            selected_tmux(&owner_selector, true)
+                .args([
+                    "set-option",
+                    "-s",
+                    "@tmux_rescue_owner",
+                    "replacement-owner",
+                ])
+                .output()
+                .unwrap(),
+        );
+    });
+    let _server = IsolatedServerGuard::for_socket(&socket);
+    let mut adapter = TmuxRestoreAdapter::with_process_probe(probe);
+    let mut owned = adapter
+        .claim(plan.destination(), plan.target_shell())
+        .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+    owned
+        .create_topology(&plan)
+        .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    require_success(
+        "create an unrelated keepalive pane",
+        selected_tmux(&selector, true)
+            .args(["split-window", "-d", "-t", "planned:0.0"])
+            .output()
+            .unwrap(),
+    );
+    let coordinate = plan.panes()[0].coordinate().clone();
+    let mut recovery = owned.begin_recovery();
+    assert_eq!(
+        recovery.observe_automatic(&coordinate, &expected),
+        AutomaticPaneObservation::Recovered
+    );
+    let target_pane = String::from_utf8(selected_tmux_stdout(
+        &selector,
+        &["display-message", "-p", "-t", "planned:0.0", "#{pane_id}"],
+    ))
+    .unwrap();
+    let (logs, proxy) =
+        install_blocked_prompt_proxy(temp.path(), &selector, target_pane.trim_end(), true);
+
+    let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
+
+    assert_eq!(result, Err(CodexPromptPasteFailure::PaneMissing));
+    assert_eq!(observations.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read(&logs.input).unwrap_or_default(),
+        b"",
+        "the blocked conditional executed prompt input"
+    );
+    assert_eq!(
+        nul_framed_arguments(&logs.pane_probe),
+        vec![
+            b"-u".to_vec(),
+            b"-N".to_vec(),
+            selector.flag().as_bytes().to_vec(),
+            selector.value().as_bytes().to_vec(),
+            b"display-message".to_vec(),
+            b"-p".to_vec(),
+            b"-t".to_vec(),
+            target_pane.trim_end().as_bytes().to_vec(),
+            b"#{pane_id}".to_vec(),
+        ]
+    );
+    drop(proxy);
+    let remaining_panes =
+        selected_tmux_stdout(&selector, &["list-panes", "-a", "-F", "#{pane_id}"]);
+    assert!(
+        remaining_panes
+            .split(|byte| *byte == b'\n')
+            .all(|pane_id| pane_id != target_pane.trim_end().as_bytes()),
+        "the exact isolated pane remained after successful kill-pane"
+    );
+    let exact_pane_probe = selected_tmux(&selector, true)
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            target_pane.trim_end(),
+            "#{pane_id}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        exact_pane_probe.status.success(),
+        "tmux rejected the explicit dead-pane probe instead of returning its blank result: {}",
+        String::from_utf8_lossy(&exact_pane_probe.stderr)
+    );
+    assert_eq!(
+        exact_pane_probe.stdout,
+        b"\n",
+        "the explicit dead-pane probe did not return tmux's blank identity: {}",
+        String::from_utf8_lossy(&exact_pane_probe.stdout)
+    );
+}
+
+#[test]
+fn fresh_codex_identity_is_checked_after_settle_observation() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("fresh-codex-identity.sock");
+    let selector = target_selector(&socket);
+    let plan = single_pane_plan(temp.path(), selector.clone());
+    let (session_id, prompt) = codex_prompt_fixture(
+        temp.path(),
+        CODEX_SESSION_A,
+        "draft line\nsecond line: \u{4f60}\u{597d}",
+    );
+    let expected = AutomaticRecoveryExpectation::Codex(session_id.clone());
+    let (probe, observations) = ScriptedCodexProbe::new([CODEX_SESSION_A, CODEX_SESSION_A]);
+    let _server = IsolatedServerGuard::for_socket(&socket);
+    let mut adapter = TmuxRestoreAdapter::with_process_probe(probe);
+    let mut owned = adapter
+        .claim(plan.destination(), plan.target_shell())
+        .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+    owned
+        .create_topology(&plan)
+        .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    require_success(
+        "start a non-shell foreground process",
+        selected_tmux(&selector, true)
+            .args(["send-keys", "-t", "planned:0.0", "sleep 30", "Enter"])
+            .output()
+            .unwrap(),
+    );
+    let foreground_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let current = selected_tmux_stdout(
+            &selector,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "planned:0.0",
+                "#{pane_current_command}",
+            ],
+        );
+        if current == b"sleep\n" {
+            break;
+        }
+        assert!(
+            Instant::now() < foreground_deadline,
+            "foreground process did not become sleep: {}",
+            String::from_utf8_lossy(&current)
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let coordinate = plan.panes()[0].coordinate().clone();
+    let mut recovery = owned.begin_recovery();
+    assert_eq!(
+        recovery.observe_automatic(&coordinate, &expected),
+        AutomaticPaneObservation::Recovered
+    );
+    let target_pane = String::from_utf8(selected_tmux_stdout(
+        &selector,
+        &["display-message", "-p", "-t", "planned:0.0", "#{pane_id}"],
+    ))
+    .unwrap();
+    let target_pane = target_pane.trim_end();
+    let (log_path, _proxy) = install_logging_tmux_proxy(temp.path());
+
+    let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(observations.load(Ordering::SeqCst), 2);
+    let arguments = nul_framed_arguments(&log_path);
+    assert_eq!(arguments.len(), 11, "expected one exact tmux client call");
+    assert_eq!(arguments[0], b"-u");
+    assert_eq!(arguments[1], b"-N");
+    assert_eq!(arguments[2], selector.flag().as_bytes());
+    assert_eq!(arguments[3], selector.value().as_bytes());
+    assert_eq!(arguments[4], b"if-shell");
+    assert_eq!(arguments[5], b"-F");
+    assert_eq!(arguments[6], b"-t");
+    assert_eq!(arguments[7], target_pane.as_bytes());
+
+    let blocked = parse_tmux_command_list(&arguments[10]);
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].len(), 3);
+    assert_eq!(blocked[0][0], b"display-message");
+    assert_eq!(blocked[0][1], b"-p");
+    let owner_token = blocked[0][2]
+        .strip_prefix(b"TMUX_RESCUE_INPUT_BLOCKED_")
+        .expect("blocked marker carries the owner token");
+    assert_eq!(owner_token.len(), 64);
+    assert!(owner_token.iter().all(u8::is_ascii_hexdigit));
+    let owner_condition = [b"#{==:#{@tmux_rescue_owner},".as_slice(), owner_token, b"}"].concat();
+    assert!(
+        arguments[8]
+            .windows(owner_condition.len())
+            .any(|bytes| bytes == owner_condition)
+    );
+    assert!(
+        !arguments[8]
+            .windows(b"pane_current_command".len())
+            .any(|bytes| bytes == b"pane_current_command")
+    );
+
+    let commands = parse_tmux_command_list(&arguments[9]);
+    assert_eq!(commands.len(), 2, "prompt paste has exactly two commands");
+    let buffer_prefix = [b"tmux-rescue-".as_slice(), owner_token, b"-"].concat();
+    let buffer_name = &commands[0][2];
+    let unique_suffix = buffer_name
+        .strip_prefix(buffer_prefix.as_slice())
+        .expect("buffer name is scoped by the owner token");
+    assert_eq!(unique_suffix.len(), 32);
+    assert!(unique_suffix.iter().all(u8::is_ascii_hexdigit));
+    assert_eq!(
+        commands,
+        vec![
+            vec![
+                b"set-buffer".to_vec(),
+                b"-b".to_vec(),
+                buffer_name.clone(),
+                b"--".to_vec(),
+                prompt.text().as_str().as_bytes().to_vec(),
+            ],
+            vec![
+                b"paste-buffer".to_vec(),
+                b"-d".to_vec(),
+                b"-p".to_vec(),
+                b"-r".to_vec(),
+                b"-b".to_vec(),
+                buffer_name.clone(),
+                b"-t".to_vec(),
+                target_pane.as_bytes().to_vec(),
+            ],
+        ]
+    );
+    assert!(commands.iter().flatten().all(|argument| {
+        argument.as_slice() != b"Enter" && argument.as_slice() != b"send-keys"
+    }));
+}
+
+#[test]
+fn multiline_codex_prompt_is_pasted_literally_without_submission_on_a_real_target() {
+    let _tmux_test = ISOLATED_TMUX_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("multiline-prompt-target.sock");
+    let selector = target_selector(&socket);
+    let session_directory = create_directory(temp.path(), "prompt-session");
+    let pane_directory = create_directory(temp.path(), "prompt-pane");
+    let snapshot = snapshot(
+        &temp.path().join("source.sock"),
+        vec![session(
+            "prompt-target",
+            &session_directory,
+            vec![window(
+                0,
+                "prompt target",
+                vec![idle_pane(0, &pane_directory)],
+            )],
+        )],
+    );
+    let environment =
+        PlanningEnvironment::new(temp.path()).with_target_shell(Path::new("/bin/bash"));
+    let plan = plan_restore(&snapshot, Some(selector.clone()), &environment).unwrap();
+    let (session_id, prompt) =
+        codex_prompt_fixture(temp.path(), CODEX_SESSION_A, CODEX_PROMPT_TEXT);
+    let (probe, observations) = ScriptedCodexProbe::new([CODEX_SESSION_A]);
+    let _server = IsolatedServerGuard::for_socket(&socket);
+    let mut adapter = TmuxRestoreAdapter::with_process_probe(probe);
+    let mut owned = adapter
+        .claim(plan.destination(), plan.target_shell())
+        .unwrap_or_else(|failure| panic!("claim setup failed: {failure}"));
+    owned
+        .create_topology(&plan)
+        .unwrap_or_else(|failure| panic!("topology setup failed: {failure}"));
+    require_success(
+        "start a controlled bracketed-paste shell",
+        selected_tmux(&selector, true)
+            .args([
+                "send-keys",
+                "-t",
+                "prompt-target:0.0",
+                "exec /bin/bash --noprofile --norc -i",
+                "Enter",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let shell_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let current = selected_tmux_stdout(
+            &selector,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "prompt-target:0.0",
+                "#{pane_current_command}",
+            ],
+        );
+        if current == b"bash\n" {
+            break;
+        }
+        assert!(
+            Instant::now() < shell_deadline,
+            "controlled shell did not become bash: {}",
+            String::from_utf8_lossy(&current)
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    require_success(
+        "set a unique test prompt and clear the visible pane",
+        selected_tmux(&selector, true)
+            .args([
+                "send-keys",
+                "-t",
+                "prompt-target:0.0",
+                "PS1=$(printf 'tmux-rescue-paste-test\\044 '); printf '\\033[2J\\033[H'",
+                "Enter",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let prompt_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let captured = tmux_stdout(&socket, &["capture-pane", "-p", "-t", "prompt-target:0.0"]);
+        if captured
+            .windows(b"tmux-rescue-paste-test$".len())
+            .any(|window| window == b"tmux-rescue-paste-test$")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < prompt_deadline,
+            "controlled shell prompt was not rendered: {}",
+            String::from_utf8_lossy(&captured)
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let coordinate = plan.panes()[0].coordinate().clone();
+    let mut recovery = owned.begin_recovery();
+
+    let result = recovery.paste_codex_prompt_area(&coordinate, &session_id, &prompt);
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(observations.load(Ordering::SeqCst), 1);
+    let paste_deadline = Instant::now() + Duration::from_secs(2);
+    let captured = loop {
+        let captured = String::from_utf8(tmux_stdout(
+            &socket,
+            &["capture-pane", "-p", "-t", "prompt-target:0.0"],
+        ))
+        .unwrap();
+        if captured.contains("Line 2.") {
+            break captured;
+        }
+        assert!(
+            Instant::now() < paste_deadline,
+            "multiline prompt was not rendered: {captured:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        captured.contains(&format!("tmux-rescue-paste-test$ {CODEX_PROMPT_TEXT}")),
+        "multiline prompt bytes or row boundaries changed: {captured:?}"
+    );
+    assert_eq!(
+        captured.matches("tmux-rescue-paste-test$").count(),
+        1,
+        "the multiline input was submitted: {captured:?}"
+    );
+    assert_eq!(
+        String::from_utf8(selected_tmux_stdout(
+            &selector,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "prompt-target:0.0",
+                "#{pane_current_command}",
+            ],
+        ))
+        .unwrap()
+        .trim(),
+        "bash"
     );
 }
 

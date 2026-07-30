@@ -4,6 +4,8 @@ use std::process::Command;
 use serde_json::json;
 use tmux_rescue::{SnapshotPublication, StateStore, ValidatedSnapshot};
 
+const CODEX_PROMPT_TEXT: &str = "The test prompt for recovering.\n\nLine 1.\n\nLine 2.";
+
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tmux-rescue"))
 }
@@ -110,6 +112,71 @@ fn explicit_inspect_renders_nerd_icons_for_a_compact_single_pane_window() {
     assert!(stdout.ends_with(
         "◆ work · 1 window · 1 pane\n   /workspace\n└─  0 editor ›  0 shell\n       = ◆\n"
     ));
+}
+
+#[test]
+fn explicit_inspect_reports_pending_input_counts_without_echoing_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let snapshot = temp.path().join("snapshot.json");
+    let mut fixture = inspect_fixture(json!({"kind": "stable"}));
+    fixture["sessions"][0]["windows"][0]["panes"][0]["recovery"] = json!({
+        "kind": "automatic",
+        "recovery": {
+            "kind": "codex",
+            "session_id": "019f7ac5-a55c-7e70-8b31-872ae70c9a94",
+            "prompt_area": {"text": CODEX_PROMPT_TEXT},
+        },
+    });
+    std::fs::write(&snapshot, serde_json::to_vec(&fixture).unwrap()).unwrap();
+
+    let plain = binary()
+        .arg("inspect")
+        .arg(&snapshot)
+        .args(["--color", "never"])
+        .output()
+        .unwrap();
+    let colored = binary()
+        .arg("inspect")
+        .arg(&snapshot)
+        .args(["--color", "always"])
+        .output()
+        .unwrap();
+
+    assert_eq!(plain.status.code(), Some(0));
+    assert_eq!(colored.status.code(), Some(0));
+    assert!(plain.stderr.is_empty());
+    assert!(colored.stderr.is_empty());
+    assert!(
+        plain
+            .stdout
+            .windows(CODEX_PROMPT_TEXT.len())
+            .all(|window| window != CODEX_PROMPT_TEXT.as_bytes())
+    );
+    assert!(
+        colored
+            .stdout
+            .windows(CODEX_PROMPT_TEXT.len())
+            .all(|window| window != CODEX_PROMPT_TEXT.as_bytes())
+    );
+    assert!(
+        plain
+            .stderr
+            .windows(CODEX_PROMPT_TEXT.len())
+            .all(|window| window != CODEX_PROMPT_TEXT.as_bytes())
+    );
+    assert!(
+        colored
+            .stderr
+            .windows(CODEX_PROMPT_TEXT.len())
+            .all(|window| window != CODEX_PROMPT_TEXT.as_bytes())
+    );
+    let stdout = String::from_utf8(plain.stdout.clone()).unwrap();
+    assert!(stdout.contains(concat!(
+        "      session 019f7ac5-a55c-7e70-8b31-872ae70c9a94\n",
+        "      pending input  5 visible rows · 49 bytes\n",
+        "      cwd = ◆\n",
+    )));
+    assert_eq!(strip_ansi(&colored.stdout), plain.stdout);
 }
 
 #[test]

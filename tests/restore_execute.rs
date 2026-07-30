@@ -5,8 +5,9 @@ use std::rc::Rc;
 use serde_json::{Value, json};
 use tmux_rescue::{
     AttentionReason, AutomaticFallbackReason, AutomaticPaneObservation,
-    AutomaticRecoveryExpectation, GuardedPaneFailure, GuardedPaneOperation, GuardedPaneResult,
-    LosslessOsString, OwnedRestoreTarget, PaneRestoreOutcome, PaneRestoreResult,
+    AutomaticRecoveryExpectation, CapturedCodexPromptArea, CodexPromptPasteFailure,
+    CodexPromptPasteResult, CodexSessionId, GuardedPaneFailure, GuardedPaneOperation,
+    GuardedPaneResult, LosslessOsString, OwnedRestoreTarget, PaneRestoreOutcome, PaneRestoreResult,
     PlanningExecutable, RecordedAbsolutePath, RecoveryRestoreTarget, RestoreDestination,
     RestoreEnvironment, RestoreEnvironmentFailure, RestoreExecutionFailure, RestoreExecutor,
     RestorePlan, RestoreRunResult, RestoreRunStatus, RestoreTargetCapability, RestoreTargetState,
@@ -50,6 +51,21 @@ fn automatic_pane(index: u32, session_id: &str) -> Value {
             "recovery": {
                 "kind": "codex",
                 "session_id": session_id
+            }
+        }
+    })
+}
+
+fn automatic_pane_with_prompt(index: u32, session_id: &str, prompt: &str) -> Value {
+    json!({
+        "source_index": index,
+        "working_directory": encoded(&format!("/workspace/pane-{index}")),
+        "recovery": {
+            "kind": "automatic",
+            "recovery": {
+                "kind": "codex",
+                "session_id": session_id,
+                "prompt_area": {"text": prompt}
             }
         }
     })
@@ -160,6 +176,13 @@ struct SentInput {
     submit: SubmitInput,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PastedCodexPrompt {
+    pane: SourcePaneCoordinate,
+    expected: CodexSessionId,
+    input: CapturedCodexPromptArea,
+}
+
 #[derive(Default)]
 struct TargetLog {
     events: Vec<&'static str>,
@@ -171,6 +194,7 @@ struct TargetLog {
     guarded_attempts: Vec<SourcePaneCoordinate>,
     sent_inputs: Vec<SentInput>,
     automatic_observations: Vec<(SourcePaneCoordinate, AutomaticRecoveryExpectation)>,
+    pasted_codex_prompts: Vec<PastedCodexPrompt>,
     disposition_observations: usize,
 }
 
@@ -180,6 +204,7 @@ struct TargetScript {
     rollback_outcome: RollbackOutcome,
     guarded_results: VecDeque<GuardedPaneResult>,
     automatic_results: VecDeque<AutomaticPaneObservation>,
+    prompt_paste_results: VecDeque<CodexPromptPasteResult>,
     final_disposition: TargetDisposition,
 }
 
@@ -191,6 +216,7 @@ impl TargetScript {
             rollback_outcome: RollbackOutcome::Removed,
             guarded_results: VecDeque::new(),
             automatic_results: VecDeque::new(),
+            prompt_paste_results: VecDeque::new(),
             final_disposition: TargetDisposition::Retained,
         }
     }
@@ -236,6 +262,7 @@ impl RestoreTargetCapability for FakeTarget {
             recovery: FakeRecoveryTarget {
                 guarded_results: script.guarded_results,
                 automatic_results: script.automatic_results,
+                prompt_paste_results: script.prompt_paste_results,
                 final_disposition: script.final_disposition,
                 log: Rc::clone(&self.log),
             },
@@ -282,6 +309,7 @@ impl OwnedRestoreTarget for FakeOwnedTarget {
 struct FakeRecoveryTarget {
     guarded_results: VecDeque<GuardedPaneResult>,
     automatic_results: VecDeque<AutomaticPaneObservation>,
+    prompt_paste_results: VecDeque<CodexPromptPasteResult>,
     final_disposition: TargetDisposition,
     log: Rc<RefCell<TargetLog>>,
 }
@@ -298,7 +326,11 @@ impl RecoveryRestoreTarget for FakeRecoveryTarget {
             .pop_front()
             .expect("test script supplies one result per guarded attempt");
         let mut log = self.log.borrow_mut();
-        log.events.push("guarded");
+        log.events.push(match operation {
+            GuardedPaneOperation::VerifyShell => "verify_shell",
+            GuardedPaneOperation::PasteLiteral { .. } => "paste_literal",
+            GuardedPaneOperation::LaunchAutomatic { .. } => "launch_automatic",
+        });
         log.guarded_attempts.push(pane.clone());
         if result.is_ok() {
             let input = match operation {
@@ -334,6 +366,25 @@ impl RecoveryRestoreTarget for FakeRecoveryTarget {
         self.automatic_results
             .pop_front()
             .expect("test script supplies one result per automatic observation")
+    }
+
+    fn paste_codex_prompt_area(
+        &mut self,
+        pane: &SourcePaneCoordinate,
+        expected: &CodexSessionId,
+        input: &CapturedCodexPromptArea,
+    ) -> CodexPromptPasteResult {
+        let mut log = self.log.borrow_mut();
+        log.events.push("paste_codex_prompt_area");
+        log.pasted_codex_prompts.push(PastedCodexPrompt {
+            pane: pane.clone(),
+            expected: expected.clone(),
+            input: input.clone(),
+        });
+        drop(log);
+        self.prompt_paste_results
+            .pop_front()
+            .expect("test script supplies one result per Codex prompt paste")
     }
 
     fn observe_disposition(&mut self) -> TargetDisposition {
@@ -526,13 +577,13 @@ fn guarded_input_preflight_automatic_fallback_is_literal_and_has_no_enter() {
 }
 
 #[test]
-fn guarded_input_automatic_launch_submits_a_separate_enter_and_confirms_identity() {
+fn automatic_recovery_without_prompt_retains_its_existing_outcome() {
     let plan = plan_with(
         vec![automatic_pane(0, "1d6381bf-01c5-4c4a-b725-8e376e5ad295")],
         &[b"codex"],
     );
     let expected = match plan.panes()[0].action() {
-        tmux_rescue::PlannedPaneAction::LaunchAutomatic { expected, .. } => expected.clone(),
+        tmux_rescue::PlannedPaneAction::LaunchAutomatic(launch) => launch.expectation().clone(),
         action => panic!("expected automatic launch, got {action:?}"),
     };
     let mut script = TargetScript::successful();
@@ -558,6 +609,170 @@ fn guarded_input_automatic_launch_submits_a_separate_enter_and_confirms_identity
         log.automatic_observations,
         [(coordinate(0), expected)],
         "post-launch observation must use the plan's exact recovery identity"
+    );
+}
+
+#[test]
+fn recovered_codex_prepares_prompt_without_enter_after_fresh_identity_check() {
+    const SESSION_ID: &str = "1d6381bf-01c5-4c4a-b725-8e376e5ad295";
+    const PROMPT: &str = "Review the recovery plan.\nKeep the input pending.";
+    let plan = plan_with(
+        vec![automatic_pane_with_prompt(0, SESSION_ID, PROMPT)],
+        &[b"codex"],
+    );
+    let mut script = TargetScript::successful();
+    script.guarded_results.push_back(Ok(()));
+    script
+        .automatic_results
+        .push_back(AutomaticPaneObservation::Recovered);
+    script.prompt_paste_results.push_back(Ok(()));
+
+    let (result, log) = execute(plan, script);
+
+    assert_eq!(result.status(), RestoreRunStatus::Complete);
+    assert_eq!(
+        pane_result(&result, 0).outcome(),
+        &PaneRestoreOutcome::RecoveredAutomaticallyWithPromptPrepared
+    );
+    let log = log.borrow();
+    assert_eq!(
+        log.events,
+        [
+            "claim",
+            "topology",
+            "begin_recovery",
+            "launch_automatic",
+            "observe_automatic",
+            "paste_codex_prompt_area",
+            "observe_disposition",
+        ],
+        "pending input is pasted only after automatic recovery settles to the expected identity"
+    );
+    assert_eq!(
+        log.sent_inputs.len(),
+        1,
+        "the prompt is not submitted as shell input"
+    );
+    assert_eq!(log.sent_inputs[0].submit, SubmitInput::SeparateEnter);
+    assert_eq!(log.pasted_codex_prompts.len(), 1);
+    assert_eq!(log.pasted_codex_prompts[0].pane, coordinate(0));
+    assert_eq!(
+        log.pasted_codex_prompts[0].expected.as_uuid().to_string(),
+        SESSION_ID
+    );
+    assert_eq!(log.pasted_codex_prompts[0].input.text().as_str(), PROMPT);
+}
+
+#[test]
+fn prompt_preparation_failure_is_partial_and_later_panes_continue() {
+    const SESSION_ID: &str = "1d6381bf-01c5-4c4a-b725-8e376e5ad295";
+    let failures = [
+        CodexPromptPasteFailure::SessionMismatch,
+        CodexPromptPasteFailure::PaneMissing,
+        CodexPromptPasteFailure::InputDisabled,
+        CodexPromptPasteFailure::PasteFailed,
+        CodexPromptPasteFailure::CleanupFailed,
+    ];
+
+    for failure in failures {
+        let plan = plan_with(
+            vec![
+                automatic_pane_with_prompt(0, SESSION_ID, "Pending prompt"),
+                manual_pane(1, "later"),
+            ],
+            &[b"codex"],
+        );
+        let mut script = TargetScript::successful();
+        script.guarded_results.extend([Ok(()), Ok(())]);
+        script
+            .automatic_results
+            .push_back(AutomaticPaneObservation::Recovered);
+        script.prompt_paste_results.push_back(Err(failure.clone()));
+
+        let (result, log) = execute(plan, script);
+
+        assert_eq!(result.status(), RestoreRunStatus::Partial);
+        assert_eq!(
+            pane_result(&result, 0).outcome(),
+            &PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(failure)
+        );
+        assert_eq!(
+            pane_result(&result, 1).outcome(),
+            &PaneRestoreOutcome::PreparedManualHint
+        );
+        let log = log.borrow();
+        assert_eq!(
+            log.pasted_codex_prompts.len(),
+            1,
+            "prompt preparation failure is never retried"
+        );
+        assert_eq!(
+            log.guarded_attempts,
+            [coordinate(0), coordinate(1)],
+            "a later pane still executes after prompt preparation fails"
+        );
+    }
+}
+
+#[test]
+fn prompt_paste_failure_debug_cannot_carry_prompt_text() {
+    const SENSITIVE_PROMPT: &str = "release the unreleased signing key";
+    for failure in [
+        CodexPromptPasteFailure::SessionMismatch,
+        CodexPromptPasteFailure::PaneMissing,
+        CodexPromptPasteFailure::InputDisabled,
+        CodexPromptPasteFailure::PasteFailed,
+        CodexPromptPasteFailure::CleanupFailed,
+    ] {
+        let outcome = PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(failure);
+        assert!(!format!("{outcome:?}").contains(SENSITIVE_PROMPT));
+    }
+}
+
+#[test]
+fn failed_or_fallback_automatic_recovery_never_pastes_prompt_input() {
+    const SESSION_ID: &str = "1d6381bf-01c5-4c4a-b725-8e376e5ad295";
+    let observations = [
+        AutomaticPaneObservation::ShellForeground,
+        AutomaticPaneObservation::UnexpectedForeground,
+        AutomaticPaneObservation::PaneMissing,
+        AutomaticPaneObservation::Failed("observation failed".to_owned()),
+    ];
+
+    for observation in observations {
+        let plan = plan_with(
+            vec![automatic_pane_with_prompt(0, SESSION_ID, "Pending prompt")],
+            &[b"codex"],
+        );
+        let mut script = TargetScript::successful();
+        script.guarded_results.push_back(Ok(()));
+        if observation == AutomaticPaneObservation::ShellForeground {
+            script.guarded_results.push_back(Ok(()));
+        }
+        script.automatic_results.push_back(observation);
+
+        let (_result, log) = execute(plan, script);
+
+        assert!(
+            log.borrow().pasted_codex_prompts.is_empty(),
+            "non-recovered automatic branches must return before prompt preparation"
+        );
+    }
+
+    let plan = plan_with(
+        vec![automatic_pane_with_prompt(0, SESSION_ID, "Pending prompt")],
+        &[b"codex"],
+    );
+    let mut script = TargetScript::successful();
+    script
+        .guarded_results
+        .push_back(Err(GuardedPaneFailure::ShellNotForeground));
+
+    let (_result, log) = execute(plan, script);
+
+    assert!(
+        log.borrow().pasted_codex_prompts.is_empty(),
+        "a failed automatic launch must return before prompt preparation"
     );
 }
 

@@ -5,7 +5,7 @@ use std::path::Path;
 use tmux_rescue::{
     AutomaticRecovery, LinuxProcessInspector, LosslessOsString, PaneInitialProcess,
     PaneProcessAnchor, PaneProcessObservation, PaneProcessProbe, PaneRecovery,
-    ProcessInspectionFailure, RecordedAbsolutePath, TopologyPane, classify_pane,
+    ProcessInspectionFailure, RecordedAbsolutePath, TmuxPaneId, TopologyPane, classify_pane,
     parse_proc_cmdline, parse_proc_stat, select_foreground_processes,
 };
 
@@ -129,6 +129,7 @@ fn fake_process(
 fn pane(initial_process: PaneInitialProcess) -> TopologyPane {
     TopologyPane::new(
         0,
+        TmuxPaneId::try_from_bytes(b"%15".to_vec()).unwrap(),
         path("/tmp/work"),
         PaneProcessAnchor::try_new(100, os("/dev/pts/42"), initial_process).unwrap(),
     )
@@ -147,6 +148,7 @@ fn rejects_a_pane_process_not_bound_to_the_recorded_tty() {
     );
     let mismatched = TopologyPane::new(
         0,
+        TmuxPaneId::try_from_bytes(b"%15".to_vec()).unwrap(),
         path("/tmp/work"),
         PaneProcessAnchor::try_new(
             100,
@@ -345,7 +347,10 @@ fn supplies_opened_codex_session_metadata_to_the_resolver() {
     };
     assert!(matches!(
         classify_pane(*evidence).recovery(),
-        PaneRecovery::Automatic(AutomaticRecovery::Codex { session_id: id })
+        PaneRecovery::Automatic(AutomaticRecovery::Codex {
+            session_id: id,
+            ..
+        })
             if id.as_uuid().to_string() == session_id
     ));
 }

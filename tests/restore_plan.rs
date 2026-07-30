@@ -5,11 +5,13 @@ use std::os::unix::fs::PermissionsExt;
 
 use serde_json::json;
 use tmux_rescue::{
-    AutomaticFallbackReason, LosslessOsString, MAX_RENDERED_SHELL_INPUT_BYTES, PlannedPaneAction,
-    PlanningExecutable, RecordedAbsolutePath, ResolvedDirectoryOrigin, RestoreEnvironment,
-    RestoreEnvironmentFailure, RestorePlanningError, TargetShell, TmuxSelector, ValidatedSnapshot,
-    plan_restore,
+    AutomaticFallbackReason, AutomaticRecoveryExpectation, LosslessOsString,
+    MAX_RENDERED_SHELL_INPUT_BYTES, PlannedPaneAction, PlanningExecutable, RecordedAbsolutePath,
+    ResolvedDirectoryOrigin, RestoreEnvironment, RestoreEnvironmentFailure, RestorePlanningError,
+    TargetShell, TmuxSelector, ValidatedSnapshot, plan_restore,
 };
+
+const CODEX_PROMPT_TEXT: &str = "The test prompt for recovering.\n\nLine 1.\n\nLine 2.";
 
 fn encoded(value: &str) -> serde_json::Value {
     json!({"encoding": "utf8", "value": value})
@@ -39,7 +41,8 @@ fn snapshot() -> ValidatedSnapshot {
                             "kind": "automatic",
                             "recovery": {
                                 "kind": "codex",
-                                "session_id": "1d6381bf-01c5-4c4a-b725-8e376e5ad295"
+                                "session_id": "1d6381bf-01c5-4c4a-b725-8e376e5ad295",
+                                "prompt_area": {"text": CODEX_PROMPT_TEXT}
                             }
                         }
                     },
@@ -67,6 +70,93 @@ fn snapshot() -> ValidatedSnapshot {
         }]
     });
     ValidatedSnapshot::from_json(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
+fn automatic_snapshot() -> ValidatedSnapshot {
+    let value = json!({
+        "captured_at": "2026-07-23T00:00:00Z",
+        "source": encoded("/recorded/source.sock"),
+        "consistency": {"kind": "stable"},
+        "sessions": [{
+            "name": "work",
+            "working_directory": encoded("/recorded/session"),
+            "windows": [{
+                "source_index": 0,
+                "name": "automatic",
+                "panes": [
+                    {
+                        "source_index": 0,
+                        "working_directory": encoded("/recorded/codex"),
+                        "recovery": {
+                            "kind": "automatic",
+                            "recovery": {
+                                "kind": "codex",
+                                "session_id": "1d6381bf-01c5-4c4a-b725-8e376e5ad295",
+                                "prompt_area": {"text": CODEX_PROMPT_TEXT}
+                            }
+                        }
+                    },
+                    {
+                        "source_index": 1,
+                        "working_directory": encoded("/recorded/claude"),
+                        "recovery": {
+                            "kind": "automatic",
+                            "recovery": {
+                                "kind": "claude_code",
+                                "session_id": "8f707f38-6fd3-4a11-a03f-853b03d47b0c"
+                            }
+                        }
+                    },
+                    {
+                        "source_index": 2,
+                        "working_directory": encoded("/recorded/mdbook"),
+                        "recovery": {
+                            "kind": "automatic",
+                            "recovery": {
+                                "kind": "md_book_serve",
+                                "command": {
+                                    "executable": encoded("/usr/bin/mdbook"),
+                                    "argv": [encoded("mdbook"), encoded("serve")]
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "source_index": 3,
+                        "working_directory": encoded("/recorded/book"),
+                        "recovery": {
+                            "kind": "automatic",
+                            "recovery": {
+                                "kind": "bookshelf_serve",
+                                "command": {
+                                    "executable": encoded("/usr/bin/book"),
+                                    "argv": [encoded("book"), encoded("serve")]
+                                }
+                            }
+                        }
+                    }
+                ]
+            }]
+        }]
+    });
+    ValidatedSnapshot::from_json(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
+fn launchable_environment(commands: &[&[u8]]) -> FakeEnvironment {
+    FakeEnvironment {
+        existing_directories: [
+            b"/home/user".to_vec(),
+            b"/recorded/session".to_vec(),
+            b"/recorded/automatic".to_vec(),
+            b"/recorded/codex".to_vec(),
+            b"/recorded/claude".to_vec(),
+            b"/recorded/mdbook".to_vec(),
+            b"/recorded/book".to_vec(),
+        ]
+        .into_iter()
+        .collect(),
+        available_commands: commands.iter().map(|command| command.to_vec()).collect(),
+    }
 }
 
 struct FakeEnvironment {
@@ -234,14 +324,81 @@ fn automatic_launch_exists_only_with_recorded_directory_and_available_executable
 
     environment.available_commands.insert(b"codex".to_vec());
     let launchable = plan_restore(&snapshot(), None, &environment).unwrap();
-    let PlannedPaneAction::LaunchAutomatic { input, .. } = launchable.panes()[1].action() else {
+    let PlannedPaneAction::LaunchAutomatic(launch) = launchable.panes()[1].action() else {
         panic!("expected an automatic launch");
     };
-    assert_eq!(input.executable().path().as_bytes(), b"/bin/sh");
+    assert_eq!(launch.input().executable().path().as_bytes(), b"/bin/sh");
     assert_eq!(
-        input.rendered().as_bytes(),
+        launch.input().rendered().as_bytes(),
         b"'/bin/sh' 'resume' '1d6381bf-01c5-4c4a-b725-8e376e5ad295'"
     );
+}
+
+#[test]
+fn codex_prompt_input_is_bound_to_its_enclosing_session_launch() {
+    let environment = launchable_environment(&[b"codex"]);
+    let plan = plan_restore(&automatic_snapshot(), None, &environment).unwrap();
+    let PlannedPaneAction::LaunchAutomatic(launch) = plan.panes()[0].action() else {
+        panic!("expected a Codex automatic launch");
+    };
+
+    assert_eq!(launch.directory().path().as_bytes(), b"/recorded/codex");
+    assert_eq!(launch.input().executable().path().as_bytes(), b"/bin/sh");
+    assert!(!format!("{plan:?}").contains(CODEX_PROMPT_TEXT));
+    assert!(matches!(
+        launch.expectation(),
+        AutomaticRecoveryExpectation::Codex(session_id)
+            if session_id.as_uuid().to_string() == "1d6381bf-01c5-4c4a-b725-8e376e5ad295"
+    ));
+    let rendered = plan.render_human();
+    let codex_pane = rendered
+        .split("  pane work:0:1")
+        .next()
+        .unwrap()
+        .rsplit_once("  pane work:0:0")
+        .unwrap()
+        .1;
+    assert!(codex_pane.contains("after recovery  paste 5 visible rows without Enter"));
+    assert!(!rendered.contains(CODEX_PROMPT_TEXT));
+}
+
+#[test]
+fn claude_and_serve_launches_cannot_acquire_codex_prompt_input() {
+    let environment = launchable_environment(&[b"codex", b"claude", b"mdbook", b"book"]);
+    let plan = plan_restore(&automatic_snapshot(), None, &environment).unwrap();
+    let rendered = plan.render_human();
+
+    for pane_index in 0..4 {
+        let PlannedPaneAction::LaunchAutomatic(launch) = plan.panes()[pane_index].action() else {
+            panic!("expected automatic launch for pane {pane_index}");
+        };
+        assert_eq!(
+            launch.directory().path().as_bytes(),
+            match pane_index {
+                0 => b"/recorded/codex" as &[u8],
+                1 => b"/recorded/claude",
+                2 => b"/recorded/mdbook",
+                3 => b"/recorded/book",
+                _ => unreachable!(),
+            }
+        );
+    }
+
+    assert_eq!(rendered.matches("after recovery  paste").count(), 1);
+    assert!(!rendered.contains(CODEX_PROMPT_TEXT));
+}
+
+#[test]
+fn automatic_fallback_drops_post_recovery_prompt_input() {
+    let plan = plan_restore(&snapshot(), None, &FakeEnvironment::absent()).unwrap();
+
+    assert!(matches!(
+        plan.panes()[1].action(),
+        PlannedPaneAction::PasteAutomaticFallback { .. }
+    ));
+    let rendered = plan.render_human();
+    assert!(!rendered.contains("after recovery"));
+    assert!(!rendered.contains(CODEX_PROMPT_TEXT));
 }
 
 #[test]
@@ -440,17 +597,25 @@ fn rejects_shell_named_copies_of_unrelated_or_malformed_native_files() {
 
 #[test]
 fn human_plan_prints_execution_relevant_fallbacks_and_inputs() {
-    let plan = plan_restore(&snapshot(), None, &FakeEnvironment::absent()).unwrap();
+    let fallback_plan = plan_restore(&snapshot(), None, &FakeEnvironment::absent()).unwrap();
+    let fallback_rendered = fallback_plan.render_human();
 
-    let rendered = plan.render_human();
+    assert!(fallback_rendered.contains("pane work:0:1 cwd /home/user [session fallback]"));
+    assert!(fallback_rendered.contains("input 'codex' 'resume'"));
+    assert!(fallback_rendered.contains("reason recorded directory unavailable"));
+    assert!(!fallback_rendered.contains("after recovery"));
+    assert!(!fallback_rendered.contains(CODEX_PROMPT_TEXT));
+    assert!(fallback_rendered.contains("input 'custom' 'a'\\\\''b' ''"));
+    assert!(fallback_rendered.contains("capture failure foreground process vanished"));
+    assert!(fallback_rendered.contains("degradations:"));
+    assert!(fallback_rendered.contains("pane work:0:1 directory fallback"));
 
-    assert!(rendered.contains("pane work:0:1 cwd /home/user [session fallback]"));
-    assert!(rendered.contains("input 'codex' 'resume'"));
-    assert!(rendered.contains("reason recorded directory unavailable"));
-    assert!(rendered.contains("input 'custom' 'a'\\\\''b' ''"));
-    assert!(rendered.contains("capture failure foreground process vanished"));
-    assert!(rendered.contains("degradations:"));
-    assert!(rendered.contains("pane work:0:1 directory fallback"));
+    let launch_plan =
+        plan_restore(&snapshot(), None, &launchable_environment(&[b"codex"])).unwrap();
+    let launch_rendered = launch_plan.render_human();
+
+    assert!(launch_rendered.contains("after recovery  paste 5 visible rows without Enter"));
+    assert!(!launch_rendered.contains(CODEX_PROMPT_TEXT));
 }
 
 #[test]

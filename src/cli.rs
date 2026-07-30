@@ -9,11 +9,11 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use tmux_rescue::{
     AttentionReason, AutomaticFallbackReason, CaptureConsistency, CaptureEvent, CaptureTime,
-    LatestDisposition, PaneRestoreOutcome, RestoreEnvironment, RestoreExecutor, RestorePlan,
-    RestoreRunResult, RestoreRunStatus, RestoreTargetCapability, RestoreTargetState,
-    SnapshotPublication, SourcePaneCoordinate, StateStore, SystemRestoreEnvironment,
-    TargetDisposition, TmuxAdapter, TmuxRestoreAdapter, TmuxSelector, TopologyReadPhase,
-    capture_snapshot, plan_restore,
+    CodexPromptPasteFailure, LatestDisposition, PaneRestoreOutcome, RestoreEnvironment,
+    RestoreExecutor, RestorePlan, RestoreRunResult, RestoreRunStatus, RestoreTargetCapability,
+    RestoreTargetState, SnapshotPublication, SourcePaneCoordinate, StateStore,
+    SystemRestoreEnvironment, TargetDisposition, TmuxAdapter, TmuxRestoreAdapter, TmuxSelector,
+    TopologyReadPhase, capture_snapshot, plan_restore,
 };
 
 use crate::inspect::{Palette, is_unicode_display_control, render};
@@ -502,6 +502,18 @@ fn write_capture_events(stderr: &mut impl Write, events: &[CaptureEvent]) -> Res
                 pane.pane_index,
                 safe_text(&format!("{outcome:?}"))
             ),
+            CaptureEvent::CodexPromptCaptureSkipped {
+                attempt,
+                pane,
+                failure,
+            } => writeln!(
+                stderr,
+                "warning: capture attempt {attempt} pane {}:{}:{} Codex prompt capture skipped: {}",
+                pane.session_name,
+                pane.window_index,
+                pane.pane_index,
+                safe_text(failure.message())
+            ),
             CaptureEvent::UnstableCandidateSaved { attempts } => writeln!(
                 stderr,
                 "warning: topology remained unstable after {attempts} attempts; publishing the latest complete candidate"
@@ -677,6 +689,15 @@ fn pane_outcome_label(outcome: &PaneRestoreOutcome) -> String {
     match outcome {
         PaneRestoreOutcome::RestoredIdleShell => "restored idle shell".to_owned(),
         PaneRestoreOutcome::RecoveredAutomatically => "recovered automatically".to_owned(),
+        PaneRestoreOutcome::RecoveredAutomaticallyWithPromptPrepared => {
+            "recovered automatically; prepared pending input".to_owned()
+        }
+        PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(failure) => {
+            format!(
+                "recovered automatically; pending input needs attention ({})",
+                codex_prompt_paste_failure_label(failure)
+            )
+        }
         PaneRestoreOutcome::PreparedManualHint => "prepared manual hint".to_owned(),
         PaneRestoreOutcome::PreparedAutomaticFallbackHint(reason) => {
             format!(
@@ -690,6 +711,16 @@ fn pane_outcome_label(outcome: &PaneRestoreOutcome) -> String {
         PaneRestoreOutcome::NeedsAttention(reason) => {
             format!("needs attention ({})", attention_label(reason))
         }
+    }
+}
+
+fn codex_prompt_paste_failure_label(failure: &CodexPromptPasteFailure) -> String {
+    match failure {
+        CodexPromptPasteFailure::SessionMismatch => "Codex session changed".to_owned(),
+        CodexPromptPasteFailure::PaneMissing => "target pane is missing".to_owned(),
+        CodexPromptPasteFailure::InputDisabled => "target pane input is disabled".to_owned(),
+        CodexPromptPasteFailure::PasteFailed => "prompt paste failed".to_owned(),
+        CodexPromptPasteFailure::CleanupFailed => "prompt buffer cleanup failed".to_owned(),
     }
 }
 
@@ -772,10 +803,13 @@ mod tests {
     use std::rc::Rc;
 
     use tmux_rescue::{
-        CaptureConsistency, LatestDisposition, LosslessOsString, OwnedRestoreTarget,
-        PlanningExecutable, RecordedAbsolutePath, RestoreDestination, RestoreEnvironment,
-        RestoreEnvironmentFailure, RestoreTargetCapability, SnapshotPublication, StorageError,
-        TargetClaimFailure, TargetShell, TmuxSelector,
+        AutomaticPaneObservation, AutomaticRecoveryExpectation, CaptureConsistency,
+        CapturedCodexPromptArea, CodexPromptPasteFailure, CodexPromptPasteResult, CodexSessionId,
+        GuardedPaneOperation, GuardedPaneResult, LatestDisposition, LosslessOsString,
+        OwnedRestoreTarget, PlanningExecutable, RecordedAbsolutePath, RecoveryRestoreTarget,
+        RestoreDestination, RestoreEnvironment, RestoreEnvironmentFailure, RestorePlan,
+        RestoreTargetCapability, RollbackOutcome, SnapshotPublication, StorageError,
+        TargetClaimFailure, TargetDisposition, TargetShell, TmuxSelector,
     };
 
     use super::*;
@@ -876,6 +910,109 @@ mod tests {
         }
     }
 
+    struct PromptRestoreEnvironment;
+
+    impl RestoreEnvironment for PromptRestoreEnvironment {
+        fn target_shell(&self) -> Result<TargetShell, RestoreEnvironmentFailure> {
+            TargetShell::try_from_bytes(b"/bin/sh".to_vec())
+                .map_err(|error| RestoreEnvironmentFailure::new(error.to_string()))
+        }
+
+        fn home_directory(&self) -> Result<RecordedAbsolutePath, RestoreEnvironmentFailure> {
+            RecordedAbsolutePath::try_from_bytes(b"/tmp".to_vec())
+                .map_err(|error| RestoreEnvironmentFailure::new(error.to_string()))
+        }
+
+        fn directory_exists(&self, _directory: &RecordedAbsolutePath) -> bool {
+            true
+        }
+
+        fn resolve_executable(
+            &self,
+            _directory: &RecordedAbsolutePath,
+            _command_word: &LosslessOsString,
+        ) -> Option<PlanningExecutable> {
+            PlanningExecutable::try_from_bytes(b"/bin/sh".to_vec()).ok()
+        }
+    }
+
+    struct PromptOutcomeTarget {
+        paste_result: CodexPromptPasteResult,
+    }
+
+    impl RestoreTargetCapability for PromptOutcomeTarget {
+        fn claim(
+            &mut self,
+            _destination: &RestoreDestination,
+            _shell: &TargetShell,
+        ) -> Result<Box<dyn OwnedRestoreTarget>, TargetClaimFailure> {
+            Ok(Box::new(PromptOutcomeOwnedTarget {
+                paste_result: Some(self.paste_result.clone()),
+            }))
+        }
+    }
+
+    struct PromptOutcomeOwnedTarget {
+        paste_result: Option<CodexPromptPasteResult>,
+    }
+
+    impl OwnedRestoreTarget for PromptOutcomeOwnedTarget {
+        fn create_topology(
+            &mut self,
+            _plan: &RestorePlan,
+        ) -> Result<(), tmux_rescue::TopologyFailure> {
+            Ok(())
+        }
+
+        fn rollback(self: Box<Self>) -> RollbackOutcome {
+            RollbackOutcome::Removed
+        }
+
+        fn begin_recovery(self: Box<Self>) -> Box<dyn RecoveryRestoreTarget> {
+            Box::new(PromptOutcomeRecoveryTarget {
+                paste_result: self.paste_result,
+            })
+        }
+    }
+
+    struct PromptOutcomeRecoveryTarget {
+        paste_result: Option<CodexPromptPasteResult>,
+    }
+
+    impl RecoveryRestoreTarget for PromptOutcomeRecoveryTarget {
+        fn guarded_pane_operation(
+            &mut self,
+            _pane: &SourcePaneCoordinate,
+            _shell: &TargetShell,
+            _operation: GuardedPaneOperation<'_>,
+        ) -> GuardedPaneResult {
+            Ok(())
+        }
+
+        fn observe_automatic(
+            &mut self,
+            _pane: &SourcePaneCoordinate,
+            _expected: &AutomaticRecoveryExpectation,
+        ) -> AutomaticPaneObservation {
+            AutomaticPaneObservation::Recovered
+        }
+
+        fn paste_codex_prompt_area(
+            &mut self,
+            _pane: &SourcePaneCoordinate,
+            _expected: &CodexSessionId,
+            _input: &CapturedCodexPromptArea,
+        ) -> CodexPromptPasteResult {
+            self.paste_result
+                .take()
+                .expect("prompt preparation is attempted exactly once")
+        }
+
+        fn observe_disposition(&mut self) -> TargetDisposition {
+            TargetDisposition::Retained
+        }
+    }
+
     struct FlushTrackingWriter {
         bytes: Vec<u8>,
         flushed: Rc<Cell<bool>>,
@@ -910,6 +1047,39 @@ mod tests {
                             "source_index": 0,
                             "working_directory": {"encoding": "utf8", "value": "/tmp"},
                             "recovery": {"kind": "idle"}
+                        }]
+                    }]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn prompt_restore_fixture(path: &Path, prompt: &str) {
+        std::fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "captured_at": "2026-07-24T00:00:00Z",
+                "source": {"encoding": "utf8", "value": "/recorded/source.sock"},
+                "consistency": {"kind": "stable"},
+                "sessions": [{
+                    "name": "work",
+                    "working_directory": {"encoding": "utf8", "value": "/tmp"},
+                    "windows": [{
+                        "source_index": 4,
+                        "name": "work",
+                        "panes": [{
+                            "source_index": 0,
+                            "working_directory": {"encoding": "utf8", "value": "/tmp"},
+                            "recovery": {
+                                "kind": "automatic",
+                                "recovery": {
+                                    "kind": "codex",
+                                    "session_id": "1d6381bf-01c5-4c4a-b725-8e376e5ad295",
+                                    "prompt_area": {"text": prompt}
+                                }
+                            }
                         }]
                     }]
                 }]
@@ -1382,5 +1552,153 @@ mod tests {
         let stderr = String::from_utf8(stderr).unwrap();
         assert!(stderr.contains("pane work:3:7"));
         assert!(stderr.contains("automatic launch failed"));
+    }
+
+    #[test]
+    fn prepared_codex_prompt_outcome_is_count_free_and_prompt_free() {
+        let label =
+            pane_outcome_label(&PaneRestoreOutcome::RecoveredAutomaticallyWithPromptPrepared);
+
+        assert_eq!(label, "recovered automatically; prepared pending input");
+        assert!(!label.contains("row"));
+        assert!(!label.contains("byte"));
+        assert!(!label.contains("secret prompt"));
+    }
+
+    #[test]
+    fn codex_prompt_attention_labels_are_safe_and_specific() {
+        for (failure, expected) in [
+            (
+                CodexPromptPasteFailure::SessionMismatch,
+                "recovered automatically; pending input needs attention (Codex session changed)",
+            ),
+            (
+                CodexPromptPasteFailure::PaneMissing,
+                "recovered automatically; pending input needs attention (target pane is missing)",
+            ),
+            (
+                CodexPromptPasteFailure::InputDisabled,
+                "recovered automatically; pending input needs attention (target pane input is disabled)",
+            ),
+            (
+                CodexPromptPasteFailure::PasteFailed,
+                "recovered automatically; pending input needs attention (prompt paste failed)",
+            ),
+            (
+                CodexPromptPasteFailure::CleanupFailed,
+                "recovered automatically; pending input needs attention (prompt buffer cleanup failed)",
+            ),
+        ] {
+            assert_eq!(
+                pane_outcome_label(
+                    &PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(failure)
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn codex_prompt_attention_label_cannot_carry_prompt_text() {
+        const SENSITIVE_PROMPT: &str = "release the unreleased signing key";
+        for failure in [
+            CodexPromptPasteFailure::SessionMismatch,
+            CodexPromptPasteFailure::PaneMissing,
+            CodexPromptPasteFailure::InputDisabled,
+            CodexPromptPasteFailure::PasteFailed,
+            CodexPromptPasteFailure::CleanupFailed,
+        ] {
+            let label = pane_outcome_label(
+                &PaneRestoreOutcome::RecoveredAutomaticallyWithPromptNeedsAttention(failure),
+            );
+            assert!(!label.contains(SENSITIVE_PROMPT));
+        }
+    }
+
+    #[test]
+    fn codex_prompt_outcomes_render_exact_pane_lines_and_partial_warning() {
+        const SENSITIVE_PROMPT: &str = "secret prompt that must not reach CLI output";
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("snapshot.json");
+        prompt_restore_fixture(&snapshot, SENSITIVE_PROMPT);
+        let cases = [
+            (
+                Ok(()),
+                EXIT_SUCCESS,
+                concat!(
+                    "restore: complete\n",
+                    "target state: retained\n",
+                    "pane work:4:0: recovered automatically; prepared pending input\n",
+                ),
+                "executing restore topology and pane recovery\n",
+            ),
+            (
+                Err(CodexPromptPasteFailure::SessionMismatch),
+                EXIT_PARTIAL,
+                concat!(
+                    "restore: partial\n",
+                    "target state: retained\n",
+                    "pane work:4:0: recovered automatically; pending input needs attention ",
+                    "(Codex session changed)\n",
+                ),
+                concat!(
+                    "executing restore topology and pane recovery\n",
+                    "warning: restore completed partially\n",
+                ),
+            ),
+        ];
+
+        for (paste_result, expected_code, expected_suffix, expected_stderr) in cases {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let code = run_restore_with_factory(
+                RestoreRequest {
+                    snapshot: Some(snapshot.clone()),
+                    selector: None,
+                    run: true,
+                },
+                &mut stdout,
+                &mut stderr,
+                &PromptRestoreEnvironment,
+                move || PromptOutcomeTarget { paste_result },
+            )
+            .unwrap();
+
+            let stdout = String::from_utf8(stdout).unwrap();
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert_eq!(code, expected_code);
+            assert!(
+                stdout.ends_with(expected_suffix),
+                "missing exact rendered restore result in {stdout:?}"
+            );
+            assert_eq!(stderr, expected_stderr);
+            for output in [&stdout, &stderr] {
+                assert!(!output.contains(SENSITIVE_PROMPT));
+                assert!(!output.contains("prompt_area"));
+                assert!(!output.contains("{\"text\":"));
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_capture_failures_are_coordinate_scoped_and_prompt_free() {
+        let mut stderr = Vec::new();
+        let event = CaptureEvent::CodexPromptCaptureSkipped {
+            attempt: 1,
+            pane: SourcePaneCoordinate {
+                session_name: "work".to_owned(),
+                window_index: 0,
+                pane_index: 0,
+            },
+            failure: tmux_rescue::CodexPromptCaptureFailure::visible_pane_read_failed(),
+        };
+
+        write_capture_events(&mut stderr, &[event]).unwrap();
+
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "warning: capture attempt 1 pane work:0:0 Codex prompt capture skipped: visible tmux pane could not be read\n"
+        );
     }
 }
