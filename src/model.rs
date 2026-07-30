@@ -20,6 +20,7 @@ pub const MAX_ARGUMENTS: usize = 4_096;
 pub const MAX_OS_VALUE_BYTES: usize = 1024 * 1024;
 pub const MAX_NAME_BYTES: usize = 4_096;
 pub const MAX_DIAGNOSTIC_BYTES: usize = 4_096;
+pub const MAX_CODEX_PROMPT_BYTES: usize = 16 * 1024;
 pub const MAX_TOPOLOGY_VALIDATION_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -129,13 +130,38 @@ pub struct RawCapturedCommand {
     pub argv: Vec<RawEncodedOsString>,
 }
 
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawCapturedCodexPromptArea {
+    pub text: String,
+}
+
+impl fmt::Debug for RawCapturedCodexPromptArea {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawCapturedCodexPromptArea")
+            .field("text", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawAutomaticRecovery {
-    Codex { session_id: String },
-    ClaudeCode { session_id: String },
-    MdBookServe { command: RawCapturedCommand },
-    BookshelfServe { command: RawCapturedCommand },
+    Codex {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_area: Option<RawCapturedCodexPromptArea>,
+    },
+    ClaudeCode {
+        session_id: String,
+    },
+    MdBookServe {
+        command: RawCapturedCommand,
+    },
+    BookshelfServe {
+        command: RawCapturedCommand,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -178,6 +204,34 @@ pub struct RawSnapshot {
     pub source: RawEncodedOsString,
     pub consistency: RawCaptureConsistency,
     pub sessions: Vec<RawSessionSnapshot>,
+}
+
+pub(crate) struct PersistedSnapshotBytes(Vec<u8>);
+
+impl PersistedSnapshotBytes {
+    fn serialize(raw: &RawSnapshot) -> Result<Self, serde_json::Error> {
+        serde_json::to_vec_pretty(raw).map(Self)
+    }
+
+    pub(crate) fn byte_count(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl RawSnapshot {
+    pub(crate) fn serialize_for_persistence(
+        &self,
+    ) -> Result<PersistedSnapshotBytes, serde_json::Error> {
+        PersistedSnapshotBytes::serialize(self)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -364,6 +418,80 @@ impl CodexSessionId {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct CapturedPromptText(String);
+
+impl fmt::Debug for CapturedPromptText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedPromptText")
+            .field("visible_rows", &self.visible_row_count())
+            .field("bytes", &self.byte_count())
+            .finish()
+    }
+}
+
+impl CapturedPromptText {
+    pub(crate) fn try_new(text: String) -> Result<Self, SnapshotValidationError> {
+        if text.is_empty() {
+            return Err(SnapshotValidationError::InvalidCodexPromptText {
+                reason: "text is empty".to_owned(),
+            });
+        }
+        if text.trim().is_empty() {
+            return Err(SnapshotValidationError::InvalidCodexPromptText {
+                reason: "text contains only whitespace".to_owned(),
+            });
+        }
+        if text.len() > MAX_CODEX_PROMPT_BYTES {
+            return Err(SnapshotValidationError::InvalidCodexPromptText {
+                reason: format!(
+                    "text is {} bytes; the maximum is {MAX_CODEX_PROMPT_BYTES}",
+                    text.len()
+                ),
+            });
+        }
+        if text
+            .chars()
+            .any(|character| character != '\n' && character.is_control())
+        {
+            return Err(SnapshotValidationError::InvalidCodexPromptText {
+                reason: "text contains terminal control characters".to_owned(),
+            });
+        }
+        Ok(Self(text))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn visible_row_count(&self) -> usize {
+        self.0.split('\n').count()
+    }
+
+    pub fn byte_count(&self) -> usize {
+        self.0.len()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedCodexPromptArea {
+    text: CapturedPromptText,
+}
+
+impl CapturedCodexPromptArea {
+    pub(crate) fn try_new(text: String) -> Result<Self, SnapshotValidationError> {
+        Ok(Self {
+            text: CapturedPromptText::try_new(text)?,
+        })
+    }
+
+    pub fn text(&self) -> &CapturedPromptText {
+        &self.text
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaudeSessionId(Uuid);
 
@@ -409,6 +537,7 @@ impl RecognizedBookshelfServeCommand {
 pub enum AutomaticRecovery {
     Codex {
         session_id: CodexSessionId,
+        prompt_area: Option<CapturedCodexPromptArea>,
     },
     ClaudeCode {
         session_id: ClaudeSessionId,
@@ -563,11 +692,12 @@ impl ValidatedSnapshot {
     }
 
     pub(crate) fn from_capture_raw(raw: RawSnapshot) -> Result<Self, SnapshotValidationError> {
-        let encoded = serde_json::to_vec(&raw)
+        let persisted = raw
+            .serialize_for_persistence()
             .map_err(|error| SnapshotValidationError::InvalidJson(error.to_string()))?;
-        if encoded.len() > MAX_SNAPSHOT_BYTES {
+        if persisted.byte_count() > MAX_SNAPSHOT_BYTES {
             return Err(SnapshotValidationError::SnapshotTooLarge {
-                actual: encoded.len(),
+                actual: persisted.byte_count(),
                 maximum: MAX_SNAPSHOT_BYTES,
             });
         }
@@ -575,7 +705,14 @@ impl ValidatedSnapshot {
     }
 
     pub fn to_json_pretty(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec_pretty(&RawSnapshot::from(self))
+        self.serialize_for_persistence()
+            .map(PersistedSnapshotBytes::into_vec)
+    }
+
+    pub(crate) fn serialize_for_persistence(
+        &self,
+    ) -> Result<PersistedSnapshotBytes, serde_json::Error> {
+        RawSnapshot::from(self).serialize_for_persistence()
     }
 
     pub fn captured_at(&self) -> &CaptureTime {
@@ -770,10 +907,16 @@ fn validate_automatic(
     field: &str,
 ) -> Result<AutomaticRecovery, SnapshotValidationError> {
     match raw {
-        RawAutomaticRecovery::Codex { session_id } => {
+        RawAutomaticRecovery::Codex {
+            session_id,
+            prompt_area,
+        } => {
             let parsed = parse_session_id("codex", &session_id)?;
             Ok(AutomaticRecovery::Codex {
                 session_id: CodexSessionId(parsed),
+                prompt_area: prompt_area
+                    .map(|prompt_area| CapturedCodexPromptArea::try_new(prompt_area.text))
+                    .transpose()?,
             })
         }
         RawAutomaticRecovery::ClaudeCode { session_id } => {
@@ -956,8 +1099,16 @@ impl From<&PaneRecovery> for RawPaneRecovery {
 impl From<&AutomaticRecovery> for RawAutomaticRecovery {
     fn from(recovery: &AutomaticRecovery) -> Self {
         match recovery {
-            AutomaticRecovery::Codex { session_id } => Self::Codex {
+            AutomaticRecovery::Codex {
+                session_id,
+                prompt_area,
+            } => Self::Codex {
                 session_id: session_id.0.to_string(),
+                prompt_area: prompt_area
+                    .as_ref()
+                    .map(|prompt_area| RawCapturedCodexPromptArea {
+                        text: prompt_area.text.as_str().to_owned(),
+                    }),
             },
             AutomaticRecovery::ClaudeCode { session_id } => Self::ClaudeCode {
                 session_id: session_id.0.to_string(),
@@ -1041,6 +1192,8 @@ pub enum SnapshotValidationError {
     InvalidUnstableAttemptCount { actual: usize, expected: usize },
     #[error("{tool} session ID {value:?} is invalid")]
     InvalidSessionId { tool: String, value: String },
+    #[error("Codex prompt text is invalid: {reason}")]
+    InvalidCodexPromptText { reason: String },
     #[error("recognized {tool} serve command is invalid: {reason}")]
     InvalidRecognizedServeCommand { tool: String, reason: String },
     #[error("{field} is invalid: {reason}")]
@@ -1061,9 +1214,9 @@ mod tests {
     }
 
     #[test]
-    fn capture_refinement_enforces_the_aggregate_snapshot_limit() {
+    fn capture_refinement_enforces_the_persisted_snapshot_limit() {
         let large_argument = "x".repeat(MAX_OS_VALUE_BYTES);
-        let raw = RawSnapshot {
+        let mut raw = RawSnapshot {
             captured_at: "2026-07-23T00:00:00Z".to_owned(),
             source: encoded("/tmp/source.sock".to_owned()),
             consistency: RawCaptureConsistency::Stable {},
@@ -1080,7 +1233,8 @@ mod tests {
                             command: RawCapturedCommand {
                                 executable: encoded("/usr/bin/tool".to_owned()),
                                 argv: std::iter::once(encoded("tool".to_owned()))
-                                    .chain((0..17).map(|_| encoded(large_argument.clone())))
+                                    .chain((0..15).map(|_| encoded(large_argument.clone())))
+                                    .chain(std::iter::once(encoded(String::new())))
                                     .collect(),
                             },
                         },
@@ -1088,10 +1242,27 @@ mod tests {
                 }],
             }],
         };
+        let compact_size_before_padding = serde_json::to_vec(&raw).unwrap().len();
+        let padding_size = MAX_SNAPSHOT_BYTES
+            .checked_sub(compact_size_before_padding)
+            .expect("fixture without its final argument must fit the compact limit");
+        assert!((1..=MAX_OS_VALUE_BYTES).contains(&padding_size));
+        let RawPaneRecovery::Manual { command } = &mut raw.sessions[0].windows[0].panes[0].recovery
+        else {
+            unreachable!()
+        };
+        command.argv.last_mut().unwrap().value = "y".repeat(padding_size);
+
+        assert_eq!(serde_json::to_vec(&raw).unwrap().len(), MAX_SNAPSHOT_BYTES);
+        let persisted_size = serde_json::to_vec_pretty(&raw).unwrap().len();
+        assert!(persisted_size > MAX_SNAPSHOT_BYTES);
 
         assert!(matches!(
             ValidatedSnapshot::from_capture_raw(raw),
-            Err(SnapshotValidationError::SnapshotTooLarge { .. })
+            Err(SnapshotValidationError::SnapshotTooLarge {
+                actual,
+                maximum: MAX_SNAPSHOT_BYTES,
+            }) if actual == persisted_size
         ));
     }
 }

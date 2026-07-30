@@ -478,7 +478,7 @@ pub enum AutomaticRecoveryExpectation {
 impl From<&AutomaticRecovery> for AutomaticRecoveryExpectation {
     fn from(recovery: &AutomaticRecovery) -> Self {
         match recovery {
-            AutomaticRecovery::Codex { session_id } => Self::Codex(session_id.clone()),
+            AutomaticRecovery::Codex { session_id, .. } => Self::Codex(session_id.clone()),
             AutomaticRecovery::ClaudeCode { session_id } => Self::ClaudeCode(session_id.clone()),
             AutomaticRecovery::MdBookServe { command } => Self::MdBookServe(command.clone()),
             AutomaticRecovery::BookshelfServe { command } => Self::BookshelfServe(command.clone()),
@@ -489,7 +489,7 @@ impl From<&AutomaticRecovery> for AutomaticRecoveryExpectation {
 impl AutomaticRecoveryExpectation {
     pub fn matches(&self, actual: &AutomaticRecovery) -> bool {
         match (self, actual) {
-            (Self::Codex(expected), AutomaticRecovery::Codex { session_id }) => {
+            (Self::Codex(expected), AutomaticRecovery::Codex { session_id, .. }) => {
                 expected == session_id
             }
             (Self::ClaudeCode(expected), AutomaticRecovery::ClaudeCode { session_id }) => {
@@ -514,7 +514,7 @@ fn same_serve_argv(expected: &[LosslessOsString], actual: &[LosslessOsString]) -
 
 pub fn derive_automatic_command(recovery: &AutomaticRecovery) -> RecoveryCommand {
     let argv = match recovery {
-        AutomaticRecovery::Codex { session_id } => vec![
+        AutomaticRecovery::Codex { session_id, .. } => vec![
             fixed_os_string(b"codex"),
             fixed_os_string(b"resume"),
             fixed_os_string(session_id.as_uuid().to_string().as_bytes()),
@@ -639,6 +639,7 @@ fn resolve_codex(evidence: &PaneTiedForegroundEvidence) -> Option<ResolverOutcom
             let session_id = *session_ids.iter().next().expect("set length is one");
             Some(ResolverOutcome::Automatic(AutomaticRecovery::Codex {
                 session_id: CodexSessionId::from_uuid(session_id),
+                prompt_area: None,
             }))
         }
         _ => Some(conflicting(
@@ -851,7 +852,7 @@ fn apply_tail_conflict(
         return outcome;
     };
     let resolved = match &outcome {
-        ResolverOutcome::Automatic(AutomaticRecovery::Codex { session_id })
+        ResolverOutcome::Automatic(AutomaticRecovery::Codex { session_id, .. })
             if tail.tool == SessionTool::Codex =>
         {
             Some(session_id.as_uuid())

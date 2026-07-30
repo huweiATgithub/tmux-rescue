@@ -43,6 +43,11 @@ All captures share one archive: one `snapshots/` directory and one global
 `latest` pointer. A capture from any selected server may advance that pointer;
 there is no per-server snapshot stream.
 
+During an explicit `snapshot` invocation, tmux-rescue also makes a best-effort
+capture of pending input in the visible composer of an exactly identified Codex
+session. Unsupported or changing screens keep the automatic Codex session
+recovery but omit the pending input.
+
 Inspect the global latest snapshot:
 
 ```bash
@@ -80,7 +85,8 @@ An unstable topology warning is part of the same document; the complete
 snapshot tree is still displayed successfully. Color defaults to automatic and
 can be forced or disabled with `--color always` or `--color never`. A window
 with one pane is compacted to one line; windows with multiple panes retain their
-full branch structure.
+full branch structure. Captured Codex pending input is shown only as visible-row
+and byte counts; inspection never prints the text.
 
 Print restore plans for the global latest snapshot, using a named destination,
 an exact destination socket path, or the selected snapshot's recorded source
@@ -118,6 +124,12 @@ server PID, tmux server start time, operating-system process start time, and
 zero sessions. A selector that reaches an existing server cannot establish the
 new token, so tmux-rescue does not mutate or remove that server.
 
+A prompt-bearing Codex plan prints only the number of visible rows it will
+prepare. After the exact session resumes and settles, restore verifies that same
+session again, bracketed-pastes the captured bytes, and does not press Enter. A
+session or pane mismatch sends no prompt input and leaves a partial result for
+manual attention.
+
 The default snapshot is `latest` for both `inspect` and `restore`; an explicit
 immutable snapshot path may be supplied as the first argument.
 
@@ -125,12 +137,17 @@ immutable snapshot path may be supplied as the first argument.
 
 v1 captures manually. It recreates topology and working directories, but does
 not restore exact pane layout, environment variables, process trees, scrollback,
-or unsaved terminal input. It never restores into an existing tmux server.
+or hidden, scrolled-out, or unsupported unsaved terminal input. It never
+restores into an existing tmux server.
 
 Inspection performs no live tmux, process, restore-planning, or preflight work.
 
 Only a closed automatic-recovery whitelist is executed automatically. Other
 captured foreground commands are pasted as hints without pressing Enter.
+
+Snapshot files are owner-only by default, but their JSON is plaintext. A
+captured Codex draft may contain secrets, so protect copied snapshots and
+backups accordingly.
 
 The complete design and recovery contracts are in the published
 [Design](https://huweiatgithub.github.io/tmux-rescue/DESIGN.html),
