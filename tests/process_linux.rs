@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, File};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
@@ -6,7 +7,7 @@ use tmux_rescue::{
     AutomaticRecovery, LinuxProcessInspector, LosslessOsString, PaneInitialProcess,
     PaneProcessAnchor, PaneProcessObservation, PaneProcessProbe, PaneRecovery,
     ProcessInspectionFailure, RecordedAbsolutePath, TmuxPaneId, TopologyPane, classify_pane,
-    parse_proc_cmdline, parse_proc_stat, select_foreground_processes,
+    derive_automatic_command, parse_proc_cmdline, parse_proc_stat, select_foreground_processes,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -120,6 +121,18 @@ fn fake_process(
     fs::create_dir_all(&process).unwrap();
     fs::write(process.join("stat"), stat_bytes).unwrap();
     fs::write(process.join("cmdline"), argv).unwrap();
+    let executable = Path::new(executable);
+    let executable = if executable.exists() {
+        executable.to_owned()
+    } else {
+        let backing = proc_root
+            .join(".executables")
+            .join(pid.to_string())
+            .join(executable.strip_prefix("/").unwrap_or(executable));
+        fs::create_dir_all(backing.parent().unwrap()).unwrap();
+        fs::write(&backing, b"fake executable image").unwrap();
+        backing
+    };
     symlink(executable, process.join("exe")).unwrap();
     symlink(cwd, process.join("cwd")).unwrap();
     fs::create_dir(process.join("fd")).unwrap();
@@ -204,7 +217,7 @@ fn proves_idle_for_default_and_conservatively_recognized_explicit_shells() {
     assert!(matches!(
         inspector
             .observe(&pane(PaneInitialProcess::DefaultShell {
-                executable: os("/bin/zsh")
+                executable: os("/usr/bin/zsh")
             }))
             .unwrap(),
         PaneProcessObservation::Idle
@@ -283,7 +296,13 @@ fn retains_a_rooted_native_child_as_transient_foreground_evidence() {
     let PaneProcessObservation::Foreground(evidence) = observation else {
         panic!("expected a foreground command");
     };
-    assert_eq!(evidence.command().executable().as_bytes(), b"/usr/bin/node");
+    assert!(
+        evidence
+            .command()
+            .executable()
+            .as_bytes()
+            .ends_with(b"/node")
+    );
     assert_eq!(evidence.members().len(), 1);
     assert_eq!(evidence.members()[0].process_id(), 201);
 }
@@ -353,6 +372,97 @@ fn supplies_opened_codex_session_metadata_to_the_resolver() {
         })
             if id.as_uuid().to_string() == session_id
     ));
+}
+
+#[test]
+fn recognizes_codex_when_the_native_executable_is_held_open_after_unlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let proc_root = temp.path().join("proc");
+    fs::create_dir(&proc_root).unwrap();
+    fake_process(
+        &proc_root,
+        100,
+        &stat(100, "zsh", 1, 100, 77, 34_817, 200, 10),
+        "/bin/zsh",
+        b"zsh\0",
+        "/tmp/work",
+    );
+    fake_process(
+        &proc_root,
+        200,
+        &stat(200, "node", 100, 200, 77, 34_817, 200, 20),
+        "/usr/bin/node",
+        b"node\0/opt/codex/bin/codex.js\0",
+        "/tmp/work",
+    );
+    let native_path = temp.path().join("codex");
+    fs::write(&native_path, b"held native image").unwrap();
+    let native = File::open(&native_path).unwrap();
+    fs::remove_file(&native_path).unwrap();
+    let held_path = format!("/proc/self/fd/{}", native.as_raw_fd());
+    fake_process(
+        &proc_root,
+        201,
+        &stat(201, "codex", 200, 200, 77, 34_817, 200, 21),
+        &held_path,
+        b"codex\0",
+        "/tmp/work",
+    );
+    assert_eq!(
+        fs::read_link(proc_root.join("201/exe"))
+            .unwrap()
+            .as_os_str()
+            .as_encoded_bytes(),
+        held_path.as_bytes(),
+    );
+
+    let session_id = "1d6381bf-01c5-4c4a-b725-8e376e5ad295";
+    let codex_store = temp.path().join("codex/sessions");
+    fs::create_dir_all(&codex_store).unwrap();
+    let session_file = codex_store.join(format!("rollout-{session_id}.jsonl"));
+    let session_record = format!(
+        r#"{{"type":"session_meta","payload":{{"id":"{session_id}","originator":"codex-tui","thread_source":"user","cwd":"/tmp/work","parent_thread_id":null}}}}"#
+    );
+    fs::write(&session_file, format!("{session_record}\n")).unwrap();
+    symlink(&session_file, proc_root.join("201/fd/7")).unwrap();
+    let inspector = LinuxProcessInspector::with_proc_root_and_tool_stores(
+        proc_root,
+        Some(
+            RecordedAbsolutePath::try_from_bytes(
+                codex_store.as_os_str().as_encoded_bytes().to_vec(),
+            )
+            .unwrap(),
+        ),
+        None,
+    );
+
+    let PaneProcessObservation::Foreground(evidence) = inspector
+        .observe(&pane(PaneInitialProcess::DefaultShell {
+            executable: os("/bin/zsh"),
+        }))
+        .unwrap()
+    else {
+        panic!("expected foreground evidence");
+    };
+    let classification = classify_pane(*evidence);
+    let PaneRecovery::Automatic(recovery @ AutomaticRecovery::Codex { session_id: id, .. }) =
+        classification.recovery()
+    else {
+        panic!("expected automatic Codex recovery");
+    };
+    assert_eq!(id.as_uuid().to_string(), session_id);
+    assert_eq!(
+        derive_automatic_command(recovery)
+            .argv()
+            .iter()
+            .map(LosslessOsString::as_bytes)
+            .collect::<Vec<_>>(),
+        vec![
+            b"codex".as_slice(),
+            b"resume".as_slice(),
+            session_id.as_bytes()
+        ],
+    );
 }
 
 #[test]

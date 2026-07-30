@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use crate::{
     AutomaticRecovery, CapturedCommand, ClaudeSessionId, CodexSessionId, LosslessOsString,
-    PaneRecovery, RecognizedBookshelfServeCommand, RecognizedMdBookServeCommand,
-    RecordedAbsolutePath,
+    ObservedProcessCommand, PaneRecovery, RecognizedBookshelfServeCommand,
+    RecognizedMdBookServeCommand, RecordedAbsolutePath,
 };
 
 pub const MAX_TOOL_RECORD_BYTES: usize = 64 * 1024;
@@ -22,7 +22,7 @@ pub struct ForegroundProcessMember {
     process_group: u32,
     process_start_time: u64,
     process_tty: LosslessOsString,
-    command: CapturedCommand,
+    command: ObservedProcessCommand,
     working_directory: RecordedAbsolutePath,
 }
 
@@ -35,6 +35,27 @@ impl ForegroundProcessMember {
         process_start_time: u64,
         process_tty: LosslessOsString,
         command: CapturedCommand,
+        working_directory: RecordedAbsolutePath,
+    ) -> Result<Self, ForegroundEvidenceError> {
+        Self::try_new_observed(
+            process_id,
+            parent_process_id,
+            process_group,
+            process_start_time,
+            process_tty,
+            ObservedProcessCommand::unpinned(command),
+            working_directory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_observed(
+        process_id: u32,
+        parent_process_id: u32,
+        process_group: u32,
+        process_start_time: u64,
+        process_tty: LosslessOsString,
+        command: ObservedProcessCommand,
         working_directory: RecordedAbsolutePath,
     ) -> Result<Self, ForegroundEvidenceError> {
         if process_id == 0
@@ -76,7 +97,7 @@ impl ForegroundProcessMember {
     }
 
     pub fn command(&self) -> &CapturedCommand {
-        &self.command
+        self.command.command()
     }
 
     pub fn working_directory(&self) -> &RecordedAbsolutePath {
@@ -190,7 +211,7 @@ impl ToolAttributedTailSession {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaneTiedForegroundEvidence {
-    command: CapturedCommand,
+    command: ObservedProcessCommand,
     pane_working_directory: RecordedAbsolutePath,
     pane_tty: LosslessOsString,
     process_tty: LosslessOsString,
@@ -208,6 +229,29 @@ impl PaneTiedForegroundEvidence {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         command: CapturedCommand,
+        pane_working_directory: RecordedAbsolutePath,
+        pane_tty: LosslessOsString,
+        process_tty: LosslessOsString,
+        foreground_process_group: u32,
+        process_id: u32,
+        process_group: u32,
+        process_start_time: u64,
+    ) -> Result<Self, ForegroundEvidenceError> {
+        Self::try_new_observed(
+            ObservedProcessCommand::unpinned(command),
+            pane_working_directory,
+            pane_tty,
+            process_tty,
+            foreground_process_group,
+            process_id,
+            process_group,
+            process_start_time,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_observed(
+        command: ObservedProcessCommand,
         pane_working_directory: RecordedAbsolutePath,
         pane_tty: LosslessOsString,
         process_tty: LosslessOsString,
@@ -354,7 +398,7 @@ impl PaneTiedForegroundEvidence {
     }
 
     pub fn command(&self) -> &CapturedCommand {
-        &self.command
+        self.command.command()
     }
 
     pub fn pane_working_directory(&self) -> &RecordedAbsolutePath {
@@ -390,6 +434,14 @@ impl PaneTiedForegroundEvidence {
     }
 
     fn process_commands(&self) -> impl Iterator<Item = (u32, &CapturedCommand)> {
+        std::iter::once((self.process_id, self.command.command())).chain(
+            self.members
+                .iter()
+                .map(|member| (member.process_id, member.command.command())),
+        )
+    }
+
+    fn observed_process_commands(&self) -> impl Iterator<Item = (u32, &ObservedProcessCommand)> {
         std::iter::once((self.process_id, &self.command)).chain(
             self.members
                 .iter()
@@ -559,7 +611,9 @@ pub fn classify_pane(evidence: PaneTiedForegroundEvidence) -> PaneClassification
         ResolverOutcome::Automatic(automatic) => PaneRecovery::Automatic(automatic.clone()),
         ResolverOutcome::NotRecognized
         | ResolverOutcome::InsufficientEvidence(_)
-        | ResolverOutcome::ConflictingEvidence(_) => PaneRecovery::Manual(evidence.command.clone()),
+        | ResolverOutcome::ConflictingEvidence(_) => {
+            PaneRecovery::Manual(evidence.command.command().clone())
+        }
     };
     PaneClassification {
         recovery,
@@ -568,19 +622,19 @@ pub fn classify_pane(evidence: PaneTiedForegroundEvidence) -> PaneClassification
 }
 
 fn resolve_serve(evidence: &PaneTiedForegroundEvidence) -> Option<ResolverOutcome> {
-    RecognizedMdBookServeCommand::recognize(evidence.command.clone())
+    RecognizedMdBookServeCommand::recognize(evidence.command.command().clone())
         .map(|command| ResolverOutcome::Automatic(AutomaticRecovery::MdBookServe { command }))
         .or_else(|_| {
-            RecognizedBookshelfServeCommand::recognize(evidence.command.clone()).map(|command| {
-                ResolverOutcome::Automatic(AutomaticRecovery::BookshelfServe { command })
-            })
+            RecognizedBookshelfServeCommand::recognize(evidence.command.command().clone()).map(
+                |command| ResolverOutcome::Automatic(AutomaticRecovery::BookshelfServe { command }),
+            )
         })
         .ok()
 }
 
 fn resolve_codex(evidence: &PaneTiedForegroundEvidence) -> Option<ResolverOutcome> {
     let codex_processes = evidence
-        .process_commands()
+        .observed_process_commands()
         .filter_map(|(process_id, command)| is_codex_tui(command).then_some(process_id))
         .collect::<HashSet<_>>();
     if codex_processes.is_empty() {
@@ -665,19 +719,17 @@ struct CodexSessionMetaPayload {
     parent_thread_id: Option<String>,
 }
 
-fn is_codex_tui(command: &CapturedCommand) -> bool {
-    let executable_matches = basename(command.executable().as_bytes()) == Some(b"codex");
-    let argv_zero_matches = command
-        .argv()
-        .first()
-        .and_then(|value| basename(value.as_bytes()))
-        == Some(b"codex");
-    let noninteractive = command
-        .argv()
-        .iter()
-        .skip(1)
-        .any(|argument| matches!(argument.as_bytes(), b"app-server" | b"exec" | b"mcp-server"));
-    executable_matches && argv_zero_matches && !noninteractive
+fn is_codex_tui(command: &ObservedProcessCommand) -> bool {
+    command.executable_identity_basename() == Some(b"codex")
+        && command
+            .command()
+            .argv()
+            .first()
+            .and_then(|value| basename(value.as_bytes()))
+            == Some(b"codex")
+        && !command.command().argv()[1..]
+            .iter()
+            .any(|argument| matches!(argument.as_bytes(), b"app-server" | b"exec" | b"mcp-server"))
 }
 
 fn resolve_claude(evidence: &PaneTiedForegroundEvidence) -> Option<ResolverOutcome> {

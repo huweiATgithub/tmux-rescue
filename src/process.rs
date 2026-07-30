@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read};
+use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -17,6 +18,103 @@ use crate::{
 
 pub const MAX_CMDLINE_BYTES: usize = MAX_OS_VALUE_BYTES;
 const MAX_PROC_STAT_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ObservedProcessCommand {
+    command: CapturedCommand,
+    executable: ObservedExecutable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessExecutableKey {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ObservedExecutable {
+    UnpinnedRaw,
+    PinnedLinked {
+        key: ProcessExecutableKey,
+        link_count: NonZeroU64,
+    },
+    PinnedUnlinked {
+        key: ProcessExecutableKey,
+        identity_path: LosslessOsString,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PinnedExecutableObservation {
+    key: ProcessExecutableKey,
+    link_count: u64,
+    raw_link: LosslessOsString,
+}
+
+impl ObservedProcessCommand {
+    pub(crate) fn unpinned(command: CapturedCommand) -> Self {
+        Self {
+            command,
+            executable: ObservedExecutable::UnpinnedRaw,
+        }
+    }
+
+    fn from_pinned(
+        executable: PinnedExecutableObservation,
+        argv: Vec<LosslessOsString>,
+    ) -> Result<Self, ProcessInspectionFailure> {
+        let command = CapturedCommand::try_new(executable.raw_link.clone(), argv)
+            .map_err(|error| ProcessInspectionFailure::InvalidCommandValue(error.to_string()))?;
+        let executable = match NonZeroU64::new(executable.link_count) {
+            Some(link_count) => ObservedExecutable::PinnedLinked {
+                key: executable.key,
+                link_count,
+            },
+            None => {
+                let Some(identity_path) =
+                    executable.raw_link.as_bytes().strip_suffix(b" (deleted)")
+                else {
+                    return Err(ProcessInspectionFailure::InvalidEvidence(
+                        "unlinked executable is missing the kernel deletion decoration".to_owned(),
+                    ));
+                };
+                if identity_path.is_empty() {
+                    return Err(ProcessInspectionFailure::InvalidEvidence(
+                        "unlinked executable identity is empty".to_owned(),
+                    ));
+                }
+                let identity_path = LosslessOsString::try_from_bytes(identity_path.to_vec())
+                    .map_err(|error| {
+                        ProcessInspectionFailure::InvalidEvidence(error.to_string())
+                    })?;
+                ObservedExecutable::PinnedUnlinked {
+                    key: executable.key,
+                    identity_path,
+                }
+            }
+        };
+        Ok(Self {
+            command,
+            executable,
+        })
+    }
+
+    pub(crate) fn command(&self) -> &CapturedCommand {
+        &self.command
+    }
+
+    pub(crate) fn executable_identity_basename(&self) -> Option<&[u8]> {
+        let identity_path = match &self.executable {
+            ObservedExecutable::UnpinnedRaw | ObservedExecutable::PinnedLinked { .. } => {
+                self.command.executable()
+            }
+            ObservedExecutable::PinnedUnlinked { identity_path, .. } => identity_path,
+        };
+        Path::new(identity_path.as_os_str())
+            .file_name()
+            .map(OsStrExt::as_bytes)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessStat {
@@ -335,17 +433,8 @@ impl LinuxProcessInspector {
             return Err(ProcessInspectionFailure::ProcessNotLive { process_id });
         }
 
-        let executable = fs::read_link(process_root.join("exe")).map_err(|error| {
-            ProcessInspectionFailure::Io {
-                operation: "read process executable".to_owned(),
-                process_id: Some(process_id),
-                reason: error.to_string(),
-            }
-        })?;
-        let executable = LosslessOsString::try_from_bytes(executable.into_os_string().into_vec())
-            .map_err(|error| {
-            ProcessInspectionFailure::InvalidCommandValue(error.to_string())
-        })?;
+        let executable_link = process_root.join("exe");
+        let first_executable = read_pinned_executable(&executable_link, process_id)?;
         let cmdline = read_bounded(
             &process_root.join("cmdline"),
             MAX_CMDLINE_BYTES,
@@ -353,8 +442,6 @@ impl LinuxProcessInspector {
             process_id,
         )?;
         let argv = parse_proc_cmdline(&cmdline)?;
-        let command = CapturedCommand::try_new(executable, argv)
-            .map_err(|error| ProcessInspectionFailure::InvalidCommandValue(error.to_string()))?;
         let cwd = fs::read_link(process_root.join("cwd")).map_err(|error| {
             ProcessInspectionFailure::Io {
                 operation: "read process working directory".to_owned(),
@@ -366,6 +453,11 @@ impl LinuxProcessInspector {
             cwd.into_os_string().into_vec(),
         )
         .map_err(|error| ProcessInspectionFailure::InvalidCommandValue(error.to_string()))?;
+        let executable = read_pinned_executable(&executable_link, process_id)?;
+        if first_executable != executable {
+            return Err(ProcessInspectionFailure::ObservationRaced { process_id });
+        }
+        let command = ObservedProcessCommand::from_pinned(executable, argv)?;
         let after = self.read_stat(process_id)?;
         if !same_process_identity_and_job(&stat, &after) {
             return Err(ProcessInspectionFailure::ObservationRaced { process_id });
@@ -606,10 +698,10 @@ impl PaneProcessProbe for LinuxProcessInspector {
         }
         let pane_process_is_idle = match anchor.initial_process() {
             PaneInitialProcess::DefaultShell { executable } => {
-                executable == leader.command.executable()
+                executable == leader.command.command().executable()
             }
             PaneInitialProcess::ExplicitCommand => {
-                is_conservatively_interactive_shell(&leader.command)
+                is_conservatively_interactive_shell(leader.command.command())
             }
         };
         if inspected.is_empty()
@@ -629,7 +721,7 @@ impl PaneProcessProbe for LinuxProcessInspector {
             .chain(inspected.iter().map(|process| process.stat.process_id))
             .collect::<Vec<_>>();
         let tool_evidence = self.collect_tool_evidence(&process_ids);
-        let mut evidence = PaneTiedForegroundEvidence::try_new(
+        let mut evidence = PaneTiedForegroundEvidence::try_new_observed(
             leader.command,
             pane.working_directory().clone(),
             anchor.pane_tty().clone(),
@@ -643,7 +735,7 @@ impl PaneProcessProbe for LinuxProcessInspector {
         let members = inspected
             .into_iter()
             .map(|process| {
-                ForegroundProcessMember::try_new(
+                ForegroundProcessMember::try_new_observed(
                     process.stat.process_id,
                     process.stat.parent_process_id,
                     process.stat.process_group,
@@ -691,6 +783,57 @@ impl PaneProcessProbe for LinuxProcessInspector {
     }
 }
 
+fn read_pinned_executable(
+    executable_link: &Path,
+    process_id: u32,
+) -> Result<PinnedExecutableObservation, ProcessInspectionFailure> {
+    let executable = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(executable_link)
+        .map_err(|error| ProcessInspectionFailure::Io {
+            operation: "open process executable".to_owned(),
+            process_id: Some(process_id),
+            reason: error.to_string(),
+        })?;
+    let before = executable
+        .metadata()
+        .map_err(|error| ProcessInspectionFailure::Io {
+            operation: "stat pinned process executable".to_owned(),
+            process_id: Some(process_id),
+            reason: error.to_string(),
+        })?;
+    let raw_link =
+        fs::read_link(format!("/proc/self/fd/{}", executable.as_raw_fd())).map_err(|error| {
+            ProcessInspectionFailure::Io {
+                operation: "read pinned process executable".to_owned(),
+                process_id: Some(process_id),
+                reason: error.to_string(),
+            }
+        })?;
+    let after = executable
+        .metadata()
+        .map_err(|error| ProcessInspectionFailure::Io {
+            operation: "stat pinned process executable".to_owned(),
+            process_id: Some(process_id),
+            reason: error.to_string(),
+        })?;
+    if before.dev() != after.dev() || before.ino() != after.ino() || before.nlink() != after.nlink()
+    {
+        return Err(ProcessInspectionFailure::ObservationRaced { process_id });
+    }
+    let raw_link = LosslessOsString::try_from_bytes(raw_link.into_os_string().into_vec())
+        .map_err(|error| ProcessInspectionFailure::InvalidEvidence(error.to_string()))?;
+    Ok(PinnedExecutableObservation {
+        key: ProcessExecutableKey {
+            device: before.dev(),
+            inode: before.ino(),
+        },
+        link_count: before.nlink(),
+        raw_link,
+    })
+}
+
 fn ensure_tool_evidence_unchanged(
     before: &ToolEvidenceObservation,
     after: &ToolEvidenceObservation,
@@ -729,7 +872,7 @@ fn is_conservatively_interactive_shell(command: &CapturedCommand) -> bool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct InspectedProcess {
     stat: ProcessStat,
-    command: CapturedCommand,
+    command: ObservedProcessCommand,
     working_directory: RecordedAbsolutePath,
 }
 
@@ -856,10 +999,50 @@ fn default_tool_store(environment: &str, default_directory: &str) -> Option<Reco
 #[cfg(test)]
 mod observation_tests {
     use super::{
-        CapturedCommand, InspectedProcess, LosslessOsString, OpenedClaudeSessionFile, ProcessStat,
-        RecordedAbsolutePath, ToolEvidenceObservation, ToolRecordObservation,
-        ensure_tool_evidence_unchanged, same_process_observations,
+        CapturedCommand, InspectedProcess, LosslessOsString, ObservedProcessCommand,
+        OpenedClaudeSessionFile, PinnedExecutableObservation, ProcessExecutableKey,
+        ProcessInspectionFailure, ProcessStat, RecordedAbsolutePath, ToolEvidenceObservation,
+        ToolRecordObservation, ensure_tool_evidence_unchanged, same_process_observations,
     };
+
+    fn observed_command(
+        raw_link: &[u8],
+        device: u64,
+        inode: u64,
+        link_count: u64,
+    ) -> Result<ObservedProcessCommand, ProcessInspectionFailure> {
+        ObservedProcessCommand::from_pinned(
+            PinnedExecutableObservation {
+                key: ProcessExecutableKey { device, inode },
+                link_count,
+                raw_link: LosslessOsString::try_from_bytes(raw_link.to_vec()).unwrap(),
+            },
+            vec![LosslessOsString::try_from_bytes(b"codex".to_vec()).unwrap()],
+        )
+    }
+
+    #[test]
+    fn zero_link_codex_strips_one_kernel_decoration_for_identity_only() {
+        let command = observed_command(b"/tmp/codex (deleted)", 8, 42, 0).unwrap();
+        assert_eq!(
+            command.command().executable().as_bytes(),
+            b"/tmp/codex (deleted)"
+        );
+        assert_eq!(
+            command.executable_identity_basename(),
+            Some(b"codex".as_slice())
+        );
+    }
+
+    #[test]
+    fn linked_codex_uses_the_raw_executable_for_identity() {
+        let command = observed_command(b"/tmp/codex", 8, 42, 1).unwrap();
+        assert_eq!(command.command().executable().as_bytes(), b"/tmp/codex");
+        assert_eq!(
+            command.executable_identity_basename(),
+            Some(b"codex".as_slice())
+        );
+    }
 
     fn observed(executable: &[u8]) -> InspectedProcess {
         InspectedProcess {
@@ -873,11 +1056,13 @@ mod observation_tests {
                 foreground_process_group: 42,
                 start_time: 99,
             },
-            command: CapturedCommand::try_new(
-                LosslessOsString::try_from_bytes(executable.to_vec()).unwrap(),
-                vec![LosslessOsString::try_from_bytes(executable.to_vec()).unwrap()],
-            )
-            .unwrap(),
+            command: ObservedProcessCommand::unpinned(
+                CapturedCommand::try_new(
+                    LosslessOsString::try_from_bytes(executable.to_vec()).unwrap(),
+                    vec![LosslessOsString::try_from_bytes(executable.to_vec()).unwrap()],
+                )
+                .unwrap(),
+            ),
             working_directory: RecordedAbsolutePath::try_from_bytes(b"/tmp".to_vec()).unwrap(),
         }
     }
