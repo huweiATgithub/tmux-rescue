@@ -1,6 +1,6 @@
 [package]
 name = "tmux-rescue"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.94"
 description = "Snapshot and restore tmux session topology and recoverable foreground commands"
